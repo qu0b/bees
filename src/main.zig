@@ -665,10 +665,10 @@ fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?type
         if (json) {
             if (!first_json) try stdout.print(",", .{});
             first_json = false;
-            try stdout.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"approach\":\"{s}\",\"branch\":\"{s}\",\"duration_ms\":{d}", .{
+            try stdout.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"approach\":\"{s}\",\"branch\":\"{s}\",\"duration_ms\":{d},\"started_at\":{d}", .{
                 id, session.header.@"type".label(), session.header.status.label(),
                 session.header.commit_count, @as(u64, session.header.cost_microdollars) / 10000, session.approach, session.branch,
-                session.header.duration_ms,
+                session.header.duration_ms, @as(u64, session.header.started_at),
             });
             if (session.header.has_tokens) {
                 try stdout.print(",\"input_tokens\":{d},\"output_tokens\":{d},\"cache_creation_tokens\":{d},\"cache_read_tokens\":{d}", .{
@@ -711,12 +711,12 @@ fn cmdSession(arena: std.mem.Allocator, stdout: *Io.Writer, id: u64, json: bool)
     };
 
     if (json) {
-        try stdout.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"cost_microdollars\":{d},\"approach\":\"{s}\",\"branch\":\"{s}\",\"turns\":{d},\"duration_ms\":{d}", .{
+        try stdout.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"cost_microdollars\":{d},\"approach\":\"{s}\",\"branch\":\"{s}\",\"turns\":{d},\"duration_ms\":{d},\"started_at\":{d}", .{
             id, session.header.@"type".label(), session.header.status.label(),
             session.header.commit_count, @as(u64, session.header.cost_microdollars) / 10000,
             session.header.cost_microdollars,
             session.approach, session.branch, session.header.num_turns,
-            session.header.duration_ms,
+            session.header.duration_ms, @as(u64, session.header.started_at),
         });
         if (session.header.has_tokens) {
             try stdout.print(",\"input_tokens\":{d},\"output_tokens\":{d},\"cache_creation_tokens\":{d},\"cache_read_tokens\":{d}", .{
