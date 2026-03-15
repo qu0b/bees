@@ -33,10 +33,13 @@ fn runServer(
     allocator: std.mem.Allocator,
     port: u16,
 ) !void {
-    const addr = try Io.net.IpAddress.parse("0.0.0.0", port);
+    // Bind to localhost only — the dashboard proxies via Next.js API routes.
+    // Use 0.0.0.0 only if explicitly configured (e.g., behind a reverse proxy with auth).
+    const bind_addr = if (cfg.api.bind_address.len > 0) cfg.api.bind_address else "127.0.0.1";
+    const addr = try Io.net.IpAddress.parse(bind_addr, port);
     var server = try Io.net.IpAddress.listen(addr, io, .{ .reuse_address = true });
 
-    logger.info("[api] HTTP server listening on port {d}", .{port});
+    logger.info("[api] HTTP server listening on {s}:{d}", .{ bind_addr, port });
 
     while (true) {
         var stream = server.accept(io) catch |e| {
@@ -70,26 +73,26 @@ fn handleConnectionInner(
     io: Io,
     allocator: std.mem.Allocator,
 ) !void {
-    // Read request (may need multiple reads for POST bodies)
-    var read_buf: [4096]u8 = undefined;
-    var net_reader = stream.reader(io, &read_buf);
-    var request: [131072]u8 = undefined; // 128KB
+    // Read request via the underlying net stream directly, bypassing the
+    // buffered Reader. This does a single recv() and returns immediately
+    // with whatever data is available — correct for HTTP request/response.
+    var request: [131072]u8 = undefined;
     var total: usize = 0;
-
-    // First read
-    total = net_reader.interface.readSliceShort(&request) catch return;
+    {
+        var recv_iov = [1][]u8{request[0..]};
+        total = io.vtable.netRead(io.userdata, stream.socket.handle, &recv_iov) catch return;
+    }
     if (total == 0) return;
 
-    // If we have headers, check if body is complete
+    // For POST/PUT with Content-Length, read remaining body if needed
     if (std.mem.indexOf(u8, request[0..total], "\r\n\r\n")) |hend| {
-        // Look for Content-Length
         const headers = request[0..hend];
         const content_length = parseContentLength(headers);
         const body_received = total - (hend + 4);
-        // Read remaining body if needed
         var remaining = if (content_length > body_received) content_length - body_received else 0;
         while (remaining > 0 and total < request.len) {
-            const extra = net_reader.interface.readSliceShort(request[total..]) catch break;
+            var body_iov = [1][]u8{request[total..]};
+            const extra = io.vtable.netRead(io.userdata, stream.socket.handle, &body_iov) catch break;
             if (extra == 0) break;
             total += extra;
             remaining -|= extra;
@@ -174,7 +177,7 @@ fn route(
             return handleApproachesPost(w, store, paths, body, allocator);
         }
         if (std.mem.eql(u8, path, "/api/config")) {
-            return handleConfigPost(w, paths, body);
+            return handleConfigPost(w, paths, body, allocator);
         }
         if (std.mem.eql(u8, path, "/api/vision")) {
             return handleVisionPut(w, store, body);
@@ -447,10 +450,16 @@ fn handleConfig(w: *Io.Writer, paths: config_mod.ProjectPaths) !void {
     try w.writeAll(buf[0..n]);
 }
 
-fn handleConfigPost(w: *Io.Writer, paths: config_mod.ProjectPaths, body: []const u8) !void {
+fn handleConfigPost(w: *Io.Writer, paths: config_mod.ProjectPaths, body: []const u8, allocator: std.mem.Allocator) !void {
     if (body.len == 0) {
         return writeResponse(w, 400, "application/json", "{\"error\":\"Empty body\"}");
     }
+
+    // Validate that body is parseable as a Config before writing
+    _ = std.json.parseFromSlice(config_mod.Config, allocator, body, .{
+        .allocate = .alloc_always,
+    }) catch
+        return writeResponse(w, 400, "application/json", "{\"error\":\"Invalid config JSON\"}");
 
     const file = fs.createFile(paths.config_file, .{}) catch
         return writeResponse(w, 500, "application/json", "{\"error\":\"Failed to write config\"}");
@@ -596,15 +605,25 @@ fn writeResponse(w: *Io.Writer, status: u16, content_type: []const u8, body: []c
 }
 
 fn parseContentLength(headers: []const u8) usize {
-    // Search for Content-Length header (case-sensitive match on common forms)
-    const needles = [_][]const u8{ "Content-Length: ", "content-length: " };
-    for (needles) |needle| {
-        if (std.mem.indexOf(u8, headers, needle)) |pos| {
-            const start = pos + needle.len;
-            const rest = headers[start..];
-            const end = std.mem.indexOf(u8, rest, "\r") orelse rest.len;
-            return std.fmt.parseInt(usize, rest[0..end], 10) catch 0;
+    // Case-insensitive search for Content-Length header (RFC 7230)
+    const needle = "content-length:";
+    var i: usize = 0;
+    while (i + needle.len < headers.len) : (i += 1) {
+        var match = true;
+        for (0..needle.len) |j| {
+            const ch = headers[i + j];
+            const lower = if (ch >= 'A' and ch <= 'Z') ch + 32 else ch;
+            if (lower != needle[j]) {
+                match = false;
+                break;
+            }
         }
+        if (!match) continue;
+        var pos = i + needle.len;
+        while (pos < headers.len and headers[pos] == ' ') : (pos += 1) {}
+        const start = pos;
+        while (pos < headers.len and headers[pos] != '\r' and headers[pos] != '\n') : (pos += 1) {}
+        return std.fmt.parseInt(usize, headers[start..pos], 10) catch 0;
     }
     return 0;
 }

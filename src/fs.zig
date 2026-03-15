@@ -63,6 +63,18 @@ pub fn writeFile(file: File, data: []const u8) !void {
     try writer.interface.flush();
 }
 
+/// Write `data` at `*pos` and advance `*pos` by the number of bytes written.
+/// Use this for append-semantics on a file opened without O_APPEND.
+pub fn writeFileAppend(file: File, data: []const u8, pos: *u64) !void {
+    try file.writePositionalAll(io, data, pos.*);
+    pos.* += data.len;
+}
+
+/// Return the current byte length of `file`, or 0 on error.
+pub fn fileLength(file: File) u64 {
+    return file.length(io) catch 0;
+}
+
 pub fn filePrint(file: File, comptime fmt: []const u8, args: anytype) !void {
     var buf: [8192]u8 = undefined;
     var writer = file.writerStreaming(io, &buf);

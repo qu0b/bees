@@ -23,7 +23,9 @@ pub const Store = struct {
         try check(c.mdb_env_set_maxdbs(env, 8));
         try check(c.mdb_env_set_mapsize(env, 1 * 1024 * 1024 * 1024));
         try check(c.mdb_env_set_maxreaders(env, 8));
-        try check(c.mdb_env_open(env, path_z, c.MDB_NOSUBDIR, 0o644));
+        // MDB_NOTLS: don't use thread-local storage for reader slots.
+        // Required because io_uring green threads can migrate between OS threads.
+        try check(c.mdb_env_open(env, path_z, c.MDB_NOSUBDIR | c.MDB_NOTLS, 0o644));
 
         // Open all sub-databases in a single write transaction
         var txn: ?*c.MDB_txn = null;
@@ -147,6 +149,14 @@ pub const Store = struct {
         var time_key_val = mkValSlice(time_key.toBytes());
         try check(c.mdb_put(txn, self.sessions_by_time, &time_key_val, &empty_val, 0));
 
+        // Write JSON summary to meta for dashboard direct reads
+        self.writeSessionMeta(txn, id, header, approach, branch) catch {};
+
+        // Update session count
+        var count_buf: [16]u8 = undefined;
+        const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{id}) catch "";
+        self.putMeta(txn, "session:count", count_str) catch {};
+
         try check(c.mdb_txn_commit(txn));
         return id;
     }
@@ -180,9 +190,12 @@ pub const Store = struct {
 
         // Copy old value into local buffer, update header, then put back.
         // mdb_get returns a read-only mmap pointer — cannot write in place.
-        var buf: [4096]u8 = undefined;
+        // Session values: 48-byte header + len-prefixed strings. Typical ~300 bytes.
+        // 8192 accommodates pathological cases (long paths + diff summary).
+        var buf: [8192]u8 = undefined;
         const old_ptr: [*]const u8 = @ptrCast(data_val.mv_data);
         const old_size = data_val.mv_size;
+        if (old_size > buf.len) return error.LmdbBadValSize;
         @memcpy(buf[0..old_size], old_ptr[0..old_size]);
         @memcpy(buf[0..@sizeOf(types.SessionHeader)], std.mem.asBytes(&new_header));
         var new_val: c.MDB_val = .{ .mv_size = old_size, .mv_data = @ptrCast(&buf) };
@@ -199,7 +212,109 @@ pub const Store = struct {
         var empty_val = mkValEmpty();
         try check(c.mdb_put(txn, self.sessions_by_status, &new_status_val, &empty_val, 0));
 
+        // Write JSON summary to meta for dashboard direct reads
+        const view = types.SessionView.fromBytes(buf[0..old_size]);
+        self.writeSessionMeta(txn, id, new_header, view.approach, view.branch) catch {};
+
+        // Update session count
+        var count_buf: [16]u8 = undefined;
+        const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{id}) catch "";
+        self.putMetaIfGreater(txn, "session:count", count_str) catch {};
+
         try check(c.mdb_txn_commit(txn));
+    }
+
+    /// Write a JSON representation of a session to the meta sub-database.
+    /// The dashboard reads these directly via lmdb-js.
+    fn writeSessionMeta(
+        self: *Store,
+        txn: ?*c.MDB_txn,
+        id: u64,
+        h: types.SessionHeader,
+        approach: []const u8,
+        branch: []const u8,
+    ) !void {
+        var json_buf: [4096]u8 = undefined;
+        // Build JSON with proper escaping for user-controlled strings (approach, branch).
+        // Enum labels are safe (compile-time literals).
+        const prefix = std.fmt.bufPrint(&json_buf,
+            \\{{"id":{d},"type":"{s}","status":"{s}","commits":{d},"cost_cents":{d},"cost_microdollars":{d},"approach":"
+        , .{
+            id, h.@"type".label(), h.status.label(), h.commit_count,
+            @as(u64, h.cost_microdollars) / 10000, h.cost_microdollars,
+        }) catch return;
+        var pos: usize = prefix.len;
+
+        pos = appendEscaped(&json_buf, pos, approach);
+        const mid = std.fmt.bufPrint(json_buf[pos..],
+            \\","branch":"
+        , .{}) catch return;
+        pos += mid.len;
+
+        pos = appendEscaped(&json_buf, pos, branch);
+        const suffix = std.fmt.bufPrint(json_buf[pos..],
+            \\","duration_ms":{d},"started_at":{d},"worker_id":{d},"num_turns":{d},"input_tokens":{d},"output_tokens":{d},"cache_creation_tokens":{d},"cache_read_tokens":{d}}}
+        , .{
+            h.duration_ms, @as(u64, h.started_at), h.worker_id, h.num_turns,
+            h.input_tokens, h.output_tokens, h.cache_creation_tokens, h.cache_read_tokens,
+        }) catch return;
+        pos += suffix.len;
+
+        var meta_key_buf: [32]u8 = undefined;
+        const meta_key = std.fmt.bufPrint(&meta_key_buf, "session:{d}", .{id}) catch return;
+        try self.putMeta(txn, meta_key, json_buf[0..pos]);
+    }
+
+    /// Append a JSON-escaped string (without surrounding quotes) into buf at pos.
+    fn appendEscaped(buf: []u8, start: usize, s: []const u8) usize {
+        var pos = start;
+        for (s) |ch| {
+            if (pos + 2 > buf.len) break;
+            switch (ch) {
+                '"' => {
+                    buf[pos] = '\\';
+                    buf[pos + 1] = '"';
+                    pos += 2;
+                },
+                '\\' => {
+                    buf[pos] = '\\';
+                    buf[pos + 1] = '\\';
+                    pos += 2;
+                },
+                '\n' => {
+                    buf[pos] = '\\';
+                    buf[pos + 1] = 'n';
+                    pos += 2;
+                },
+                '\r' => {
+                    buf[pos] = '\\';
+                    buf[pos + 1] = 'r';
+                    pos += 2;
+                },
+                '\t' => {
+                    buf[pos] = '\\';
+                    buf[pos + 1] = 't';
+                    pos += 2;
+                },
+                else => {
+                    if (ch >= 0x20) {
+                        buf[pos] = ch;
+                        pos += 1;
+                    }
+                },
+            }
+        }
+        return pos;
+    }
+
+    /// Write to meta only if the new value (parsed as integer) is greater than existing.
+    fn putMetaIfGreater(self: *Store, txn: ?*c.MDB_txn, key: []const u8, value: []const u8) !void {
+        const new_val = std.fmt.parseInt(u64, value, 10) catch return;
+        if (self.getMeta(txn, key) catch null) |existing| {
+            const old_val = std.fmt.parseInt(u64, existing, 10) catch 0;
+            if (new_val <= old_val) return;
+        }
+        try self.putMeta(txn, key, value);
     }
 
     // -- Event operations --
@@ -558,6 +673,84 @@ pub const Store = struct {
             }
         }
     };
+
+    /// Mark all sessions with status "running" as "error".
+    /// Called on daemon startup and from CLI maintenance commands.
+    pub fn cleanupStaleSessions(self: *Store) u32 {
+        const read_txn = self.beginReadTxn() catch return 0;
+        defer abortTxn(read_txn);
+
+        var iter = self.iterSessions(read_txn) catch return 0;
+        defer iter.close();
+
+        var stale_ids: [1024]u64 = undefined;
+        var stale_headers: [1024]types.SessionHeader = undefined;
+        var count: usize = 0;
+
+        while (iter.next()) |entry| {
+            if (entry.view.header.status == .running and count < 1024) {
+                stale_ids[count] = entry.id;
+                stale_headers[count] = entry.view.header;
+                count += 1;
+            }
+        }
+
+        for (0..count) |i| {
+            var h = stale_headers[i];
+            const old_status = h.status;
+            const old_started_at = h.started_at;
+            h.status = .err;
+            if (h.finished_at == 0) {
+                var ts: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.REALTIME, &ts);
+                h.finished_at = @truncate(@as(u64, @intCast(ts.sec)));
+            }
+            self.updateSessionStatus(stale_ids[i], old_status, old_started_at, h) catch {};
+        }
+        return @intCast(count);
+    }
+
+    /// Backfill all existing sessions into meta as JSON.
+    /// Call once to populate meta for sessions created before JSON writes were added.
+    pub fn backfillSessionMeta(self: *Store) !void {
+        // Read all sessions
+        const read_txn = try self.beginReadTxn();
+        defer abortTxn(read_txn);
+
+        var iter = try self.iterSessions(read_txn);
+        defer iter.close();
+
+        var max_id: u64 = 0;
+
+        while (iter.next()) |entry| {
+            // Write each session to meta in its own write transaction
+            const write_txn = self.beginWriteTxn() catch continue;
+            self.writeSessionMeta(
+                write_txn,
+                entry.id,
+                entry.view.header,
+                entry.view.approach,
+                entry.view.branch,
+            ) catch {
+                abortTxn(write_txn);
+                continue;
+            };
+            commitTxn(write_txn) catch continue;
+            if (entry.id > max_id) max_id = entry.id;
+        }
+
+        // Update session count
+        if (max_id > 0) {
+            const write_txn = try self.beginWriteTxn();
+            var count_buf: [16]u8 = undefined;
+            const count_str = std.fmt.bufPrint(&count_buf, "{d}", .{max_id}) catch return;
+            self.putMeta(write_txn, "session:count", count_str) catch {
+                abortTxn(write_txn);
+                return;
+            };
+            try commitTxn(write_txn);
+        }
+    }
 
     // -- Transaction helpers --
 

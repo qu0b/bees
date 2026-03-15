@@ -4,10 +4,14 @@ const Io = std.Io;
 
 pub const Logger = struct {
     file: ?Io.File,
+    /// Current write position in the log file; initialized to the file's
+    /// existing length so that writes append rather than overwrite on restart.
+    pos: u64,
 
     pub fn init(log_path: ?[]const u8) Logger {
         const file = if (log_path) |p| fs.createFile(p, .{ .truncate = false }) catch null else null;
-        return .{ .file = file };
+        const pos: u64 = if (file) |f| fs.fileLength(f) else 0;
+        return .{ .file = file, .pos = pos };
     }
 
     pub fn deinit(self: *Logger) void {
@@ -43,7 +47,7 @@ pub const Logger = struct {
         const msg_len = std.fmt.bufPrint(buf[prefix_len.len..], fmt ++ "\n", args) catch return;
         const total = buf[0 .. prefix_len.len + msg_len.len];
 
-        if (self.file) |f| fs.writeFile(f, total) catch {};
+        if (self.file) |f| fs.writeFileAppend(f, total, &self.pos) catch {};
         std.debug.print("{s}", .{total});
     }
 };

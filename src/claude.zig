@@ -35,6 +35,7 @@ pub const SessionResult = struct {
     output_tokens: u32 = 0,
     cache_creation_tokens: u32 = 0,
     cache_read_tokens: u32 = 0,
+    tool_errors: u16 = 0,
 };
 
 pub fn spawnClaude(allocator: std.mem.Allocator, io: Io, options: ClaudeOptions) !std.process.Child {
@@ -186,6 +187,13 @@ pub fn parseEventMeta(line: []const u8) types.EventMeta {
         if (std.mem.indexOf(u8, line, "\"tool_result\"") != null) {
             meta.event_type = .tool_result;
             meta.role = .user;
+            // Detect tool errors: "is_error":true or "<tool_use_error>"
+            if (std.mem.indexOf(u8, line, "\"is_error\":true") != null or
+                std.mem.indexOf(u8, line, "\"is_error\": true") != null or
+                std.mem.indexOf(u8, line, "<tool_use_error>") != null)
+            {
+                meta.is_error = true;
+            }
         } else {
             meta.event_type = .message;
             meta.role = .user;
@@ -252,7 +260,54 @@ pub fn runClaudeSession(
     var total_cache_creation: u32 = 0;
     var total_cache_read: u32 = 0;
     var total_cost_microdollars: u32 = 0;
+    var tool_error_count: u16 = 0;
     const session_start = fs.timestamp();
+
+    // Store the user prompt as a synthetic event so the dashboard can display it.
+    // Claude CLI -p mode doesn't emit the user prompt in stream-json.
+    {
+        var prompt_json_buf: [8192]u8 = undefined;
+        const prefix = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"";
+        const suffix = if (options.stdin_data != null) " [+ stdin data]\"}]}}}" else "\"}]}}";
+        if (prefix.len < prompt_json_buf.len) {
+            @memcpy(prompt_json_buf[0..prefix.len], prefix);
+            var pos: usize = prefix.len;
+            // Escape prompt text for JSON
+            const prompt_preview = if (options.prompt.len > 3000) options.prompt[0..3000] else options.prompt;
+            for (prompt_preview) |ch| {
+                if (pos + 2 >= prompt_json_buf.len - suffix.len) break;
+                switch (ch) {
+                    '"' => { prompt_json_buf[pos] = '\\'; prompt_json_buf[pos + 1] = '"'; pos += 2; },
+                    '\\' => { prompt_json_buf[pos] = '\\'; prompt_json_buf[pos + 1] = '\\'; pos += 2; },
+                    '\n' => { prompt_json_buf[pos] = '\\'; prompt_json_buf[pos + 1] = 'n'; pos += 2; },
+                    '\r' => { prompt_json_buf[pos] = '\\'; prompt_json_buf[pos + 1] = 'r'; pos += 2; },
+                    '\t' => { prompt_json_buf[pos] = '\\'; prompt_json_buf[pos + 1] = 't'; pos += 2; },
+                    else => {
+                        if (ch >= 0x20) { prompt_json_buf[pos] = ch; pos += 1; }
+                    },
+                }
+            }
+            if (pos + suffix.len <= prompt_json_buf.len) {
+                @memcpy(prompt_json_buf[pos..][0..suffix.len], suffix);
+                pos += suffix.len;
+                const prompt_header = types.EventHeader{
+                    .event_type = .message,
+                    .tool_name = .none,
+                    .role = .user,
+                    .timestamp_offset_ms = 0,
+                };
+                store_event: {
+                    const txn = store.beginWriteTxn() catch break :store_event;
+                    store.insertEvent(txn, session_id, seq, prompt_header, prompt_json_buf[0..pos]) catch {
+                        store_mod.Store.abortTxn(txn);
+                        break :store_event;
+                    };
+                    store_mod.Store.commitTxn(txn) catch break :store_event;
+                }
+                seq += 1;
+            }
+        }
+    }
 
     // Read stdout line by line using the new Reader API
     if (child.stdout) |stdout_file| {
@@ -308,6 +363,10 @@ pub fn runClaudeSession(
                 };
             }
 
+            if (meta.event_type == .tool_result and meta.is_error) {
+                tool_error_count +|= 1;
+            }
+
             if (meta.event_type == .init_event) {
                 if (findJsonStringValue(line_copy, "\"session_id\"")) |sid| {
                     claude_session_id = try allocator.dupe(u8, sid);
@@ -361,6 +420,7 @@ pub fn runClaudeSession(
             .output_tokens = total_output_tokens,
             .cache_creation_tokens = total_cache_creation,
             .cache_read_tokens = total_cache_read,
+            .tool_errors = tool_error_count,
         };
     };
 
@@ -383,6 +443,7 @@ pub fn runClaudeSession(
         .output_tokens = total_output_tokens,
         .cache_creation_tokens = total_cache_creation,
         .cache_read_tokens = total_cache_read,
+        .tool_errors = tool_error_count,
     };
 }
 
@@ -412,18 +473,95 @@ pub fn findJsonStringValue(json: []const u8, key: []const u8) ?[]const u8 {
 }
 
 pub fn findJsonNumberValue(json: []const u8, key: []const u8) ?f64 {
-    const key_pos = std.mem.indexOf(u8, json, key) orelse return null;
-    var pos = key_pos + key.len;
+    var search_start: usize = 0;
+    while (search_start < json.len) {
+        const key_pos = std.mem.indexOf(u8, json[search_start..], key) orelse return null;
+        var pos = search_start + key_pos + key.len;
+        search_start = pos;
 
-    while (pos < json.len and (json[pos] == ' ' or json[pos] == ':' or json[pos] == '\t')) : (pos += 1) {}
+        while (pos < json.len and (json[pos] == ' ' or json[pos] == ':' or json[pos] == '\t')) : (pos += 1) {}
 
-    if (pos >= json.len) return null;
+        if (pos >= json.len) return null;
 
-    const start = pos;
-    while (pos < json.len and (json[pos] == '-' or json[pos] == '.' or (json[pos] >= '0' and json[pos] <= '9'))) : (pos += 1) {}
-    if (pos == start) return null;
+        // Value must start with a digit or minus sign (skip non-number values)
+        if (json[pos] != '-' and (json[pos] < '0' or json[pos] > '9')) continue;
 
-    return std.fmt.parseFloat(f64, json[start..pos]) catch null;
+        const start = pos;
+        while (pos < json.len and (json[pos] == '-' or json[pos] == '.' or (json[pos] >= '0' and json[pos] <= '9') or json[pos] == 'e' or json[pos] == 'E' or json[pos] == '+')) : (pos += 1) {}
+        if (pos == start) continue;
+
+        return std.fmt.parseFloat(f64, json[start..pos]) catch continue;
+    }
+    return null;
+}
+
+/// Scan a completed session's events in LMDB and extract tool error details
+/// into a human-readable summary for the SRE agent.
+pub fn collectToolErrors(
+    store: *store_mod.Store,
+    session_id: u64,
+    allocator: std.mem.Allocator,
+) ?[]const u8 {
+    const txn = store.beginReadTxn() catch return null;
+    defer store_mod.Store.abortTxn(txn);
+
+    var iter = store.iterSessionEvents(txn, session_id) catch return null;
+    defer iter.close();
+
+    var buf: std.ArrayList(u8) = .empty;
+    var error_count: u32 = 0;
+    var last_tool_name: []const u8 = "";
+    var last_tool_cmd: []const u8 = "";
+
+    while (iter.next()) |ev| {
+        // Track the most recent tool_use so we can label errors
+        if (ev.header.event_type == .tool_use) {
+            last_tool_name = findJsonStringValue(ev.raw_json, "\"name\"") orelse "";
+            last_tool_cmd = findJsonStringValue(ev.raw_json, "\"command\"") orelse
+                findJsonStringValue(ev.raw_json, "\"file_path\"") orelse "";
+        }
+
+        // Detect tool errors
+        if (ev.header.event_type == .tool_result) {
+            const is_err = std.mem.indexOf(u8, ev.raw_json, "\"is_error\":true") != null or
+                std.mem.indexOf(u8, ev.raw_json, "\"is_error\": true") != null or
+                std.mem.indexOf(u8, ev.raw_json, "<tool_use_error>") != null;
+            if (!is_err) continue;
+
+            error_count += 1;
+            if (error_count > 10) continue; // Cap to avoid huge prompts
+
+            // Extract the error content (first "content" string that's the actual error)
+            const error_text = findJsonStringValue(ev.raw_json, "\"content\"") orelse
+                findJsonStringValue(ev.raw_json, "\"text\"") orelse "unknown error";
+            const preview_len = @min(error_text.len, 200);
+
+            buf.appendSlice(allocator, "- [") catch continue;
+            buf.appendSlice(allocator, last_tool_name) catch continue;
+            if (last_tool_cmd.len > 0) {
+                buf.appendSlice(allocator, "] `") catch continue;
+                const cmd_len = @min(last_tool_cmd.len, 80);
+                buf.appendSlice(allocator, last_tool_cmd[0..cmd_len]) catch continue;
+                buf.appendSlice(allocator, "` → ") catch continue;
+            } else {
+                buf.appendSlice(allocator, "] → ") catch continue;
+            }
+            buf.appendSlice(allocator, error_text[0..preview_len]) catch continue;
+            buf.append(allocator, '\n') catch continue;
+        }
+    }
+
+    if (error_count == 0) return null;
+
+    // Prepend a header
+    var result: std.ArrayList(u8) = .empty;
+    var count_buf: [32]u8 = undefined;
+    const count_str = std.fmt.bufPrint(&count_buf, "{d} tool errors in session {d}:\n", .{ error_count, session_id }) catch return null;
+    result.appendSlice(allocator, count_str) catch return null;
+    result.appendSlice(allocator, buf.items) catch return null;
+    buf.deinit(allocator);
+
+    return result.toOwnedSlice(allocator) catch null;
 }
 
 fn streamEvent(s: *Io.Writer, meta: types.EventMeta, line: []const u8) void {

@@ -44,6 +44,7 @@ pub const Config = struct {
         max_budget_usd: f64 = 30.0,
         cooldown_minutes: u32 = 60,
         max_turns: u32 = 10,
+        tool_error_threshold: u32 = 3,
     };
 
     pub const Strategist = struct {
@@ -51,17 +52,20 @@ pub const Config = struct {
         effort: []const u8 = "high",
         max_budget_usd: f64 = 30.0,
         cycle_interval: u32 = 3,
+        mcp_config: ?[]const u8 = null,
     };
 
     pub const Qa = struct {
         model: []const u8 = "opus",
         effort: []const u8 = "medium",
         max_budget_usd: f64 = 30.0,
+        mcp_config: ?[]const u8 = null,
     };
 
     pub const Api = struct {
         port: u16 = 3002,
         enabled: bool = true,
+        bind_address: []const u8 = "127.0.0.1",
     };
 
     pub const Daemon = struct {
@@ -79,6 +83,7 @@ pub const Config = struct {
         command: ?[]const u8 = null,
         test_command: ?[]const u8 = null,
         deploy_command: ?[]const u8 = null,
+        setup_command: ?[]const u8 = null,
     };
 
     pub const Serve = struct {

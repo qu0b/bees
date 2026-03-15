@@ -11,38 +11,26 @@ const approaches_mod = @import("approaches.zig");
 const git = @import("git.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
-const api = @import("api.zig");
-
+const types = @import("types.zig");
 const MAX_WORKERS = 32;
 
-const Slot = struct {
-    thread: std.Thread = undefined,
-    active: bool = false,
-    done: bool = false,
+const claude = @import("claude.zig");
+
+/// Shared daemon state — accessed via atomics for cross-green-thread safety.
+const DaemonState = struct {
+    done_count: u32 = 0,
+    active_count: u32 = 0,
+    next_worker_id: u32 = 1,
+    /// Session IDs that completed with tool errors above threshold.
+    /// Workers write here; main loop reads and drains.
+    sre_trigger_sessions: [64]u64 = [_]u64{0} ** 64,
+    sre_trigger_count: u32 = 0,
 };
 
-// Shared state — all access protected by mutex
-var mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER;
-var done_count: u32 = 0;
-var active_count: u32 = 0;
-var next_worker_id: u32 = 1;
-var slots: [MAX_WORKERS]Slot = [_]Slot{.{}} ** MAX_WORKERS;
-var sre_thread: std.Thread = undefined;
-var sre_active: bool = false;
-var sre_done: bool = false;
-var sre_last_finished: u64 = 0;
-
-fn lock() void {
-    _ = std.c.pthread_mutex_lock(&mutex);
-}
-
-fn unlock() void {
-    _ = std.c.pthread_mutex_unlock(&mutex);
-}
-
-pub fn sleep_secs(secs: u64) void {
-    var ts = std.c.timespec{ .sec = @intCast(secs), .nsec = 0 };
-    _ = std.c.nanosleep(&ts, null);
+/// I/O-cooperative sleep — yields to the event loop so other green threads
+/// (API server, workers, SRE) keep making progress.
+pub fn sleep_secs(io: Io, secs: u64) void {
+    io.sleep(Io.Duration.fromSeconds(@intCast(secs)), .awake) catch {};
 }
 
 pub fn run(
@@ -58,17 +46,10 @@ pub fn run(
         cfg.daemon.worker_timeout_minutes, cfg.daemon.cooldown_minutes,
     });
 
-    // Spawn API server thread
-    if (cfg.api.enabled) {
-        _ = std.Thread.spawn(.{}, api.startApiServer, .{
-            store, cfg, paths, logger, io, allocator, cfg.api.port,
-        }) catch |e| {
-            logger.err("[daemon] failed to spawn API server: {}", .{e});
-        };
-    }
+    var state = DaemonState{};
 
-    // Spawn SRE agent
-    spawnSre(cfg, paths, store, logger, io, allocator);
+    // Mark any stale "running" sessions as "error" from previous daemon crash
+    cleanupStaleSessions(store, logger);
 
     // Track merge cycles for strategist scheduling
     var merge_cycle: u32 = 0;
@@ -78,63 +59,32 @@ pub fn run(
         logger.warn("[daemon] initial approach sync failed: {}", .{e});
     };
 
+    // Always run strategist at startup to refresh stale approaches before spawning workers
+    logger.info("[daemon] running startup strategist to refresh approaches", .{});
+    runStrategistWithPrep(cfg, paths, store, logger, io, allocator);
+    approaches_mod.syncFromFile(store, paths.approaches_file, allocator) catch {};
+
     // Load approaches from LMDB (single source of truth)
     var pool = approaches_mod.ApproachPool.loadFromStore(store, allocator) catch
         try approaches_mod.ApproachPool.load(allocator, paths.approaches_file);
     if (!pool.hasActiveApproaches()) {
-        logger.info("[daemon] all approaches exhausted (weight=0), running strategist to generate new work", .{});
-        runStrategistWithPrep(cfg, paths, store, logger, io, allocator);
-        approaches_mod.syncFromFile(store, paths.approaches_file, allocator) catch {};
-        pool = approaches_mod.ApproachPool.loadFromStore(store, allocator) catch
-            approaches_mod.ApproachPool.load(allocator, paths.approaches_file) catch pool;
-        if (!pool.hasActiveApproaches()) {
-            logger.warn("[daemon] still no active approaches after strategist, waiting for SRE/manual intervention", .{});
-        }
+        logger.warn("[daemon] no active approaches after startup strategist, waiting for SRE/manual intervention", .{});
     }
+
+    // Spawn initial workers as green threads
     if (pool.hasActiveApproaches()) {
         const spawn_count = @min(cfg.workers.count, MAX_WORKERS);
         for (0..spawn_count) |_| {
-            spawnWorker(cfg, paths, store, pool, logger, io, allocator);
+            spawnWorker(cfg, paths, store, pool, logger, io, allocator, &state);
         }
     }
 
-    // Main loop
+    // Main loop — polls via cooperative sleep
     while (true) {
-        sleep_secs(10);
-
-        // Join completed worker threads
-        joinCompleted();
-
-        // Check SRE health and restart if needed (with cooldown)
-        var need_sre_restart = false;
-        {
-            lock();
-            defer unlock();
-            if (sre_done) {
-                sre_last_finished = fs.timestamp();
-                need_sre_restart = true;
-                sre_done = false;
-            } else if (!sre_active) {
-                need_sre_restart = true;
-            }
-        }
-        if (need_sre_restart) {
-            joinSre();
-            const sre_cooldown_secs = @as(u64, cfg.sre.cooldown_minutes) * 60;
-            const elapsed_since_sre = fs.timestamp() -| sre_last_finished;
-            if (sre_last_finished == 0 or elapsed_since_sre >= sre_cooldown_secs) {
-                logger.info("[daemon] starting SRE agent", .{});
-                spawnSre(cfg, paths, store, logger, io, allocator);
-            }
-        }
+        sleep_secs(io, 10);
 
         // Check completion threshold
-        var current_done: u32 = 0;
-        {
-            lock();
-            defer unlock();
-            current_done = done_count;
-        }
+        const current_done = @atomicLoad(u32, &state.done_count, .acquire);
 
         if (current_done >= cfg.merger.merge_threshold) {
             logger.info("[daemon] {d} workers completed, triggering merger", .{current_done});
@@ -146,11 +96,7 @@ pub fn run(
                 logger.err("[daemon] merger failed: {}", .{e});
             };
 
-            {
-                lock();
-                defer unlock();
-                done_count -|= cfg.merger.merge_threshold;
-            }
+            _ = @atomicRmw(u32, &state.done_count, .Sub, cfg.merger.merge_threshold, .release);
 
             // Detect changed files for QA
             const changed_files: ?[]const u8 = if (pre_merge_head) |pmh| blk: {
@@ -186,10 +132,13 @@ pub fn run(
                 logger.info("[daemon] skipping strategist (cycle {d}, interval {d})", .{ merge_cycle, cfg.strategist.cycle_interval });
             }
 
+            // Check for tool-error-triggered SRE
+            drainSreTriggers(cfg, paths, store, logger, io, allocator, &state);
+
             // Cooldown
             const cooldown_secs = @as(u64, cfg.daemon.cooldown_minutes) * 60;
             logger.info("[daemon] cooling down for {d} minutes", .{cfg.daemon.cooldown_minutes});
-            sleep_secs(cooldown_secs);
+            sleep_secs(io, cooldown_secs);
 
             // Sync approaches.json into LMDB and reload from store
             approaches_mod.syncFromFile(store, paths.approaches_file, allocator) catch {};
@@ -206,16 +155,12 @@ pub fn run(
 
             // Refill workers (only if there's work to do)
             if (pool.hasActiveApproaches()) {
-                var need: u32 = 0;
-                {
-                    lock();
-                    defer unlock();
-                    need = @min(cfg.workers.count, MAX_WORKERS) -| active_count;
-                }
+                const current_active = @atomicLoad(u32, &state.active_count, .acquire);
+                const need = @min(cfg.workers.count, MAX_WORKERS) -| current_active;
                 if (need > 0) {
                     logger.info("[daemon] spawning {d} new workers", .{need});
                     for (0..need) |_| {
-                        spawnWorker(cfg, paths, store, pool, logger, io, allocator);
+                        spawnWorker(cfg, paths, store, pool, logger, io, allocator, &state);
                     }
                 }
             } else {
@@ -225,6 +170,7 @@ pub fn run(
     }
 }
 
+/// Spawn a single worker as an async green thread.
 fn spawnWorker(
     cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
@@ -233,48 +179,23 @@ fn spawnWorker(
     logger: *log_mod.Logger,
     io: Io,
     allocator: std.mem.Allocator,
+    state: *DaemonState,
 ) void {
-    var wid: u32 = 0;
-    var slot_idx: usize = MAX_WORKERS;
-
-    {
-        lock();
-        defer unlock();
-        for (0..MAX_WORKERS) |i| {
-            if (!slots[i].active) {
-                slot_idx = i;
-                break;
-            }
-        }
-        if (slot_idx >= MAX_WORKERS) {
-            logger.err("[daemon] no free worker slots", .{});
-            return;
-        }
-        wid = next_worker_id;
-        next_worker_id += 1;
-        active_count += 1;
-        slots[slot_idx].active = true;
-        slots[slot_idx].done = false;
-    }
+    const wid = @atomicRmw(u32, &state.next_worker_id, .Add, 1, .monotonic);
+    _ = @atomicRmw(u32, &state.active_count, .Add, 1, .release);
 
     const timeout_secs: u32 = if (cfg.daemon.worker_timeout_minutes > 0)
         cfg.daemon.worker_timeout_minutes * 60
     else
         0;
 
-    slots[slot_idx].thread = std.Thread.spawn(.{}, workerThread, .{
-        cfg, paths, store, pool, logger, io, wid, allocator, timeout_secs, slot_idx,
-    }) catch |e| {
-        logger.err("[daemon] spawn worker {d} failed: {}", .{ wid, e });
-        lock();
-        defer unlock();
-        active_count -= 1;
-        slots[slot_idx].active = false;
-        return;
-    };
+    _ = io.async(workerTask, .{
+        cfg, paths, store, pool, logger, io, wid, allocator, timeout_secs, state,
+    });
 }
 
-fn workerThread(
+/// Green thread entry point for a worker.
+fn workerTask(
     cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
     store: *store_mod.Store,
@@ -284,105 +205,83 @@ fn workerThread(
     wid: u32,
     allocator: std.mem.Allocator,
     timeout_secs: u32,
-    slot_idx: usize,
+    state: *DaemonState,
 ) void {
     defer {
-        lock();
-        defer unlock();
-        done_count += 1;
-        active_count -= 1;
-        slots[slot_idx].done = true;
+        _ = @atomicRmw(u32, &state.done_count, .Add, 1, .release);
+        _ = @atomicRmw(u32, &state.active_count, .Sub, 1, .release);
     }
-    worker.runWorkerWithTimeout(cfg, paths, store, &pool, logger, io, wid, allocator, timeout_secs) catch |e| {
+    const result = worker.runWorkerWithTimeout(cfg, paths, store, &pool, logger, io, wid, allocator, timeout_secs) catch |e| {
         logger.err("[worker:{d}] fatal: {}", .{ wid, e });
-    };
-}
-
-fn spawnSre(
-    cfg: config_mod.Config,
-    paths: config_mod.ProjectPaths,
-    store: *store_mod.Store,
-    logger: *log_mod.Logger,
-    io: Io,
-    allocator: std.mem.Allocator,
-) void {
-    {
-        lock();
-        defer unlock();
-        sre_active = true;
-        sre_done = false;
-    }
-
-    sre_thread = std.Thread.spawn(.{}, sreThread, .{
-        cfg, paths, store, logger, io, allocator,
-    }) catch |e| {
-        logger.err("[daemon] spawn SRE failed: {}", .{e});
-        lock();
-        defer unlock();
-        sre_active = false;
         return;
     };
+
+    // If tool errors exceed threshold, queue SRE trigger
+    if (result.tool_errors >= cfg.sre.tool_error_threshold and result.session_id > 0) {
+        const idx = @atomicRmw(u32, &state.sre_trigger_count, .Add, 1, .monotonic);
+        if (idx < state.sre_trigger_sessions.len) {
+            state.sre_trigger_sessions[idx] = result.session_id;
+        }
+        logger.info("[worker:{d}] queued SRE trigger: session {d} had {d} tool errors", .{
+            wid, result.session_id, result.tool_errors,
+        });
+    }
 }
 
-fn sreThread(
+fn cleanupStaleSessions(store: *store_mod.Store, logger: *log_mod.Logger) void {
+    const count = store.cleanupStaleSessions();
+    if (count > 0) {
+        logger.info("[daemon] cleaned up {d} stale running sessions from previous run", .{count});
+    }
+}
+
+/// Drain queued SRE triggers — collect tool errors from sessions that exceeded
+/// the threshold, build a combined context, and run a single SRE session.
+fn drainSreTriggers(
     cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
     store: *store_mod.Store,
     logger: *log_mod.Logger,
     io: Io,
     allocator: std.mem.Allocator,
+    state: *DaemonState,
 ) void {
-    defer {
-        lock();
-        defer unlock();
-        sre_done = true;
+    const count = @atomicRmw(u32, &state.sre_trigger_count, .Xchg, 0, .acquire);
+    if (count == 0) return;
+
+    const n = @min(count, @as(u32, @intCast(state.sre_trigger_sessions.len)));
+    logger.info("[daemon] {d} sessions triggered SRE, collecting tool errors", .{n});
+
+    // Collect error context from all triggering sessions
+    var context: std.ArrayList(u8) = .empty;
+    defer context.deinit(allocator);
+    var first_session_id: u64 = 0;
+
+    for (0..n) |i| {
+        const sid = state.sre_trigger_sessions[i];
+        state.sre_trigger_sessions[i] = 0;
+        if (sid == 0) continue;
+        if (first_session_id == 0) first_session_id = sid;
+
+        if (claude.collectToolErrors(store, sid, allocator)) |errors| {
+            defer allocator.free(errors);
+            context.appendSlice(allocator, errors) catch continue;
+            context.append(allocator, '\n') catch continue;
+        }
     }
-    sre_mod.runSre(cfg, paths, store, logger, io, allocator, false) catch |e| {
+
+    if (context.items.len == 0 or first_session_id == 0) {
+        logger.info("[daemon] no tool errors to report to SRE", .{});
+        return;
+    }
+
+    logger.info("[daemon] running SRE agent for tool error diagnosis", .{});
+    sre_mod.runSre(cfg, paths, store, logger, io, allocator, false, context.items, first_session_id) catch |e| {
         logger.err("[sre] fatal: {}", .{e});
     };
 }
 
-fn joinCompleted() void {
-    var to_join: [MAX_WORKERS]std.Thread = undefined;
-    var count: usize = 0;
-
-    {
-        lock();
-        defer unlock();
-        for (0..MAX_WORKERS) |i| {
-            if (slots[i].done) {
-                to_join[count] = slots[i].thread;
-                count += 1;
-                slots[i].active = false;
-                slots[i].done = false;
-            }
-        }
-    }
-
-    for (to_join[0..count]) |t| {
-        t.join();
-    }
-}
-
-fn joinSre() void {
-    var to_join: ?std.Thread = null;
-
-    {
-        lock();
-        defer unlock();
-        if (sre_active) {
-            to_join = sre_thread;
-            sre_active = false;
-        }
-    }
-
-    if (to_join) |t| {
-        t.join();
-    }
-}
-
 /// Build the project and restart the serve process before the strategist runs.
-/// All process management happens here in native Zig — never inside a Claude session.
 fn prepareForStrategist(
     cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
@@ -390,7 +289,6 @@ fn prepareForStrategist(
     io: Io,
     allocator: std.mem.Allocator,
 ) void {
-    // Step 1: Build
     if (cfg.build.command) |build_cmd| {
         logger.info("[daemon] pre-strategist build: {s}", .{build_cmd});
         const result = git.run(allocator, io, &.{ "sh", "-c", build_cmd }, paths.root) catch |e| {
@@ -404,7 +302,6 @@ fn prepareForStrategist(
         }
     }
 
-    // Step 2: Restart systemd service
     if (cfg.serve.systemd_unit) |unit| {
         logger.info("[daemon] restarting serve unit: {s}", .{unit});
         const result = git.run(allocator, io, &.{ "systemctl", "--user", "restart", unit }, paths.root) catch |e| {
@@ -418,7 +315,6 @@ fn prepareForStrategist(
         }
     }
 
-    // Step 3: Health check — poll until the serve port responds
     if (cfg.serve.health_url) |url| {
         logger.info("[daemon] waiting for serve health: {s}", .{url});
         const deadline = cfg.serve.health_timeout_secs;
@@ -427,7 +323,7 @@ fn prepareForStrategist(
             const result = git.run(allocator, io, &.{
                 "curl", "-sf", "-o", "/dev/null", "--max-time", "2", url,
             }, paths.root) catch {
-                sleep_secs(2);
+                sleep_secs(io, 2);
                 continue;
             };
             allocator.free(result.stdout);
@@ -436,13 +332,12 @@ fn prepareForStrategist(
                 logger.info("[daemon] serve is healthy after {d}s", .{elapsed});
                 return;
             }
-            sleep_secs(2);
+            sleep_secs(io, 2);
         }
         logger.warn("[daemon] serve health check timed out after {d}s, strategist will proceed without live server", .{deadline});
     }
 }
 
-/// Run strategist with infrastructure preparation and LMDB context injection.
 fn runStrategistWithPrep(
     cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
@@ -454,7 +349,6 @@ fn runStrategistWithPrep(
     prepareForStrategist(cfg, paths, logger, io, allocator);
     writeApproachTrends(cfg, paths, store, logger, allocator);
 
-    // Read QA report and approach trends from LMDB to inject into strategist prompt
     const context = buildStrategistContext(store, allocator);
     defer if (context) |c| allocator.free(c);
 
@@ -463,8 +357,6 @@ fn runStrategistWithPrep(
     };
 }
 
-/// Build context string from LMDB reports for the strategist prompt.
-/// Injects: previous VISION, latest QA report, approach trends.
 fn buildStrategistContext(store: *store_mod.Store, allocator: std.mem.Allocator) ?[]const u8 {
     const txn = store.beginReadTxn() catch return null;
     defer store_mod.Store.abortTxn(txn);
@@ -491,7 +383,6 @@ fn buildStrategistContext(store: *store_mod.Store, allocator: std.mem.Allocator)
     return parts.toOwnedSlice(allocator) catch null;
 }
 
-/// Compute approach performance trends and store in LMDB meta.
 fn writeApproachTrends(
     cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
@@ -503,7 +394,6 @@ fn writeApproachTrends(
     const pool = approaches_mod.ApproachPool.loadFromStore(store, allocator) catch
         approaches_mod.ApproachPool.load(allocator, paths.approaches_file) catch return;
 
-    // Build the trends report in a stack buffer
     var buf: [16384]u8 = undefined;
     var pos: usize = 0;
 
@@ -549,7 +439,6 @@ fn writeApproachTrends(
         }
     }
 
-    // Store in LMDB meta
     const write_txn = store.beginWriteTxn() catch return;
     store.putMeta(write_txn, "report:trends", buf[0..pos]) catch {
         store_mod.Store.abortTxn(write_txn);

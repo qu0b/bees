@@ -9,7 +9,7 @@ pub const GitResult = struct {
 
 pub const MergeResult = union(enum) {
     success,
-    conflict: struct { files: []const []const u8 },
+    conflict: struct { files: []const []const u8, stderr: []const u8 = "" },
 };
 
 pub const DiffStats = struct {
@@ -100,9 +100,14 @@ pub fn getDiff(allocator: std.mem.Allocator, io: Io, repo_path: []const u8, bran
 pub fn tryMerge(allocator: std.mem.Allocator, io: Io, repo_path: []const u8, branch: []const u8) !MergeResult {
     const result = try run(allocator, io, &.{ "git", "merge", "--no-edit", branch }, repo_path);
     defer allocator.free(result.stdout);
-    defer allocator.free(result.stderr);
 
-    if (result.exit_code == 0) return .success;
+    if (result.exit_code == 0) {
+        allocator.free(result.stderr);
+        return .success;
+    }
+
+    // Keep merge stderr for diagnostics (caller must free)
+    const merge_stderr = result.stderr;
 
     const conflict_result = try run(allocator, io, &.{ "git", "diff", "--name-only", "--diff-filter=U" }, repo_path);
     defer allocator.free(conflict_result.stderr);
@@ -113,11 +118,11 @@ pub fn tryMerge(allocator: std.mem.Allocator, io: Io, repo_path: []const u8, bra
         while (iter.next()) |file| {
             if (file.len > 0) try files.append(allocator, file);
         }
-        return .{ .conflict = .{ .files = try files.toOwnedSlice(allocator) } };
+        return .{ .conflict = .{ .files = try files.toOwnedSlice(allocator), .stderr = merge_stderr } };
     }
 
     allocator.free(conflict_result.stdout);
-    return .{ .conflict = .{ .files = &.{} } };
+    return .{ .conflict = .{ .files = &.{}, .stderr = merge_stderr } };
 }
 
 pub fn abortMerge(allocator: std.mem.Allocator, io: Io, repo_path: []const u8) !void {
@@ -146,7 +151,12 @@ pub fn getCurrentHead(allocator: std.mem.Allocator, io: Io, repo_path: []const u
         allocator.free(result.stdout);
         return error.HeadNotFound;
     }
-    return std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+    // Dupe the trimmed slice so callers can safely free the returned pointer.
+    // result.stdout is freed here; the caller owns the dupe.
+    const trimmed = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+    const owned = try allocator.dupe(u8, trimmed);
+    allocator.free(result.stdout);
+    return owned;
 }
 
 pub fn getChangedFiles(allocator: std.mem.Allocator, io: Io, repo_path: []const u8, old_ref: []const u8, new_ref: []const u8) ![]const u8 {

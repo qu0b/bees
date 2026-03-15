@@ -72,7 +72,7 @@ pub fn runQa(
         .model = cfg.qa.model,
         .effort = cfg.qa.effort,
         .max_budget_usd = cfg.qa.max_budget_usd,
-        .mcp_config = "/home/ubuntu/agents-swarm/mcp-chrome.json",
+        .mcp_config = cfg.qa.mcp_config,
         .stream_output = stream_output,
         .db_dir = paths.db_dir,
     }, session_id, allocator) catch |e| {

@@ -30,18 +30,25 @@ pub const DeadLetterQueue = struct {
         header: types.EventHeader,
         raw_json: []const u8,
     ) void {
-        const file = fs.createFile(self.path, .{ .truncate = false }) catch return;
+        // Read existing content so we can append. fs.writeFile writes from position 0,
+        // so we must read existing data, truncate the file, then write existing + new entry.
+        const existing = fs.readFileAlloc(std.heap.page_allocator, self.path, 64 * 1024 * 1024) catch &[_]u8{};
+        defer if (existing.len > 0) std.heap.page_allocator.free(existing);
+
+        // Build the new 20-byte fixed header for this entry.
+        // Write: session_id(8) + seq(4) + header(4) + json_len(4) + json(N)
+        var entry_hdr: [20]u8 = undefined;
+        std.mem.writeInt(u64, entry_hdr[0..8], session_id, .little);
+        std.mem.writeInt(u32, entry_hdr[8..12], seq, .little);
+        @memcpy(entry_hdr[12..16], std.mem.asBytes(&header));
+        std.mem.writeInt(u32, entry_hdr[16..20], @intCast(raw_json.len), .little);
+
+        // Truncate the file and rewrite: existing content + new entry header + new json.
+        const file = fs.createFile(self.path, .{}) catch return;
         defer fs.closeFile(file);
 
-        // Seek to end by writing at current position (createFile with truncate=false)
-        // Write: session_id(8) + seq(4) + header(4) + json_len(4) + json(N)
-        var buf: [20]u8 = undefined;
-        std.mem.writeInt(u64, buf[0..8], session_id, .little);
-        std.mem.writeInt(u32, buf[8..12], seq, .little);
-        @memcpy(buf[12..16], std.mem.asBytes(&header));
-        std.mem.writeInt(u32, buf[16..20], @intCast(raw_json.len), .little);
-
-        fs.writeFile(file, &buf) catch return;
+        fs.writeFile(file, existing) catch return;
+        fs.writeFile(file, &entry_hdr) catch return;
         fs.writeFile(file, raw_json) catch return;
         self.entry_count += 1;
     }

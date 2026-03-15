@@ -25,6 +25,11 @@ pub fn runMerger(
 ) !void {
     logger.info("[merger] starting scan", .{});
 
+    // Ensure clean working tree before merging. QA, strategist, and build
+    // commands run in the main repo and can leave uncommitted changes that
+    // cause `git merge` to refuse.
+    ensureCleanWorktree(cfg, paths, logger, io, allocator);
+
     // Scan worktrees for .done markers
     const worktree_base = try std.fmt.allocPrint(allocator, "/tmp/bees-{s}/worktrees", .{cfg.project.name});
     defer allocator.free(worktree_base);
@@ -38,6 +43,9 @@ pub fn runMerger(
     };
     defer fs.closeDir(dir);
 
+    const now: u64 = fs.timestamp();
+    const stale_cutoff = now -| (@as(u64, cfg.timeouts.stale_hours) * 3600);
+
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
         if (entry.kind != .directory) continue;
@@ -50,6 +58,24 @@ pub fn runMerger(
         if (!fs.access(done_path)) {
             allocator.free(wt_dir);
             continue;
+        }
+
+        // Age-gate: parse timestamp from directory name (worker-{id}-{YYYYMMDD-HHMMSS})
+        // and skip worktrees older than timeouts.stale_hours
+        if (parseWorktreeTimestamp(entry.name)) |wt_time| {
+            if (wt_time < stale_cutoff) {
+                const age_hours = (now - wt_time) / 3600;
+                logger.info("[merger] {s}: stale ({d}h old, cutoff={d}h), cleaning up", .{ entry.name, age_hours, cfg.timeouts.stale_hours });
+                const branch = std.fmt.allocPrint(allocator, "bee/{s}/{s}", .{ cfg.project.name, entry.name }) catch {
+                    allocator.free(wt_dir);
+                    continue;
+                };
+                defer allocator.free(branch);
+                git.removeWorktree(allocator, io, paths.root, wt_dir) catch {};
+                git.deleteBranch(allocator, io, paths.root, branch) catch {};
+                allocator.free(wt_dir);
+                continue;
+            }
         }
 
         const branch = try std.fmt.allocPrint(allocator, "bee/{s}/{s}", .{ cfg.project.name, entry.name });
@@ -87,89 +113,73 @@ pub fn runMerger(
 
     logger.info("[merger] found {d} candidates", .{candidates.items.len});
 
-    // Review each candidate
-    var accepted: std.ArrayList(usize) = .empty;
-    defer accepted.deinit(allocator);
-
-    for (candidates.items, 0..) |*candidate, idx| {
-        const verdict = try reviewCandidate(cfg, paths, store, logger, io, candidate, allocator);
-        if (verdict == .accept) {
-            try accepted.append(allocator, idx);
-        }
-    }
-
-    if (accepted.items.len == 0) {
-        logger.info("[merger] no branches accepted", .{});
-        return;
-    }
-
-    // Save HEAD before merging
+    // Save HEAD before any merges for rollback
     const saved_head = try git.getCurrentHead(allocator, io, paths.root);
     defer allocator.free(saved_head);
 
-    // Merge accepted branches
+    // For each candidate: one Claude agent session reviews the diff AND
+    // performs the merge if it approves. The verdict is determined by
+    // whether HEAD moved — no text parsing needed.
     var merged_count: u32 = 0;
-    for (accepted.items) |idx| {
-        const candidate = &candidates.items[idx];
-        logger.info("[merger] merging {s}", .{candidate.branch});
+    for (candidates.items) |*candidate| {
+        const pre_head = git.getCurrentHead(allocator, io, paths.root) catch continue;
+        defer allocator.free(pre_head);
 
-        const merge_result = try git.tryMerge(allocator, io, paths.root, candidate.branch);
-        switch (merge_result) {
-            .success => {
-                merged_count += 1;
-                logger.info("[merger] merged {s} successfully", .{candidate.branch});
-            },
-            .conflict => |conflict| {
-                if (conflict.files.len <= cfg.merger.max_conflict_files) {
-                    logger.info("[merger] {s}: {d} conflicts, attempting AI resolution", .{ candidate.branch, conflict.files.len });
-                    const resolved = try resolveConflicts(cfg, paths, store, logger, io, candidate, allocator);
-                    if (resolved) {
-                        merged_count += 1;
-                    } else {
-                        try git.abortMerge(allocator, io, paths.root);
-                        writeMarker(allocator, candidate.dir, ".conflict");
-                        if (candidate.worker_session_id) |wsid| {
-                            updateWorkerStatus(store, wsid, .conflict_status) catch {};
-                        }
-                    }
-                } else {
-                    logger.info("[merger] {s}: too many conflicts ({d}), aborting", .{ candidate.branch, conflict.files.len });
-                    try git.abortMerge(allocator, io, paths.root);
-                    writeMarker(allocator, candidate.dir, ".conflict");
-                    if (candidate.worker_session_id) |wsid| {
-                        updateWorkerStatus(store, wsid, .conflict_status) catch {};
-                    }
-                }
-            },
-        }
-    }
+        reviewAndMerge(cfg, paths, store, logger, io, candidate, allocator);
 
-    if (merged_count == 0) {
-        logger.info("[merger] no branches merged", .{});
-        return;
-    }
+        const post_head = git.getCurrentHead(allocator, io, paths.root) catch continue;
+        defer allocator.free(post_head);
 
-    // Build, test, deploy pipeline
-    const pipeline_ok = try runPipeline(cfg, paths, store, logger, io, saved_head, allocator);
-
-    if (pipeline_ok) {
-        for (accepted.items) |idx| {
-            const candidate = &candidates.items[idx];
-            // Mark worker session as merged
+        if (!std.mem.eql(u8, pre_head, post_head)) {
+            // HEAD moved — agent merged the branch
+            merged_count += 1;
             if (candidate.worker_session_id) |wsid| {
                 updateWorkerStatus(store, wsid, .merged) catch {};
+                const txn = store.beginWriteTxn() catch null;
+                if (txn) |t| {
+                    const rh = types.ReviewHeader{ .verdict = .accept, .review_session_id = @truncate(candidate.session_id orelse 0), .reviewed_at = @truncate(fs.timestamp()) };
+                    store.insertReview(t, wsid, rh, "Merged by review agent") catch {};
+                    store_mod.Store.commitTxn(t) catch {};
+                }
+                incrementWorkerApproachStat(store, wsid, .accepted);
             }
             cleanupWorktree(allocator, io, paths.root, candidate);
-            logger.info("[merger] cleaned up {s}", .{candidate.branch});
+            logger.info("[merger] merged and cleaned up {s}", .{candidate.branch});
+        } else {
+            // HEAD unchanged — agent rejected or failed to merge
+            logger.info("[merger] {s}: not merged (rejected or failed)", .{candidate.branch});
+            writeMarker(allocator, candidate.dir, ".rejected");
+            if (candidate.worker_session_id) |wsid| {
+                updateWorkerStatus(store, wsid, .rejected) catch {};
+                const txn = store.beginWriteTxn() catch null;
+                if (txn) |t| {
+                    const rh = types.ReviewHeader{ .verdict = .reject, .review_session_id = @truncate(candidate.session_id orelse 0), .reviewed_at = @truncate(fs.timestamp()) };
+                    store.insertReview(t, wsid, rh, "Rejected by review agent") catch {};
+                    store_mod.Store.commitTxn(t) catch {};
+                }
+                incrementWorkerApproachStat(store, wsid, .rejected);
+            }
         }
     }
 
+    if (merged_count > 0) {
+        // Build, test, deploy pipeline
+        const pipeline_ok = try runPipeline(cfg, paths, store, logger, io, saved_head, allocator);
+        if (!pipeline_ok) {
+            logger.warn("[merger] pipeline failed, changes rolled back to {s}", .{saved_head[0..@min(saved_head.len, 12)]});
+        }
+    }
+
+    // Always clean up old/failed worktrees
     try cleanupOldWorktrees(cfg, paths, logger, io, worktree_base, allocator);
 
-    logger.info("[merger] done. merged={d}", .{merged_count});
+    logger.info("[merger] done. merged={d}/{d}", .{ merged_count, candidates.items.len });
 }
 
-fn reviewCandidate(
+/// Combined review + merge agent. The agent reviews the diff, and if it
+/// approves, merges the branch itself. Verdict is determined by whether
+/// HEAD moved — no text parsing needed.
+fn reviewAndMerge(
     cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
     store: *store_mod.Store,
@@ -177,14 +187,17 @@ fn reviewCandidate(
     io: Io,
     candidate: *WorktreeCandidate,
     allocator: std.mem.Allocator,
-) !types.Verdict {
+) void {
     const diff = git.getDiff(allocator, io, paths.root, candidate.branch, cfg.project.base_branch) catch |e| {
         logger.err("[merger] diff failed for {s}: {}", .{ candidate.branch, e });
-        return .reject;
+        return;
     };
     defer allocator.free(diff);
 
-    if (diff.len == 0) return .reject;
+    if (diff.len == 0) {
+        logger.info("[merger] {s}: empty diff, skipping", .{candidate.branch});
+        return;
+    }
 
     const merger_model = types.ModelType.fromString(cfg.merger.model);
     const now: u64 = fs.timestamp();
@@ -211,172 +224,96 @@ fn reviewCandidate(
         .cache_read_tokens = 0,
     };
 
-    const session_id = try store.createSession(header, "", candidate.branch, "");
+    const session_id = store.createSession(header, "", candidate.branch, "") catch return;
     candidate.session_id = session_id;
 
-    const review_prompt_path = try std.fs.path.join(allocator, &.{ paths.prompts_dir, "review.txt" });
+    const review_prompt_path = std.fs.path.join(allocator, &.{ paths.prompts_dir, "review.txt" }) catch return;
     defer allocator.free(review_prompt_path);
 
+    // Cap diff to avoid blowing the context window
+    const diff_preview = if (diff.len > 50000) diff[0..50000] else diff;
+
+    const review_prompt = std.fmt.allocPrint(allocator,
+        \\Review and merge the following diff from branch `{s}`.
+        \\
+        \\You have full tool access. You can read source files, run the build, and run tests.
+        \\
+        \\## Your task
+        \\1. Review the diff below for correctness, safety, and quality
+        \\2. If needed, read the surrounding source code for context
+        \\3. If the changes are good:
+        \\   - Run: `git merge --no-edit {s}`
+        \\   - If there are conflicts, resolve them, then `git add -A && git commit --no-edit`
+        \\   - Verify the build still passes
+        \\4. If the changes are bad or harmful, do NOT merge. Explain why.
+        \\
+        \\```diff
+        \\{s}
+        \\```
+    , .{ candidate.branch, candidate.branch, diff_preview }) catch return;
+    defer allocator.free(review_prompt);
+
+    logger.info("[merger] reviewing {s}", .{candidate.branch});
+
     const result = claude.runClaudeSession(store, io, .{
-        .prompt = "Review the following diff and respond with ACCEPT or REJECT followed by your reasoning.",
+        .prompt = review_prompt,
         .cwd = paths.root,
-        .system_prompt_file = review_prompt_path,
-        .stdin_data = diff,
+        .append_prompt_file = review_prompt_path,
         .model = cfg.merger.model,
         .effort = cfg.merger.effort,
         .max_budget_usd = cfg.merger.max_budget_usd,
+        .max_turns = 20,
         .db_dir = paths.db_dir,
     }, session_id, allocator) catch |e| {
-        logger.err("[merger] review failed for {s}: {}", .{ candidate.branch, e });
-        return .reject;
+        logger.err("[merger] review session failed for {s}: {}", .{ candidate.branch, e });
+        return;
     };
 
-    const verdict = parseVerdict(result.result_text);
-
-    {
-        const txn = try store.beginWriteTxn();
-        errdefer store_mod.Store.abortTxn(txn);
-
-        const review_header = types.ReviewHeader{
-            .verdict = verdict,
-            .review_session_id = @truncate(session_id),
-            .reviewed_at = @truncate(now),
-        };
-        try store.insertReview(txn, session_id, review_header, result.result_text);
-
-        // Increment approach stats for the worker's approach
-        if (candidate.worker_session_id) |wsid| {
-            if (try store.getSession(txn, wsid)) |worker_session| {
-                if (worker_session.approach.len > 0 and worker_session.approach.len <= 256) {
-                    var name_buf: [256]u8 = undefined;
-                    const name_len = worker_session.approach.len;
-                    @memcpy(name_buf[0..name_len], worker_session.approach[0..name_len]);
-                    store.incrementApproachStat(txn, name_buf[0..name_len], if (verdict == .accept) .accepted else .rejected) catch {};
-                }
-            }
-        }
-
-        try store_mod.Store.commitTxn(txn);
-    }
-
-    // Update review session status to done
-    {
-        var updated_header = header;
-        updated_header.status = .done;
-        updated_header.has_cost = true;
-        updated_header.cost_microdollars = result.cost_microdollars;
-        updated_header.duration_ms = @as(u32, result.duration_secs) * 1000;
-        updated_header.finished_at = @truncate(fs.timestamp());
-        updated_header.num_turns = result.num_turns;
-        updated_header.has_tokens = (result.input_tokens > 0 or result.output_tokens > 0);
-        updated_header.input_tokens = result.input_tokens;
-        updated_header.output_tokens = result.output_tokens;
-        updated_header.cache_creation_tokens = result.cache_creation_tokens;
-        updated_header.cache_read_tokens = result.cache_read_tokens;
-        store.updateSessionStatus(session_id, .running, header.started_at, updated_header) catch {};
-    }
-
-    logger.info("[merger] review {s}: {s}", .{ candidate.branch, verdict.label() });
-    if (verdict == .reject) {
-        writeMarker(allocator, candidate.dir, ".rejected");
-        // Update the original worker session status to rejected
-        if (candidate.worker_session_id) |wsid| {
-            updateWorkerStatus(store, wsid, .rejected) catch {};
-        }
-    }
-
-    return verdict;
+    // Update session status
+    var updated_header = header;
+    updated_header.status = if (result.is_error) .err else .done;
+    updated_header.has_exit_code = true;
+    updated_header.has_cost = true;
+    updated_header.cost_microdollars = result.cost_microdollars;
+    updated_header.finished_at = @truncate(fs.timestamp());
+    updated_header.duration_ms = @intCast(@min((fs.timestamp() - now) * 1000, std.math.maxInt(u32)));
+    updated_header.num_turns = result.num_turns;
+    updated_header.has_tokens = (result.input_tokens > 0 or result.output_tokens > 0);
+    updated_header.input_tokens = result.input_tokens;
+    updated_header.output_tokens = result.output_tokens;
+    updated_header.cache_creation_tokens = result.cache_creation_tokens;
+    updated_header.cache_read_tokens = result.cache_read_tokens;
+    store.updateSessionStatus(session_id, .running, @truncate(now), updated_header) catch {};
 }
 
-fn parseVerdict(text: []const u8) types.Verdict {
-    const upper_start = if (text.len > 200) text[0..200] else text;
-    if (std.mem.indexOf(u8, upper_start, "ACCEPT") != null) return .accept;
-    return .reject;
-}
-
-fn resolveConflicts(
-    cfg: config_mod.Config,
-    paths: config_mod.ProjectPaths,
-    store: *store_mod.Store,
-    logger: *log_mod.Logger,
-    io: Io,
-    candidate: *WorktreeCandidate,
-    allocator: std.mem.Allocator,
-) !bool {
-    const conflict_model = types.ModelType.fromString(cfg.merger.model);
-    const now: u64 = fs.timestamp();
-    const header = types.SessionHeader{
-        .@"type" = .conflict,
-        .status = .running,
-        .has_exit_code = false,
-        .has_cost = false,
-        .model = conflict_model,
-        .has_tokens = false,
-        .has_duration = false,
-        .has_diff_summary = false,
-        .worker_id = 0,
-        .commit_count = 0,
-        .num_turns = 0,
-        .exit_code = 0,
-        .started_at = @truncate(now),
-        .finished_at = 0,
-        .duration_ms = 0,
-        .cost_microdollars = 0,
-        .input_tokens = 0,
-        .output_tokens = 0,
-        .cache_creation_tokens = 0,
-        .cache_read_tokens = 0,
+/// Increment the approach stat for a worker session's approach.
+fn incrementWorkerApproachStat(store: *store_mod.Store, worker_session_id: u64, field: enum { accepted, rejected }) void {
+    const read_txn = store.beginReadTxn() catch return;
+    const session = (store.getSession(read_txn, worker_session_id) catch null) orelse {
+        store_mod.Store.abortTxn(read_txn);
+        return;
     };
+    // Copy approach name before closing read txn (it points into mmap)
+    var name_buf: [256]u8 = undefined;
+    const name_len = @min(session.approach.len, name_buf.len);
+    if (name_len == 0) {
+        store_mod.Store.abortTxn(read_txn);
+        return;
+    }
+    @memcpy(name_buf[0..name_len], session.approach[0..name_len]);
+    store_mod.Store.abortTxn(read_txn);
 
-    const session_id = try store.createSession(header, "", candidate.branch, paths.root);
-
-    const conflict_prompt_path = try std.fs.path.join(allocator, &.{ paths.prompts_dir, "conflict.txt" });
-    defer allocator.free(conflict_prompt_path);
-
-    const cr_result = claude.runClaudeSession(store, io, .{
-        .prompt = "Resolve all merge conflicts in this repository. Ensure the code compiles and tests pass.",
-        .cwd = paths.root,
-        .append_prompt_file = conflict_prompt_path,
-        .model = cfg.merger.model,
-        .effort = cfg.merger.effort,
-        .max_budget_usd = cfg.merger.max_budget_usd,
-        .db_dir = paths.db_dir,
-    }, session_id, allocator) catch |e| {
-        logger.err("[merger] conflict resolution failed: {}", .{e});
-        return false;
+    const write_txn = store.beginWriteTxn() catch return;
+    store.incrementApproachStat(write_txn, name_buf[0..name_len], switch (field) {
+        .accepted => .accepted,
+        .rejected => .rejected,
+    }) catch {
+        store_mod.Store.abortTxn(write_txn);
+        return;
     };
-
-    const check = git.run(allocator, io, &.{ "git", "diff", "--name-only", "--diff-filter=U" }, paths.root) catch return false;
-    defer allocator.free(check.stdout);
-    defer allocator.free(check.stderr);
-
-    const resolved = check.stdout.len == 0;
-
-    // Update conflict session status
-    {
-        var updated_header = header;
-        updated_header.status = if (resolved) .done else .conflict_status;
-        updated_header.has_cost = true;
-        updated_header.cost_microdollars = cr_result.cost_microdollars;
-        updated_header.duration_ms = @as(u32, cr_result.duration_secs) * 1000;
-        updated_header.finished_at = @truncate(fs.timestamp());
-        updated_header.num_turns = cr_result.num_turns;
-        updated_header.has_tokens = (cr_result.input_tokens > 0 or cr_result.output_tokens > 0);
-        updated_header.input_tokens = cr_result.input_tokens;
-        updated_header.output_tokens = cr_result.output_tokens;
-        updated_header.cache_creation_tokens = cr_result.cache_creation_tokens;
-        updated_header.cache_read_tokens = cr_result.cache_read_tokens;
-        store.updateSessionStatus(session_id, .running, header.started_at, updated_header) catch {};
-    }
-
-    if (resolved) {
-        git.commitMerge(allocator, io, paths.root) catch return false;
-        logger.info("[merger] conflicts resolved for {s}", .{candidate.branch});
-        return true;
-    }
-
-    return false;
+    store_mod.Store.commitTxn(write_txn) catch {};
 }
+
 
 fn runPipeline(
     cfg: config_mod.Config,
@@ -543,29 +480,136 @@ fn cleanupOldWorktrees(
     worktree_base: []const u8,
     allocator: std.mem.Allocator,
 ) !void {
-    var dir = fs.openDir(worktree_base) catch return;
-    defer fs.closeDir(dir);
+    // 1. Clean worktree directories with failure markers
+    {
+        var dir = fs.openDir(worktree_base) catch return;
+        defer fs.closeDir(dir);
 
-    // TODO: once we can stat files, compare worktree age vs cfg.timeouts
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .directory) continue;
 
-    var it = dir.iterate();
-    while (try it.next(io)) |entry| {
-        if (entry.kind != .directory) continue;
+            const wt_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ worktree_base, entry.name });
+            defer allocator.free(wt_dir);
 
-        const wt_dir = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ worktree_base, entry.name });
+            const has_rejected = hasFile(allocator, wt_dir, ".rejected");
+            const has_conflict = hasFile(allocator, wt_dir, ".conflict");
+            const has_build_failed = hasFile(allocator, wt_dir, ".build-failed");
+            const has_done = hasFile(allocator, wt_dir, ".done");
+
+            if (has_rejected or has_conflict or has_build_failed or !has_done) {
+                const branch = std.fmt.allocPrint(allocator, "bee/{s}/{s}", .{ cfg.project.name, entry.name }) catch continue;
+                defer allocator.free(branch);
+                git.removeWorktree(allocator, io, paths.root, wt_dir) catch {};
+                git.deleteBranch(allocator, io, paths.root, branch) catch {};
+                logger.info("[merger] cleaned old worktree {s}", .{entry.name});
+            }
+        }
+    }
+
+    // 2. Prune stale git worktree refs (worktree dir deleted but git still tracks it)
+    {
+        const prune = git.run(allocator, io, &.{ "git", "worktree", "prune" }, paths.root) catch null;
+        if (prune) |r| {
+            allocator.free(r.stdout);
+            allocator.free(r.stderr);
+        }
+    }
+
+    // 3. Delete orphaned bee/ branches (no corresponding worktree directory)
+    pruneOrphanedBranches(cfg, paths, logger, io, worktree_base, allocator);
+}
+
+/// Delete bee/ branches whose worktree directory no longer exists.
+/// Prevents branch accumulation across daemon restarts.
+fn pruneOrphanedBranches(
+    cfg: config_mod.Config,
+    paths: config_mod.ProjectPaths,
+    logger: *log_mod.Logger,
+    io: Io,
+    worktree_base: []const u8,
+    allocator: std.mem.Allocator,
+) void {
+    const prefix = std.fmt.allocPrint(allocator, "bee/{s}/", .{cfg.project.name}) catch return;
+    defer allocator.free(prefix);
+
+    const result = git.run(allocator, io, &.{ "git", "branch", "--format=%(refname:short)" }, paths.root) catch return;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.exit_code != 0) return;
+
+    var pruned: u32 = 0;
+    var lines = std.mem.splitScalar(u8, result.stdout, '\n');
+    while (lines.next()) |line| {
+        const branch = std.mem.trim(u8, line, &std.ascii.whitespace);
+        if (branch.len == 0) continue;
+        if (!std.mem.startsWith(u8, branch, prefix)) continue;
+
+        // Extract worktree dir name from branch: "bee/{project}/{dirname}" -> "{dirname}"
+        const dirname = branch[prefix.len..];
+        if (dirname.len == 0) continue;
+
+        // Check if worktree dir still exists
+        const wt_dir = std.fmt.allocPrint(allocator, "{s}/{s}", .{ worktree_base, dirname }) catch continue;
         defer allocator.free(wt_dir);
 
-        const has_rejected = hasFile(allocator, wt_dir, ".rejected");
-        const has_conflict = hasFile(allocator, wt_dir, ".conflict");
-        const has_build_failed = hasFile(allocator, wt_dir, ".build-failed");
-        const has_done = hasFile(allocator, wt_dir, ".done");
+        if (!fs.access(wt_dir)) {
+            // Worktree gone — branch is orphaned
+            git.deleteBranch(allocator, io, paths.root, branch) catch continue;
+            pruned += 1;
+        }
+    }
 
-        if (has_rejected or has_conflict or has_build_failed or !has_done) {
-            const branch = std.fmt.allocPrint(allocator, "bee/{s}/{s}", .{ cfg.project.name, entry.name }) catch continue;
-            defer allocator.free(branch);
-            git.removeWorktree(allocator, io, paths.root, wt_dir) catch {};
-            git.deleteBranch(allocator, io, paths.root, branch) catch {};
-            logger.info("[merger] cleaned old worktree {s}", .{entry.name});
+    if (pruned > 0) {
+        logger.info("[merger] pruned {d} orphaned bee/ branches", .{pruned});
+    }
+}
+
+/// Ensure the main repo working tree is clean before merging.
+/// Agents (QA, strategist) and build commands can leave dirty files.
+fn ensureCleanWorktree(
+    cfg: config_mod.Config,
+    paths: config_mod.ProjectPaths,
+    logger: *log_mod.Logger,
+    io: Io,
+    allocator: std.mem.Allocator,
+) void {
+    _ = cfg;
+    const status = git.run(allocator, io, &.{ "git", "status", "--porcelain" }, paths.root) catch return;
+    defer allocator.free(status.stdout);
+    defer allocator.free(status.stderr);
+
+    const trimmed = std.mem.trim(u8, status.stdout, &std.ascii.whitespace);
+    if (trimmed.len == 0) return;
+
+    // Count modified vs untracked
+    var modified: u32 = 0;
+    var untracked: u32 = 0;
+    var lines = std.mem.splitScalar(u8, trimmed, '\n');
+    while (lines.next()) |line| {
+        if (line.len >= 2) {
+            if (line[0] == '?' and line[1] == '?') {
+                untracked += 1;
+            } else {
+                modified += 1;
+            }
+        }
+    }
+
+    logger.info("[merger] dirty working tree: {d} modified, {d} untracked files", .{ modified, untracked });
+
+    // Stage and commit everything
+    {
+        const add = git.run(allocator, io, &.{ "git", "add", "-A" }, paths.root) catch return;
+        allocator.free(add.stdout);
+        allocator.free(add.stderr);
+    }
+    {
+        const commit = git.run(allocator, io, &.{ "git", "commit", "-m", "Auto-commit: save agent changes before merge cycle" }, paths.root) catch return;
+        allocator.free(commit.stdout);
+        allocator.free(commit.stderr);
+        if (commit.exit_code == 0) {
+            logger.info("[merger] auto-committed dirty working tree", .{});
         }
     }
 }
@@ -588,4 +632,40 @@ fn updateWorkerStatus(store: *store_mod.Store, worker_session_id: u64, new_statu
     var updated_header = session.header;
     updated_header.status = new_status;
     try store.updateSessionStatus(worker_session_id, .done, old_started_at, updated_header);
+}
+
+/// Parse a unix timestamp from a worktree directory name like "worker-3-20260315-163045".
+/// Returns null if the name doesn't match the expected pattern.
+fn parseWorktreeTimestamp(name: []const u8) ?u64 {
+    // Name format: worker-{id}-{YYYYMMDD}-{HHMMSS}
+    // Last 15 chars: "YYYYMMDD-HHMMSS"
+    if (name.len < 15) return null;
+    const tail = name[name.len - 15 ..];
+    if (tail[8] != '-') return null;
+
+    const year = std.fmt.parseInt(u32, tail[0..4], 10) catch return null;
+    const month = std.fmt.parseInt(u32, tail[4..6], 10) catch return null;
+    const day = std.fmt.parseInt(u32, tail[6..8], 10) catch return null;
+    const hour = std.fmt.parseInt(u32, tail[9..11], 10) catch return null;
+    const minute = std.fmt.parseInt(u32, tail[11..13], 10) catch return null;
+    const second = std.fmt.parseInt(u32, tail[13..15], 10) catch return null;
+
+    if (month < 1 or month > 12 or day < 1 or day > 31) return null;
+    if (hour > 23 or minute > 59 or second > 59) return null;
+
+    // Convert to epoch seconds: days since 1970-01-01 * 86400 + time of day
+    // Simplified Gregorian calendar calculation
+    var y = year;
+    var m = month;
+    if (m <= 2) {
+        y -= 1;
+        m += 12;
+    }
+    // Days from epoch (1970-01-01) using a standard formula
+    const epoch_days: i64 = @as(i64, @intCast(365 * y + y / 4 - y / 100 + y / 400 + (153 * (m - 3) + 2) / 5 + day - 719469));
+    if (epoch_days < 0) return null;
+    return @as(u64, @intCast(epoch_days)) * 86400 +
+        @as(u64, hour) * 3600 +
+        @as(u64, minute) * 60 +
+        @as(u64, second);
 }

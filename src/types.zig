@@ -477,11 +477,13 @@ pub fn readLenPrefixed(buf: []const u8, offset: *usize) []const u8 {
 }
 
 pub fn writeLenPrefixed(buf: []u8, offset: *usize, data: []const u8) void {
-    const len: u16 = @intCast(data.len);
+    // Truncate to u16 max if data is too long (defensive — avoids runtime panic)
+    const capped_len = @min(data.len, std.math.maxInt(u16));
+    const len: u16 = @intCast(capped_len);
     std.mem.writeInt(u16, buf[offset.*..][0..2], len, .little);
     offset.* += 2;
-    @memcpy(buf[offset.*..][0..data.len], data);
-    offset.* += data.len;
+    @memcpy(buf[offset.*..][0..capped_len], data[0..capped_len]);
+    offset.* += capped_len;
 }
 
 pub fn sessionValueSize(approach: []const u8, branch: []const u8, worktree: []const u8, diff_summary: ?[]const u8) usize {

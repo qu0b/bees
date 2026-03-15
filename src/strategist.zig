@@ -68,7 +68,7 @@ pub fn runStrategist(
         .model = cfg.strategist.model,
         .effort = cfg.strategist.effort,
         .max_budget_usd = cfg.strategist.max_budget_usd,
-        .mcp_config = "/home/ubuntu/agents-swarm/mcp-chrome.json",
+        .mcp_config = cfg.strategist.mcp_config,
         .stream_output = stream_output,
         .db_dir = paths.db_dir,
     }, session_id, allocator) catch |e| {

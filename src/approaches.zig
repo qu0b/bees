@@ -104,27 +104,17 @@ pub const ApproachPool = struct {
         return self.total_weight > 0;
     }
 
+    /// Select an approach. Uses round-robin so consecutive calls within a
+    /// batch always return different approaches (when batch size <= pool size).
+    /// Weight still matters across cycles — higher-weight approaches appear
+    /// more often in the rotation order.
     pub fn select(self: *const ApproachPool) ?*const Approach {
         if (self.approaches.len == 0) return null;
         if (self.total_weight == 0) return null;
-        if (self.approaches.len == 1) return &self.approaches[0];
 
         const counter = @atomicRmw(u64, &select_counter, .Add, 1, .monotonic);
-        var prng = std.Random.DefaultPrng.init(fs.timestamp() *% 2654435761 +% counter);
-        const rand = prng.random();
-        const val = rand.intRangeAtMost(u32, 1, self.total_weight);
-
-        var lo: usize = 0;
-        var hi: usize = self.approaches.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (self.approaches[mid].cumulative < val) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        return &self.approaches[lo];
+        const idx = counter % self.approaches.len;
+        return &self.approaches[@intCast(idx)];
     }
 };
 
@@ -178,13 +168,13 @@ pub fn syncFromJson(
         if (existing) |view| {
             // Preserve stats, update weight + prompt + reactivate
             var header = view.header;
-            header.weight = @intCast(item.weight);
+            header.weight = @truncate(item.weight);
             header.status = .active;
             try store.upsertApproach(txn, item.name, header, item.prompt);
         } else {
             // New approach
             const header = types.ApproachHeader{
-                .weight = @intCast(item.weight),
+                .weight = @truncate(item.weight),
                 .total_runs = 0,
                 .accepted = 0,
                 .rejected = 0,
@@ -219,7 +209,61 @@ pub fn syncFromJson(
         }
     }
 
+    // Write approaches JSON to meta for dashboard direct reads
+    writeApproachesMeta(store, txn, allocator) catch {};
+
     try store_mod.Store.commitTxn(txn);
+}
+
+/// Write a JSON array of all approaches to the meta sub-database.
+fn writeApproachesMeta(store: *store_mod.Store, txn: anytype, allocator: std.mem.Allocator) !void {
+    var json: std.ArrayList(u8) = .empty;
+    defer json.deinit(allocator);
+    try json.append(allocator, '[');
+
+    var iter = try store.iterApproaches(txn);
+    defer iter.close();
+    var first = true;
+
+    while (iter.next()) |entry| {
+        if (!first) try json.append(allocator, ',');
+        first = false;
+
+        const h = entry.view.header;
+        // Build JSON object — escape approach name and prompt
+        try json.appendSlice(allocator, "{\"name\":");
+        try appendJsonStr(&json, allocator, entry.name);
+        var stat_buf: [256]u8 = undefined;
+        const stats = std.fmt.bufPrint(&stat_buf,
+            \\,"weight":{d},"total_runs":{d},"accepted":{d},"rejected":{d},"empty":{d},"status":"{s}","origin":"{s}","prompt":
+        , .{ h.weight, h.total_runs, h.accepted, h.rejected, h.empty, h.status.label(), h.origin.label() }) catch continue;
+        try json.appendSlice(allocator, stats);
+        try appendJsonStr(&json, allocator, entry.view.prompt);
+        try json.append(allocator, '}');
+    }
+
+    try json.append(allocator, ']');
+    try store.putMeta(txn, "approaches:all", json.items);
+}
+
+/// Append a JSON-escaped string (with quotes) to an ArrayList.
+fn appendJsonStr(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    try list.append(allocator, '"');
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try list.appendSlice(allocator, "\\\""),
+            '\\' => try list.appendSlice(allocator, "\\\\"),
+            '\n' => try list.appendSlice(allocator, "\\n"),
+            '\r' => try list.appendSlice(allocator, "\\r"),
+            '\t' => try list.appendSlice(allocator, "\\t"),
+            else => {
+                if (ch >= 0x20) {
+                    try list.append(allocator, ch);
+                }
+            },
+        }
+    }
+    try list.append(allocator, '"');
 }
 
 /// Sync approaches from JSON file into LMDB.

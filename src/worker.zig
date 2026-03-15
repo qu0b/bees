@@ -9,6 +9,11 @@ const approaches_mod = @import("approaches.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 
+pub const WorkerResult = struct {
+    session_id: u64 = 0,
+    tool_errors: u16 = 0,
+};
+
 pub fn runWorkerWithTimeout(
     cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
@@ -19,7 +24,7 @@ pub fn runWorkerWithTimeout(
     worker_id: u32,
     allocator: std.mem.Allocator,
     timeout_secs: u32,
-) !void {
+) !WorkerResult {
     return runWorkerImpl(cfg, paths, store, pool, logger, io, worker_id, allocator, timeout_secs, cfg.daemon.restart_timeout_minutes * 60, cfg.daemon.max_restarts, false);
 }
 
@@ -33,7 +38,7 @@ pub fn runWorker(
     worker_id: u32,
     allocator: std.mem.Allocator,
     stream_output: bool,
-) !void {
+) !WorkerResult {
     return runWorkerImpl(cfg, paths, store, pool, logger, io, worker_id, allocator, 0, 0, 0, stream_output);
 }
 
@@ -50,21 +55,21 @@ fn runWorkerImpl(
     restart_timeout_secs: u32,
     max_restarts: u32,
     stream_output: bool,
-) !void {
+) !WorkerResult {
     // Lock check
     var lock_path_buf: [256]u8 = undefined;
-    const lock_path = std.fmt.bufPrint(&lock_path_buf, "/tmp/bees-{s}-worker-{d}.lock", .{ cfg.project.name, worker_id }) catch return;
+    const lock_path = std.fmt.bufPrint(&lock_path_buf, "/tmp/bees-{s}-worker-{d}.lock", .{ cfg.project.name, worker_id }) catch return .{};
 
     if (!try acquireLock(lock_path)) {
         logger.info("[worker:{d}] another instance running, skipping", .{worker_id});
-        return;
+        return .{};
     }
     defer releaseLock(lock_path);
 
     // Select approach
     const approach = pool.select() orelse {
         logger.info("[worker:{d}] no active approaches, skipping", .{worker_id});
-        return;
+        return .{};
     };
     logger.info("[worker:{d}] start approach=\"{s}\"", .{ worker_id, approach.name });
 
@@ -96,8 +101,22 @@ fn runWorkerImpl(
 
     git.createWorktree(allocator, io, paths.root, branch_name, worktree_dir, cfg.project.base_branch, cfg.git.shallow_worktrees) catch |e| {
         logger.err("[worker:{d}] worktree create failed: {}", .{ worker_id, e });
-        return;
+        return .{};
     };
+
+    // Run setup command (e.g. npm install) to prepare the worktree
+    if (cfg.build.setup_command) |setup_cmd| {
+        logger.info("[worker:{d}] running setup: {s}", .{ worker_id, setup_cmd });
+        if (git.run(allocator, io, &.{ "sh", "-c", setup_cmd }, worktree_dir)) |setup_result| {
+            allocator.free(setup_result.stdout);
+            allocator.free(setup_result.stderr);
+            if (setup_result.exit_code != 0) {
+                logger.warn("[worker:{d}] setup command exited {d}", .{ worker_id, setup_result.exit_code });
+            }
+        } else |e| {
+            logger.warn("[worker:{d}] setup command failed to spawn: {}", .{ worker_id, e });
+        }
+    }
 
     // Create session in LMDB
     const model = types.ModelType.fromString(cfg.workers.model);
@@ -110,7 +129,7 @@ fn runWorkerImpl(
         .has_tokens = false,
         .has_duration = false,
         .has_diff_summary = false,
-        .worker_id = @intCast(worker_id),
+        .worker_id = @truncate(worker_id),
         .commit_count = 0,
         .num_turns = 0,
         .exit_code = 0,
@@ -126,7 +145,7 @@ fn runWorkerImpl(
 
     const session_id = store.createSession(header, approach.name, branch_name, worktree_dir) catch |e| {
         logger.err("[worker:{d}] session create failed: {}", .{ worker_id, e });
-        return;
+        return .{};
     };
 
     // Build prompt with approach
@@ -194,7 +213,7 @@ fn runWorkerImpl(
         break; // Normal completion or non-resumable error
     }
 
-    const result = last_result orelse return;
+    const result = last_result orelse return .{ .session_id = session_id };
 
     // Count commits
     const commits = git.getCommitsAhead(allocator, io, paths.root, branch_name, cfg.project.base_branch) catch 0;
@@ -211,7 +230,7 @@ fn runWorkerImpl(
         .has_tokens = has_tokens,
         .has_duration = true,
         .has_diff_summary = false,
-        .worker_id = @intCast(worker_id),
+        .worker_id = @truncate(worker_id),
         .commit_count = @intCast(@min(commits, 255)),
         .num_turns = result.num_turns,
         .exit_code = result.exit_code,
@@ -258,14 +277,13 @@ fn runWorkerImpl(
         }
     }
 
-    const restarts = if (attempt > 0) attempt else @as(u32, 0);
-    if (restarts > 0) {
-        logger.info("[worker:{d}] done approach=\"{s}\" commits={d} cost=${d:.2} restarts={d}", .{
+    if (result.tool_errors > 0) {
+        logger.info("[worker:{d}] done approach=\"{s}\" commits={d} cost=${d:.2} tool_errors={d}", .{
             worker_id,
             approach.name,
             commits,
             @as(f64, @floatFromInt(result.cost_microdollars)) / 1000000.0,
-            restarts,
+            result.tool_errors,
         });
     } else {
         logger.info("[worker:{d}] done approach=\"{s}\" commits={d} cost=${d:.2}", .{
@@ -275,6 +293,8 @@ fn runWorkerImpl(
             @as(f64, @floatFromInt(result.cost_microdollars)) / 1000000.0,
         });
     }
+
+    return .{ .session_id = session_id, .tool_errors = result.tool_errors };
 }
 
 pub fn runAllWorkers(
@@ -288,24 +308,34 @@ pub fn runAllWorkers(
     stream_output: bool,
 ) !void {
     const count = cfg.workers.count;
-    logger.info("spawning {d} workers", .{count});
+    logger.info("spawning {d} workers as async green threads", .{count});
 
-    var threads = try allocator.alloc(std.Thread, count);
-    defer allocator.free(threads);
-
+    var group: Io.Group = Io.Group.init;
     for (0..count) |i| {
         const worker_id: u32 = @intCast(i + 1);
-        threads[i] = try std.Thread.spawn(.{}, struct {
-            fn work(c: config_mod.Config, p: config_mod.ProjectPaths, s: *store_mod.Store, pl: *const approaches_mod.ApproachPool, lg: *log_mod.Logger, iox: Io, wid: u32, alloc: std.mem.Allocator, so: bool) void {
-                runWorker(c, p, s, pl, lg, iox, wid, alloc, so) catch |e| {
-                    lg.err("[worker:{d}] fatal: {}", .{ wid, e });
-                };
-            }
-        }.work, .{ cfg, paths, store, pool, logger, io, worker_id, allocator, stream_output });
+        group.async(io, workerGroupTask, .{
+            cfg, paths, store, pool, logger, io, worker_id, allocator, stream_output,
+        });
     }
-
-    for (threads) |t| t.join();
+    group.await(io) catch {};
     logger.info("all workers completed", .{});
+}
+
+fn workerGroupTask(
+    cfg: config_mod.Config,
+    paths: config_mod.ProjectPaths,
+    store: *store_mod.Store,
+    pool: *const approaches_mod.ApproachPool,
+    logger: *log_mod.Logger,
+    io: Io,
+    worker_id: u32,
+    allocator: std.mem.Allocator,
+    stream_output: bool,
+) void {
+    _ = runWorker(cfg, paths, store, pool, logger, io, worker_id, allocator, stream_output) catch |e| {
+        logger.err("[worker:{d}] fatal: {}", .{ worker_id, e });
+        return;
+    };
 }
 
 fn acquireLock(path: []const u8) !bool {
@@ -327,7 +357,10 @@ fn acquireLock(path: []const u8) !bool {
         // Signal 0 checks if process exists without sending a signal
         const rc = std.c.kill(pid, @enumFromInt(0));
         if (rc != 0) {
-            // Process doesn't exist (ESRCH) — stale lock
+            // Only reclaim lock on ESRCH (no such process).
+            // EPERM means the process exists but is owned by another user — lock is valid.
+            if (std.c.errno(rc) != .SRCH) return false;
+            // Process doesn't exist — stale lock
             fs.deleteFile(path) catch return false;
             return acquireLock(path);
         }

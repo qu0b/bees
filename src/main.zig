@@ -14,7 +14,6 @@ const qa_mod = @import("qa.zig");
 const git = @import("git.zig");
 const scheduler = @import("scheduler.zig");
 const approaches_mod = @import("approaches.zig");
-const api = @import("api.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 
@@ -176,7 +175,7 @@ fn writeDefaultPrompts(arena: std.mem.Allocator, bees_dir: []const u8) !void {
         .{ .name = "review.txt", .content = "You are a code reviewer. You will receive a git diff via stdin. Review the changes for correctness, safety, and code quality. Respond with either ACCEPT or REJECT followed by your reasoning. Be concise. Only reject changes that are clearly wrong or harmful.\n" },
         .{ .name = "conflict.txt", .content = "There are merge conflicts in this repository. Resolve all conflicts by examining both sides and making the correct choice. After resolving, ensure the code compiles and tests pass.\n" },
         .{ .name = "fix.txt", .content = "The build or tests are failing after a merge. Examine the error output and fix the issue. Ensure the build passes and tests are green before committing.\n" },
-        .{ .name = "sre.txt", .content = "You are the SRE agent monitoring the bees autonomous coding system. Use bees CLI commands to check system health. Identify and resolve systemic issues. Be conservative with configuration changes.\n" },
+        .{ .name = "sre.txt", .content = "You are the SRE agent monitoring the bees autonomous coding system. Use bees CLI commands to check system health. Identify and resolve systemic issues. Be conservative with configuration changes.\n\nCRITICAL: Do NOT kill, restart, or stop any processes (no pkill, kill, systemctl stop/restart). The daemon manages all service lifecycle. Do NOT run build commands. Only inspect and adjust configuration/approaches.\n" },
     };
 
     for (prompts) |p| {
@@ -270,8 +269,12 @@ fn cmdStatus(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
     const stats = try store.getDailyStats(txn, day_start);
 
     if (json) {
-        try stdout.print("{{\"project\":\"{s}\",\"path\":\"{s}\",\"workers\":{d},\"today\":{{\"total\":{d},\"accepted\":{d},\"rejected\":{d},\"conflicts\":{d},\"build_failures\":{d},\"cost_cents\":{d}}}}}\n", .{
-            cfg.project.name, paths.root, cfg.workers.count,
+        try stdout.print("{{\"project\":", .{});
+        try writeJsonStr(stdout, cfg.project.name);
+        try stdout.print(",\"path\":", .{});
+        try writeJsonStr(stdout, paths.root);
+        try stdout.print(",\"workers\":{d},\"today\":{{\"total\":{d},\"accepted\":{d},\"rejected\":{d},\"conflicts\":{d},\"build_failures\":{d},\"cost_cents\":{d}}}}}\n", .{
+            cfg.workers.count,
             stats.total, stats.accepted, stats.rejected, stats.conflicts, stats.build_failures, stats.total_cost_cents,
         });
     } else {
@@ -300,7 +303,7 @@ fn cmdRunWorker(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, id: ?u32) 
     defer logger.deinit();
 
     if (id) |worker_id| {
-        try worker.runWorker(cfg, paths, &store, &pool, &logger, io, worker_id, arena, true);
+        _ = try worker.runWorker(cfg, paths, &store, &pool, &logger, io, worker_id, arena, true);
     } else {
         try worker.runAllWorkers(cfg, paths, &store, &pool, &logger, io, arena, true);
     }
@@ -373,7 +376,7 @@ fn cmdRunStrategist(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void 
         const deadline = cfg.serve.health_timeout_secs;
         while (elapsed < deadline) : (elapsed += 2) {
             const hc = git.run(arena, io, &.{ "curl", "-sf", "-o", "/dev/null", "--max-time", "2", url }, paths.root) catch {
-                orchestrator.sleep_secs(2);
+                io.sleep(Io.Duration.fromSeconds(2), .awake) catch {};
                 continue;
             };
             arena.free(hc.stdout);
@@ -382,7 +385,7 @@ fn cmdRunStrategist(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void 
                 try stdout.print("Server healthy after {d}s\n", .{elapsed});
                 break;
             }
-            orchestrator.sleep_secs(2);
+            io.sleep(Io.Duration.fromSeconds(2), .awake) catch {};
         }
     }
 
@@ -431,7 +434,7 @@ fn cmdRunSre(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     try stdout.print("Running SRE agent...\n", .{});
     try stdout.flush();
 
-    try sre_mod.runSre(cfg, paths, &store, &logger, io, arena, true);
+    try sre_mod.runSre(cfg, paths, &store, &logger, io, arena, true, null, 0);
     try stdout.print("SRE run complete\n", .{});
 }
 
@@ -477,7 +480,7 @@ fn cmdRunQa(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         var elapsed: u32 = 0;
         while (elapsed < cfg.serve.health_timeout_secs) : (elapsed += 2) {
             const hc = git.run(arena, io, &.{ "curl", "-sf", "-o", "/dev/null", "--max-time", "2", url }, paths.root) catch {
-                orchestrator.sleep_secs(2);
+                io.sleep(Io.Duration.fromSeconds(2), .awake) catch {};
                 continue;
             };
             arena.free(hc.stdout);
@@ -486,7 +489,7 @@ fn cmdRunQa(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
                 try stdout.print("Server healthy after {d}s\n", .{elapsed});
                 break;
             }
-            orchestrator.sleep_secs(2);
+            io.sleep(Io.Duration.fromSeconds(2), .awake) catch {};
         }
     }
 
@@ -575,7 +578,9 @@ fn cmdApproaches(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void
         while (iter.next()) |entry| {
             if (!first) try stdout.print(",", .{});
             first = false;
-            try stdout.print("{{\"name\":\"{s}\",\"weight\":{d},\"prompt\":", .{ entry.name, entry.view.header.weight });
+            try stdout.print("{{\"name\":", .{});
+            try writeJsonStr(stdout, entry.name);
+            try stdout.print(",\"weight\":{d},\"prompt\":", .{entry.view.header.weight});
             // Simple JSON string escape for prompt
             try stdout.print("\"", .{});
             for (entry.view.prompt) |ch| {
@@ -629,6 +634,15 @@ fn cmdApproachesSync(arena: std.mem.Allocator, stdout: *Io.Writer, file: ?[]cons
     const approaches_path = file orelse paths.approaches_file;
     try approaches_mod.syncFromFile(&store, approaches_path, arena);
 
+    // Backfill session meta for dashboard direct reads
+    store.backfillSessionMeta() catch {};
+
+    // Clean up any stale running sessions
+    const cleaned = store.cleanupStaleSessions();
+    if (cleaned > 0) {
+        try stdout.print("Cleaned up {d} stale running sessions\n", .{cleaned});
+    }
+
     try stdout.print("Approaches synced to LMDB from {s}\n", .{approaches_path});
 }
 
@@ -653,36 +667,42 @@ fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?type
         try stdout.print("  {s:-<6} {s:-<10} {s:-<10} {s:-<8} {s:-<10} {s:-<30}\n", .{ "", "", "", "", "", "" });
     }
 
-    var id: u64 = 1;
+    var iter = try store.iterSessions(txn);
+    defer iter.close();
     var printed: u32 = 0;
     var first_json = true;
-    while (id <= 10000 and printed < 50) : (id += 1) {
-        const session = (try store.getSession(txn, id)) orelse continue;
+    while (printed < 50) {
+        const entry = iter.next() orelse break;
         if (session_type) |st| {
-            if (session.header.@"type" != st) continue;
+            if (entry.view.header.@"type" != st) continue;
         }
 
         if (json) {
             if (!first_json) try stdout.print(",", .{});
             first_json = false;
-            try stdout.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"approach\":\"{s}\",\"branch\":\"{s}\",\"duration_ms\":{d},\"started_at\":{d}", .{
-                id, session.header.@"type".label(), session.header.status.label(),
-                session.header.commit_count, @as(u64, session.header.cost_microdollars) / 10000, session.approach, session.branch,
-                session.header.duration_ms, @as(u64, session.header.started_at),
+            try stdout.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"approach\":", .{
+                entry.id, entry.view.header.@"type".label(), entry.view.header.status.label(),
+                entry.view.header.commit_count, @as(u64, entry.view.header.cost_microdollars) / 10000,
             });
-            if (session.header.has_tokens) {
+            try writeJsonStr(stdout, entry.view.approach);
+            try stdout.print(",\"branch\":", .{});
+            try writeJsonStr(stdout, entry.view.branch);
+            try stdout.print(",\"duration_ms\":{d},\"started_at\":{d}", .{
+                entry.view.header.duration_ms, @as(u64, entry.view.header.started_at),
+            });
+            if (entry.view.header.has_tokens) {
                 try stdout.print(",\"input_tokens\":{d},\"output_tokens\":{d},\"cache_creation_tokens\":{d},\"cache_read_tokens\":{d}", .{
-                    session.header.input_tokens,
-                    session.header.output_tokens,
-                    session.header.cache_creation_tokens,
-                    session.header.cache_read_tokens,
+                    entry.view.header.input_tokens,
+                    entry.view.header.output_tokens,
+                    entry.view.header.cache_creation_tokens,
+                    entry.view.header.cache_read_tokens,
                 });
             }
             try stdout.print("}}", .{});
         } else {
             try stdout.print("  {d:<6} {s:<10} {s:<10} {d:<8} ${d:<9.2} {s:<30}\n", .{
-                id, session.header.@"type".label(), session.header.status.label(),
-                session.header.commit_count, @as(f64, @floatFromInt(session.header.cost_microdollars)) / 1000000.0, session.approach,
+                entry.id, entry.view.header.@"type".label(), entry.view.header.status.label(),
+                entry.view.header.commit_count, @as(f64, @floatFromInt(entry.view.header.cost_microdollars)) / 1000000.0, entry.view.approach,
             });
         }
         printed += 1;
@@ -711,11 +731,16 @@ fn cmdSession(arena: std.mem.Allocator, stdout: *Io.Writer, id: u64, json: bool)
     };
 
     if (json) {
-        try stdout.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"cost_microdollars\":{d},\"approach\":\"{s}\",\"branch\":\"{s}\",\"turns\":{d},\"duration_ms\":{d},\"started_at\":{d}", .{
+        try stdout.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"cost_microdollars\":{d},\"approach\":", .{
             id, session.header.@"type".label(), session.header.status.label(),
             session.header.commit_count, @as(u64, session.header.cost_microdollars) / 10000,
             session.header.cost_microdollars,
-            session.approach, session.branch, session.header.num_turns,
+        });
+        try writeJsonStr(stdout, session.approach);
+        try stdout.print(",\"branch\":", .{});
+        try writeJsonStr(stdout, session.branch);
+        try stdout.print(",\"turns\":{d},\"duration_ms\":{d},\"started_at\":{d}", .{
+            session.header.num_turns,
             session.header.duration_ms, @as(u64, session.header.started_at),
         });
         if (session.header.has_tokens) {
@@ -849,6 +874,26 @@ fn printUsage(stdout: *Io.Writer) !void {
     , .{version});
 }
 
+/// Write a JSON-escaped string (with surrounding quotes) to a Writer.
+fn writeJsonStr(w: *Io.Writer, s: []const u8) !void {
+    try w.print("\"", .{});
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            else => {
+                if (ch >= 0x20) {
+                    try w.print("{c}", .{ch});
+                }
+            },
+        }
+    }
+    try w.print("\"", .{});
+}
+
 fn printError(stdout: *Io.Writer, e: anyerror) !void {
     const msg: []const u8 = switch (e) {
         error.MissingSessionId => "Missing session ID. Usage: bees session <id>",
@@ -879,7 +924,7 @@ comptime {
     _ = orchestrator;
     _ = sre_mod;
     _ = @import("strategist.zig");
-    _ = api;
+    _ = @import("api.zig");
     _ = qa_mod;
     _ = @import("dlq.zig");
 }

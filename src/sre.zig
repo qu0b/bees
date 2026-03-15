@@ -7,6 +7,9 @@ const claude = @import("claude.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 
+/// Run SRE agent reactively — triggered by tool errors in a completed session.
+/// `error_context` contains the specific tool errors that triggered this run.
+/// `trigger_session_id` is the session whose errors triggered SRE.
 pub fn runSre(
     cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
@@ -15,17 +18,26 @@ pub fn runSre(
     io: Io,
     allocator: std.mem.Allocator,
     stream_output: bool,
+    error_context: ?[]const u8,
+    trigger_session_id: u64,
 ) !void {
-    logger.info("[sre] starting monitoring cycle", .{});
+    logger.info("[sre] triggered by session {d}", .{trigger_session_id});
 
-    // Load prompt from external template file
+    // Load prompt template
     const prompt_path_main = try std.fs.path.join(allocator, &.{ paths.prompts_dir, "sre-main.txt" });
     defer allocator.free(prompt_path_main);
-    const prompt = fs.readFileAlloc(allocator, prompt_path_main, 256 * 1024) catch {
+    const base_prompt = fs.readFileAlloc(allocator, prompt_path_main, 256 * 1024) catch {
         logger.err("[sre] failed to read prompt template: {s}", .{prompt_path_main});
         return;
     };
-    defer allocator.free(prompt);
+    defer allocator.free(base_prompt);
+
+    // Build the full prompt: base template + error context
+    const prompt = if (error_context) |ctx|
+        std.fmt.allocPrint(allocator, "{s}\n\n## Tool Errors That Triggered This Run\n\nThe following tool errors were observed in session {d}. Diagnose the root cause and fix the configuration, prompts, or approaches to prevent recurrence.\n\n{s}", .{ base_prompt, trigger_session_id, ctx }) catch base_prompt
+    else
+        base_prompt;
+    defer if (prompt.ptr != base_prompt.ptr) allocator.free(prompt);
 
     const now: u64 = fs.timestamp();
     const model = types.ModelType.fromString(cfg.sre.model);
@@ -110,7 +122,8 @@ pub fn runSre(
         }
     }
 
-    logger.info("[sre] cycle complete. cost=${d:.2}", .{
+    logger.info("[sre] done. cost=${d:.2} triggered_by=session:{d}", .{
         @as(f64, @floatFromInt(result.cost_microdollars)) / 1000000.0,
+        trigger_session_id,
     });
 }
