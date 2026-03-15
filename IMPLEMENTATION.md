@@ -96,7 +96,7 @@ src/
 ├── claude.zig        # Claude CLI process management + stream parsing
 ├── git.zig           # Git/worktree operations
 ├── scheduler.zig     # systemd unit generation
-├── approaches.zig    # Weighted random selection + LMDB sync
+├── tasks.zig         # Weighted random selection + LMDB sync
 ├── log.zig           # Central logging
 ├── orchestrator.zig  # Daemon main loop (workers, merger, QA, strategist, SRE)
 ├── strategist.zig    # Strategist agent (loads external prompt)
@@ -113,7 +113,7 @@ Add `@import` for each module in `main.zig` to verify compilation. Add comptime 
 
 ```
 config.example.json
-approaches.example.json
+tasks.example.json
 prompts/
 ├── worker.txt
 ├── review.txt
@@ -164,10 +164,10 @@ Note: `project.path` is no longer in config — it's derived from `.bees/config.
 - Validate at load time: project root must be a git repo, build commands (if set) must be non-empty strings
 - Return clear error messages for missing/invalid fields
 
-### Commit 2.3: Approach loading
+### Commit 2.3: Task loading
 
 ```zig
-const Approach = struct {
+const Task = struct {
     name: []const u8,     // Slice into JSON buffer
     weight: u32,
     prompt: []const u8,   // Slice into JSON buffer (inline)
@@ -175,7 +175,7 @@ const Approach = struct {
 };
 ```
 
-Parse `<project>/.bees/approaches.json` into `[]Approach`. Validate weights > 0. Precompute cumulative weights for O(log n) binary search selection.
+Parse `<project>/.bees/tasks.json` into `[]Task`. Validate weights > 0. Precompute cumulative weights for O(log n) binary search selection.
 
 ### Commit 2.4: `bees init` command
 
@@ -188,7 +188,7 @@ Claude-powered project setup:
    - Suggests a project name
    - Generates `config.json` with appropriate settings
 4. Writes Claude's output to `<project>/.bees/config.json`
-5. Copies default `approaches.json` → `<project>/.bees/approaches.json`
+5. Copies default `tasks.json` → `<project>/.bees/tasks.json`
 6. Copies prompt templates → `<project>/.bees/prompts/`
 7. Adds `.bees/` to `.gitignore` if not already present
 
@@ -222,7 +222,7 @@ const TimeIndexKey = struct { started_at: [5]u8, session_id: [3]u8, type_byte: u
 const SessionHeader = packed struct(u256) { ... };             // 32 bytes exact
 const EventHeader = packed struct(u32) { ... };                // 4 bytes exact
 const ReviewHeader = packed struct(u64) { ... };               // 8 bytes exact
-const ApproachRecord = packed struct(u128) { ... };            // 16 bytes exact
+const TaskRecord = packed struct(u128) { ... };                // 16 bytes exact
 ```
 
 All key types have `toBytes() → [N]u8` and `fromBytes(*const [N]u8) → Self` methods. Big-endian encoding for correct LMDB ordering.
@@ -241,7 +241,7 @@ const Store = struct {
     sessions_by_time: lmdb.Database,   // TimeIndexKey → void
     events: lmdb.Database,             // EventKey → EventRecord
     reviews: lmdb.Database,            // worker_session_id → ReviewRecord
-    approaches: lmdb.Database,         // approach_name → ApproachRecord
+    tasks: lmdb.Database,              // task_name → TaskRecord
     meta: lmdb.Database,               // string keys → various
 
     pub fn open(path: []const u8) !Store { ... }
@@ -262,7 +262,7 @@ All operations use explicit read/write transactions. Write operations atomically
 
 ```zig
 // Write path: single write txn updates primary + indexes atomically
-pub fn createSession(self: *Store, header: SessionHeader, approach: []const u8, branch: []const u8, worktree: []const u8) !u64 {
+pub fn createSession(self: *Store, header: SessionHeader, task: []const u8, branch: []const u8, worktree: []const u8) !u64 {
     var txn = try lmdb.Transaction.init(self.env, .{ .mode = .read_write });
     errdefer txn.abort();
 
@@ -271,7 +271,7 @@ pub fn createSession(self: *Store, header: SessionHeader, approach: []const u8, 
 
     // Write primary: sessions[id] = header + variable strings
     const key = SessionKey{ .id = id };
-    const value = try self.packSessionValue(txn, header, approach, branch, worktree);
+    const value = try self.packSessionValue(txn, header, task, branch, worktree);
     try txn.set(self.sessions, &key.toBytes(), value);
 
     // Write index: sessions_by_status[(status, started_at, id)] = void
@@ -297,7 +297,7 @@ pub fn getSession(self: *Store, txn: lmdb.Transaction, id: u64) !?SessionView {
 // SessionView: provides typed access to mmap'd bytes without copying
 const SessionView = struct {
     header: *const SessionHeader,   // Points into mmap
-    approach: []const u8,           // Slice into mmap
+    task: []const u8,               // Slice into mmap
     branch: []const u8,             // Slice into mmap
     worktree: []const u8,           // Slice into mmap
     diff_summary: []const u8,       // Slice into mmap
@@ -306,11 +306,11 @@ const SessionView = struct {
         const header: *const SessionHeader = @ptrCast(@alignCast(value.ptr));
         var offset: usize = @sizeOf(SessionHeader);
         // Read length-prefixed variable strings
-        const approach = readLenPrefixed(value, &offset);
+        const task = readLenPrefixed(value, &offset);
         const branch = readLenPrefixed(value, &offset);
         const worktree = readLenPrefixed(value, &offset);
         const diff_summary = if (header.has_diff_summary) readLenPrefixed(value, &offset) else "";
-        return .{ .header = header, .approach = approach, .branch = branch, .worktree = worktree, .diff_summary = diff_summary };
+        return .{ .header = header, .task = task, .branch = branch, .worktree = worktree, .diff_summary = diff_summary };
     }
 };
 ```
@@ -375,7 +375,7 @@ const EventView = struct {
 };
 ```
 
-### Commit 3.5: Review and approach CRUD
+### Commit 3.5: Review and task CRUD
 
 Reviews:
 ```zig
@@ -384,12 +384,12 @@ pub fn insertReview(self: *Store, worker_session_id: u64, header: ReviewHeader, 
 pub fn getReview(self: *Store, txn: lmdb.Transaction, worker_session_id: u64) !?ReviewView
 ```
 
-Approaches:
+Tasks:
 ```zig
-// Key: approach name (variable string). Value: ApproachRecord (16 bytes fixed).
-pub fn upsertApproach(self: *Store, name: []const u8, record: ApproachRecord) !void
-pub fn getApproach(self: *Store, txn: lmdb.Transaction, name: []const u8) !?*const ApproachRecord
-pub fn incrementApproachStat(self: *Store, name: []const u8, field: enum { total_runs, accepted, rejected, empty }) !void
+// Key: task name (variable string). Value: TaskRecord (16 bytes fixed).
+pub fn upsertTask(self: *Store, name: []const u8, record: TaskRecord) !void
+pub fn getTask(self: *Store, txn: lmdb.Transaction, name: []const u8) !?*const TaskRecord
+pub fn incrementTaskStat(self: *Store, name: []const u8, field: enum { total_runs, accepted, rejected, empty }) !void
 ```
 
 Meta:
@@ -568,16 +568,16 @@ The `ClaudeOptions` struct includes:
 
 ## Phase 6: Worker
 
-**Goal:** `bees run worker` creates a worktree, selects an approach, spawns Claude, captures output, writes markers.
+**Goal:** `bees run worker` creates a worktree, selects a task, spawns Claude, captures output, writes markers.
 
-### Commit 6.1: Weighted random approach selection
+### Commit 6.1: Weighted random task selection
 
-`approaches.zig` — `ApproachPool`:
+`tasks.zig` — `TaskPool`:
 
-- Load from `<project>/.bees/approaches.json` into global arena (zero-copy strings)
+- Load from `<project>/.bees/tasks.json` into global arena (zero-copy strings)
 - Precompute cumulative weights at load time
 - Selection via binary search: O(log n), zero allocation
-- Approach stats loaded from LMDB `approaches` db (supplementary, not authoritative)
+- Task stats loaded from LMDB `tasks` db (supplementary, not authoritative)
 
 ### Commit 6.2: Worker lifecycle
 
@@ -588,18 +588,18 @@ The `ClaudeOptions` struct includes:
    - If PID alive but hung → kill, remove lock
    - If PID dead → remove stale lock
 2. **Write lockfile** with current PID
-3. **Select approach** via weighted random (binary search, no alloc)
+3. **Select task** via weighted random (binary search, no alloc)
 4. **Create worktree:**
    - Branch: `bee/{project_name}/worker-{id}-{YYYYMMDD}-{HHMMSS}`
    - Dir: `/tmp/bees-{project_name}/worktrees/worker-{id}-{YYYYMMDD}-{HHMMSS}`
 5. **Create session** in LMDB (type=worker, status=running, packed SessionHeader)
-6. **Spawn Claude** in worktree dir with approach prompt
+6. **Spawn Claude** in worktree dir with task prompt
 7. **Capture all events** via pipeline (Phase 5) → LMDB events db
 8. **Count commits** ahead of base branch (`git rev-list --count`)
 9. **Finish session** in LMDB (status=done, cost, duration, commit_count)
 10. **Write `.done` marker** in worktree dir (if commits > 0)
 11. **If 0 commits:** record `finished_at` timestamp on worktree for delayed cleanup (at least 1 hour)
-12. **Update approach stats** in LMDB (increment total_runs; empty if 0 commits)
+12. **Update task stats** in LMDB (increment total_runs; empty if 0 commits)
 13. **Remove lockfile**
 14. **Log** to central log
 
@@ -619,8 +619,8 @@ Note: Claude CLI is spawned with `cwd` set to the worktree directory. Since the 
 `log.zig` — append-only structured log:
 
 ```
-2026-03-07T14:00:01Z [worker:1] start approach="Cross-reference verification" branch=bee/worker-1-20260307-140001
-2026-03-07T14:08:19Z [worker:1] done approach="Cross-reference verification" commits=2 cost=$1.47
+2026-03-07T14:00:01Z [worker:1] start task="Cross-reference verification" branch=bee/worker-1-20260307-140001
+2026-03-07T14:08:19Z [worker:1] done task="Cross-reference verification" commits=2 cost=$1.47
 ```
 
 File output to `<project>/.bees/logs/bees.log`. Uses stack buffer for formatting (no allocation per log line).
@@ -752,8 +752,8 @@ bees run sre                  # Run the SRE agent
 bees run qa                   # Run the QA agent
 bees log [--follow]           # Show/tail central log
 bees config [--json]          # Print resolved config
-bees approaches [--json]      # List approaches with stats
-bees approaches sync [file]   # Sync approaches from JSON file to LMDB
+bees tasks [--json]            # List tasks with stats
+bees tasks sync [file]         # Sync tasks from JSON file to LMDB
 bees sessions [--type X] [--json]  # List recent sessions
 bees session <id> [--json]    # Show session detail + events
 bees version                  # Print version
@@ -862,7 +862,7 @@ Prompts are read into the per-session arena at spawn time.
 
 **Goal:** HTTP server for dashboard integration.
 
-`src/api.zig` implements an HTTP server that serves session, approach, and status data as JSON. Designed for consumption by the bees-dashboard Next.js application. Configured via the `api` section in `config.json`.
+`src/api.zig` implements an HTTP server that serves session, task, and status data as JSON. Designed for consumption by the bees-dashboard Next.js application. Configured via the `api` section in `config.json`.
 
 ---
 
@@ -882,10 +882,10 @@ Prompts are read into the per-session arena at spawn time.
 |-------|---------|-----------------|
 | 1. Scaffold | 4 | Project compiles, dependencies resolve, file structure exists |
 | 2. Config | 4 | `bees init` creates config, JSON loads and validates |
-| 3. Database | 6 | LMDB environment, bit-packed CRUD for sessions/events/reviews/approaches/stats |
+| 3. Database | 6 | LMDB environment, bit-packed CRUD for sessions/events/reviews/tasks/stats |
 | 4. Git | 4 | Worktree CRUD, diffs, merges, conflict detection |
 | 5. Claude | 4 | Process spawn, zero-alloc stream parsing, event capture, timeout, non-fatal DLQ |
-| 6. Worker | 4 | Full worker lifecycle with approach selection and logging |
+| 6. Worker | 4 | Full worker lifecycle with task selection and logging |
 | 7. Merger | 6 | Full merger pipeline: review, merge, conflict, build, deploy, cleanup |
 | 8. CLI | 4 | All subcommands functional |
 | 9. systemd | 2 | Timer generation, start/stop commands |
@@ -904,7 +904,7 @@ Zig's built-in `test` blocks used throughout. Run with `zig build test`.
 - **config.zig:** Parse valid JSON, reject invalid JSON, validate missing fields, verify zero-copy (string pointers reference input buffer).
 - **claude.zig:** Mock process stdout with canned NDJSON lines. Verify `parseEventMeta` against all event types. Verify cost/duration extraction from result events. Verify timeout kill behavior.
 - **git.zig:** Temp repo with scripted commits. Test worktree create/remove, merge success/conflict, diff parsing.
-- **worker.zig:** Integration test with mock Claude binary (shell script that emits canned NDJSON). Test lockfile contention. Test approach selection distribution over many iterations.
+- **worker.zig:** Integration test with mock Claude binary (shell script that emits canned NDJSON). Test lockfile contention. Test task selection distribution over many iterations.
 - **merger.zig:** Integration test with pre-built worktrees. Test review verdict parsing. Test rollback on build failure. Test conflict retry logic.
 
 ## Risk Register

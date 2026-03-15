@@ -39,7 +39,7 @@ LMDB returns pointers directly into memory-mapped pages. Data is valid for the e
 | Get running workers | Cursor scan on `sessions_by_status` index |
 | Get session events | Range scan: `key >= (session_id, 0)` until `session_id` changes |
 | Daily stats | Scan `sessions` where `started_at >= today_start` |
-| Approach stats | Direct key lookup on approach name |
+| Task stats | Direct key lookup on task name |
 
 All are sequential scans or point lookups. No joins, no GROUP BY, no subqueries. LMDB handles these natively with cursors.
 
@@ -169,15 +169,15 @@ const ModelType = enum(u2) {
     haiku = 2,
 };
 
-/// 2 bits — 3 values (approach lifecycle)
-const ApproachStatus = enum(u2) {
+/// 2 bits — 3 values (task lifecycle)
+const TaskStatus = enum(u2) {
     active = 0,
     completed = 1,
     retired = 2,
 };
 
-/// 2 bits — 4 values (who created the approach)
-const ApproachOrigin = enum(u2) {
+/// 2 bits — 4 values (who created the task)
+const TaskOrigin = enum(u2) {
     unknown = 0,
     template = 1,
     user = 2,
@@ -196,8 +196,8 @@ const ApproachOrigin = enum(u2) {
 | Verdict | 2 | 1 | 0 |
 | Role | 3 | 2 | 1 |
 | ModelType | 3 | 2 | 1 |
-| ApproachStatus | 3 | 2 | 1 |
-| ApproachOrigin | 4 | 2 | 0 |
+| TaskStatus | 3 | 2 | 1 |
+| TaskOrigin | 4 | 2 | 0 |
 
 Display: each enum has `pub fn label(self) []const u8` returning a comptime string literal (no allocation).
 
@@ -214,7 +214,7 @@ const DbNames = struct {
     const sessions_by_time = "st";  // (started_at, session_id) → void
     const events = "e";             // (session_id, seq) → EventHeader + raw JSON
     const reviews = "r";            // worker_session_id → ReviewHeader + reason
-    const approaches = "a";         // approach_name → ApproachHeader + prompt
+    const tasks = "a";              // task_name → TaskHeader + prompt
     const meta = "m";               // string keys → various (next_session_id: u64, report:qa: text, report:sre: text, report:trends: text)
 };
 ```
@@ -373,7 +373,7 @@ const SessionHeader = packed struct(u384) {
 
 /// Full session record: header + variable-length strings
 /// Layout: [SessionHeader: 48 bytes]
-///         [approach_len: u16][approach: ...]
+///         [task_len: u16][task: ...]
 ///         [branch_len: u16][branch: ...]
 ///         [worktree_len: u16][worktree: ...]
 ///         [diff_summary_len: u16][diff_summary: ...]  (only if has_diff_summary)
@@ -451,26 +451,26 @@ const ReviewHeader = packed struct(u64) {
 
 Since LMDB tells us the total value length, the last variable field doesn't need a length prefix. `reason.len = value.len - @sizeOf(ReviewHeader)`.
 
-#### ApproachHeader — 16 bytes fixed header + variable prompt
+#### TaskHeader — 16 bytes fixed header + variable prompt
 
 ```zig
-const ApproachHeader = packed struct(u128) {
+const TaskHeader = packed struct(u128) {
     weight: u16,                // Selection weight (higher = more likely)
-    total_runs: u24,            // Total times this approach was used
+    total_runs: u24,            // Total times this task was used
     accepted: u24,              // Times the result was accepted
     rejected: u24,              // Times the result was rejected
     empty: u24,                 // Times the result was empty/no changes
-    status: ApproachStatus,     // 2 bits: active, completed, retired
-    origin: ApproachOrigin,     // 2 bits: unknown, template, user, strategist
+    status: TaskStatus,         // 2 bits: active, completed, retired
+    origin: TaskOrigin,         // 2 bits: unknown, template, user, strategist
     _reserved: u12,             // 12 bits for future use
 
     comptime {
-        std.debug.assert(@sizeOf(ApproachHeader) == 16);
+        std.debug.assert(@sizeOf(TaskHeader) == 16);
     }
 };
 ```
 
-Key is the approach name (variable-length string). Value layout: `[ApproachHeader: 16 bytes][prompt_len: u16][prompt: ...]`.
+Key is the task name (variable-length string). Value layout: `[TaskHeader: 16 bytes][prompt_len: u16][prompt: ...]`.
 
 Note: run counters use u24 (max ~16M) instead of u32, freeing 4 bytes for `status`, `origin`, and reserved bits within the same 16-byte packed struct.
 
@@ -542,7 +542,7 @@ const Compact = struct {
 /// value bytes — valid for the read transaction's lifetime.
 const SessionView = struct {
     header: SessionHeader,      // 48 bytes (copied from mmap for alignment safety)
-    approach: []const u8,       // slice into LMDB mmap
+    task: []const u8,           // slice into LMDB mmap
     branch: []const u8,         // slice into LMDB mmap
     worktree: []const u8,       // slice into LMDB mmap
     diff_summary: []const u8,   // slice into LMDB mmap (empty if !has_diff_summary)
@@ -551,13 +551,13 @@ const SessionView = struct {
         var header: SessionHeader = undefined;
         @memcpy(std.mem.asBytes(&header), value[0..@sizeOf(SessionHeader)]);
         var offset: usize = @sizeOf(SessionHeader);
-        const approach = readLenPrefixed(value, &offset);
+        const task = readLenPrefixed(value, &offset);
         const branch = readLenPrefixed(value, &offset);
         const worktree = readLenPrefixed(value, &offset);
         const diff_summary = if (header.has_diff_summary) readLenPrefixed(value, &offset) else "";
         return .{
             .header = header,
-            .approach = approach,
+            .task = task,
             .branch = branch,
             .worktree = worktree,
             .diff_summary = diff_summary,
@@ -608,11 +608,11 @@ const EventMeta = packed struct(u64) {
 /// 32 bytes per worker in the CLI display array. For 5 workers: 160 bytes.
 const WorkerRow = struct {
     // 8-byte aligned
-    approach_ptr: [*]const u8,      // 8 bytes (zero-copy into LMDB)
+    task_ptr: [*]const u8,          // 8 bytes (zero-copy into LMDB)
 
     // 4-byte aligned
     elapsed_secs: u32,              // 4 bytes (0 = idle)
-    approach_len: u16,              // 2 bytes
+    task_len: u16,                  // 2 bytes
 
     // 1-byte aligned
     id: u8,                         // 1 byte (worker 0-255)
@@ -620,9 +620,9 @@ const WorkerRow = struct {
     commit_count: u8,               // 1 byte
     _pad: [7]u8,                    // explicit padding to 32-byte boundary
 
-    pub fn approach(self: WorkerRow) []const u8 {
-        if (self.approach_len == 0) return "";
-        return self.approach_ptr[0..self.approach_len];
+    pub fn task(self: WorkerRow) []const u8 {
+        if (self.task_len == 0) return "";
+        return self.task_ptr[0..self.task_len];
     }
 
     comptime {
@@ -639,7 +639,7 @@ const WorkerRow = struct {
 Program Lifetime (GlobalArena)
 │
 ├─ Config           — JSON file buffer + parsed structs
-├─ Approaches       — JSON file buffer + parsed structs
+├─ Tasks            — JSON file buffer + parsed structs
 ├─ Prompt templates — 7 files loaded once (see Prompt Templates section)
 ├─ LMDB env handle  — single mmap for entire database
 └─ Sub-database handles (7)
@@ -647,7 +647,7 @@ Program Lifetime (GlobalArena)
 Per-Session Lifetime (SessionArena)
 │
 ├─ Branch name, worktree path — derived strings
-├─ Approach prompt (ref into GlobalArena — no copy)
+├─ Task prompt (ref into GlobalArena — no copy)
 └─ Session result metadata
 
 Per-Line Lifetime (session arena)
@@ -778,7 +778,7 @@ const LmdbConfig = struct {
 
 | Component | Memory | Lifetime | Notes |
 |-----------|--------|----------|-------|
-| Config + Approaches | ~10 KB | Program | JSON file buffer + slices |
+| Config + Tasks | ~10 KB | Program | JSON file buffer + slices |
 | Prompt templates | ~30 KB | Program | 7 files loaded once |
 | LMDB env + mmap overhead | ~4 KB | Program | Actual mmap pages loaded on demand by OS |
 | Per-worker line buffer | 1 MB initial | Per-session | Dynamically grows for large lines, reused across lines |

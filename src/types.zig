@@ -327,12 +327,12 @@ pub const ReviewHeader = packed struct(u64) {
     }
 };
 
-pub const ApproachStatus = enum(u2) {
+pub const TaskStatus = enum(u2) {
     active = 0,
     completed = 1,
     retired = 2,
 
-    pub fn label(self: ApproachStatus) []const u8 {
+    pub fn label(self: TaskStatus) []const u8 {
         return switch (self) {
             .active => "active",
             .completed => "completed",
@@ -341,13 +341,13 @@ pub const ApproachStatus = enum(u2) {
     }
 };
 
-pub const ApproachOrigin = enum(u2) {
+pub const TaskOrigin = enum(u2) {
     unknown = 0,
     template = 1,
     user = 2,
     strategist = 3,
 
-    pub fn label(self: ApproachOrigin) []const u8 {
+    pub fn label(self: TaskOrigin) []const u8 {
         return switch (self) {
             .unknown => "unknown",
             .template => "template",
@@ -357,36 +357,36 @@ pub const ApproachOrigin = enum(u2) {
     }
 };
 
-pub const ApproachHeader = packed struct(u128) {
+pub const TaskHeader = packed struct(u128) {
     weight: u16,
     total_runs: u24,
     accepted: u24,
     rejected: u24,
     empty: u24,
-    status: ApproachStatus,
-    origin: ApproachOrigin,
+    status: TaskStatus,
+    origin: TaskOrigin,
     _reserved: u12 = 0,
 
     comptime {
-        std.debug.assert(@sizeOf(ApproachHeader) == 16);
+        std.debug.assert(@sizeOf(TaskHeader) == 16);
     }
 };
 
-pub const ApproachView = struct {
-    header: ApproachHeader,
+pub const TaskView = struct {
+    header: TaskHeader,
     prompt: []const u8,
 
-    pub fn fromBytes(value: []const u8) ApproachView {
-        var header: ApproachHeader = undefined;
-        @memcpy(std.mem.asBytes(&header), value[0..@sizeOf(ApproachHeader)]);
-        var offset: usize = @sizeOf(ApproachHeader);
+    pub fn fromBytes(value: []const u8) TaskView {
+        var header: TaskHeader = undefined;
+        @memcpy(std.mem.asBytes(&header), value[0..@sizeOf(TaskHeader)]);
+        var offset: usize = @sizeOf(TaskHeader);
         const prompt = if (offset < value.len) readLenPrefixed(value, &offset) else "";
         return .{ .header = header, .prompt = prompt };
     }
 };
 
-pub fn approachValueSize(prompt: []const u8) usize {
-    return @sizeOf(ApproachHeader) + 2 + prompt.len;
+pub fn taskValueSize(prompt: []const u8) usize {
+    return @sizeOf(TaskHeader) + 2 + prompt.len;
 }
 
 pub const EventMeta = packed struct(u64) {
@@ -413,7 +413,7 @@ pub const DbNames = struct {
     pub const sessions_by_time = "st";
     pub const events = "e";
     pub const reviews = "r";
-    pub const approaches = "a";
+    pub const tasks = "a";
     pub const meta = "m";
 };
 
@@ -421,7 +421,7 @@ pub const DbNames = struct {
 
 pub const SessionView = struct {
     header: SessionHeader,
-    approach: []const u8,
+    task: []const u8,
     branch: []const u8,
     worktree: []const u8,
     diff_summary: []const u8,
@@ -430,13 +430,13 @@ pub const SessionView = struct {
         var header: SessionHeader = undefined;
         @memcpy(std.mem.asBytes(&header), value[0..@sizeOf(SessionHeader)]);
         var offset: usize = @sizeOf(SessionHeader);
-        const approach = readLenPrefixed(value, &offset);
+        const task = readLenPrefixed(value, &offset);
         const branch = readLenPrefixed(value, &offset);
         const worktree = readLenPrefixed(value, &offset);
         const diff_summary = if (header.has_diff_summary) readLenPrefixed(value, &offset) else "";
         return .{
             .header = header,
-            .approach = approach,
+            .task = task,
             .branch = branch,
             .worktree = worktree,
             .diff_summary = diff_summary,
@@ -486,9 +486,9 @@ pub fn writeLenPrefixed(buf: []u8, offset: *usize, data: []const u8) void {
     offset.* += capped_len;
 }
 
-pub fn sessionValueSize(approach: []const u8, branch: []const u8, worktree: []const u8, diff_summary: ?[]const u8) usize {
+pub fn sessionValueSize(task: []const u8, branch: []const u8, worktree: []const u8, diff_summary: ?[]const u8) usize {
     var size: usize = @sizeOf(SessionHeader);
-    size += 2 + approach.len;
+    size += 2 + task.len;
     size += 2 + branch.len;
     size += 2 + worktree.len;
     if (diff_summary) |ds| size += 2 + ds.len;
@@ -511,7 +511,7 @@ test "packed struct sizes" {
     try std.testing.expectEqual(@as(usize, 48), @sizeOf(SessionHeader));
     try std.testing.expectEqual(@as(usize, 4), @sizeOf(EventHeader));
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(ReviewHeader));
-    try std.testing.expectEqual(@as(usize, 16), @sizeOf(ApproachHeader));
+    try std.testing.expectEqual(@as(usize, 16), @sizeOf(TaskHeader));
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(EventMeta));
 }
 

@@ -2,7 +2,7 @@ const std = @import("std");
 const types = @import("types.zig");
 
 pub const Command = union(enum) {
-    init,
+    init: struct { skip_analysis: bool = false },
     start,
     stop,
     daemon,
@@ -14,8 +14,8 @@ pub const Command = union(enum) {
     run_qa,
     log: struct { follow: bool = false },
     config: OutputOptions,
-    approaches: OutputOptions,
-    approaches_sync: struct { file: ?[]const u8 = null },
+    tasks: OutputOptions,
+    tasks_sync: struct { file: ?[]const u8 = null },
     sessions: struct { session_type: ?types.SessionType = null, json: bool = false },
     session: struct { id: u64, json: bool = false },
     version,
@@ -31,7 +31,9 @@ pub fn parse(args: []const []const u8) !Command {
 
     const cmd = args[1];
 
-    if (std.mem.eql(u8, cmd, "init")) return .init;
+    if (std.mem.eql(u8, cmd, "init")) {
+        return .{ .init = .{ .skip_analysis = hasFlag(args[2..], "--skip-analysis") } };
+    }
     if (std.mem.eql(u8, cmd, "start")) return .start;
     if (std.mem.eql(u8, cmd, "stop")) return .stop;
     if (std.mem.eql(u8, cmd, "daemon")) return .daemon;
@@ -44,12 +46,12 @@ pub fn parse(args: []const []const u8) !Command {
     if (std.mem.eql(u8, cmd, "config")) {
         return .{ .config = .{ .json = hasFlag(args[2..], "--json") } };
     }
-    if (std.mem.eql(u8, cmd, "approaches")) {
+    if (std.mem.eql(u8, cmd, "tasks")) {
         if (args.len >= 3 and std.mem.eql(u8, args[2], "sync")) {
             const file = if (args.len >= 4) args[3] else null;
-            return .{ .approaches_sync = .{ .file = file } };
+            return .{ .tasks_sync = .{ .file = file } };
         }
-        return .{ .approaches = .{ .json = hasFlag(args[2..], "--json") } };
+        return .{ .tasks = .{ .json = hasFlag(args[2..], "--json") } };
     }
     if (std.mem.eql(u8, cmd, "log")) {
         return .{ .log = .{ .follow = hasFlag(args[2..], "--follow") or hasFlag(args[2..], "-f") } };
@@ -144,6 +146,17 @@ test "parse run worker with id" {
 test "parse session" {
     const cmd = try parse(&.{ "bees", "session", "42" });
     try std.testing.expectEqual(@as(u64, 42), cmd.session.id);
+}
+
+test "parse init" {
+    const cmd = try parse(&.{ "bees", "init" });
+    try std.testing.expect(cmd == .init);
+    try std.testing.expectEqual(false, cmd.init.skip_analysis);
+}
+
+test "parse init skip analysis" {
+    const cmd = try parse(&.{ "bees", "init", "--skip-analysis" });
+    try std.testing.expectEqual(true, cmd.init.skip_analysis);
 }
 
 test "parse status json" {

@@ -13,7 +13,7 @@ const strategist_mod = @import("strategist.zig");
 const qa_mod = @import("qa.zig");
 const git = @import("git.zig");
 const scheduler = @import("scheduler.zig");
-const approaches_mod = @import("approaches.zig");
+const tasks_mod = @import("tasks.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 
@@ -47,7 +47,7 @@ fn runCommand(cmd: cli.Command, arena: std.mem.Allocator, io: Io, stdout: *Io.Wr
     switch (cmd) {
         .version => try stdout.print("bees v{s}\n", .{version}),
         .help => try printUsage(stdout),
-        .init => try cmdInit(arena, io, stdout),
+        .init => |opts| try cmdInit(arena, io, stdout, opts.skip_analysis),
         .start => try cmdStart(arena, io, stdout),
         .stop => try cmdStop(arena, io, stdout),
         .daemon => try cmdDaemon(arena, io, stdout),
@@ -59,8 +59,8 @@ fn runCommand(cmd: cli.Command, arena: std.mem.Allocator, io: Io, stdout: *Io.Wr
         .run_qa => try cmdRunQa(arena, io, stdout),
         .log => try cmdLog(arena, stdout),
         .config => |opts| try cmdConfig(arena, stdout, opts.json),
-        .approaches => |opts| try cmdApproaches(arena, stdout, opts.json),
-        .approaches_sync => |opts| try cmdApproachesSync(arena, stdout, opts.file),
+        .tasks => |opts| try cmdTasks(arena, stdout, opts.json),
+        .tasks_sync => |opts| try cmdTasksSync(arena, stdout, opts.file),
         .sessions => |opts| try cmdSessions(arena, stdout, opts.session_type, opts.json),
         .session => |opts| try cmdSession(arena, stdout, opts.id, opts.json),
     }
@@ -78,7 +78,7 @@ fn loadProject(arena: std.mem.Allocator) !struct { config_mod.Config, config_mod
     return .{ cfg, paths };
 }
 
-fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
+fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: bool) !void {
     const cwd = try getCwd(arena);
 
     if (!git.isGitRepo(arena, io, cwd)) {
@@ -95,19 +95,159 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     }
 
     // Create directory structure
-    const dirs = [_][]const u8{ "db", "logs", "prompts", "worktrees" };
-    for (dirs) |d| {
+    for ([_][]const u8{ "db", "logs", "prompts" }) |d| {
         const path = try std.fs.path.join(arena, &.{ bees_dir, d });
         try fs.makePath(path);
     }
 
-    // Write default config
     const project_name = std.fs.path.basename(cwd);
-    const default_config = try std.fmt.allocPrint(arena,
+    const base_branch = git.getDefaultBranch(arena, io, cwd) orelse "main";
+
+    if (!skip_analysis) {
+        try stdout.print("Analyzing project with Claude...\n\n", .{});
+        try stdout.flush();
+
+        const prompt = try buildInitPrompt(arena, cwd, project_name, base_branch, bees_dir);
+        const success = runInitSession(arena, io, stdout, cwd, prompt);
+
+        if (success) {
+            // Validate generated config
+            _ = config_mod.load(arena, config_path) catch {
+                try stdout.print("\nGenerated config.json is invalid, replacing with defaults...\n", .{});
+                writeDefaultConfig(arena, config_path, project_name, base_branch) catch {};
+            };
+        } else {
+            try stdout.print("\nClaude analysis failed, using defaults...\n", .{});
+        }
+    }
+
+    // Ensure all required files exist (fill in anything Claude missed or skipped)
+    if (!fs.access(config_path)) {
+        writeDefaultConfig(arena, config_path, project_name, base_branch) catch {};
+    }
+
+    const tasks_path = try std.fs.path.join(arena, &.{ bees_dir, "tasks.json" });
+    if (!fs.access(tasks_path)) {
+        writeDefaultTasks(tasks_path) catch {};
+    }
+
+    try ensureDefaultPrompts(arena, bees_dir);
+
+    // Add .bees/ to .gitignore
+    try addToGitignore(arena, cwd);
+
+    try stdout.print("\nInitialized bees project at {s}\n", .{bees_dir});
+    try stdout.print("Review .bees/config.json and .bees/tasks.json, then run `bees start`.\n", .{});
+}
+
+fn runInitSession(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, cwd: []const u8, prompt: []const u8) bool {
+    var child = claude.spawnClaude(arena, io, .{
+        .prompt = prompt,
+        .cwd = cwd,
+        .model = "sonnet",
+        .effort = "high",
+        .max_budget_usd = 5.0,
+        .max_turns = 20,
+    }) catch {
+        stdout.print("Failed to start Claude CLI. Is it installed?\n", .{}) catch {};
+        return false;
+    };
+
+    if (child.stdout) |stdout_file| {
+        var read_buf: [256 * 1024]u8 = undefined;
+        var reader = stdout_file.readerStreaming(io, &read_buf);
+
+        while (true) {
+            const line = reader.interface.takeDelimiter('\n') catch |e| switch (e) {
+                error.ReadFailed => break,
+                error.StreamTooLong => {
+                    _ = reader.interface.discardDelimiterInclusive('\n') catch break;
+                    continue;
+                },
+            };
+            if (line == null) break;
+            const line_data = line.?;
+            if (line_data.len == 0) continue;
+
+            const meta = claude.parseEventMeta(line_data);
+            claude.streamEvent(stdout, meta, line_data);
+        }
+    }
+
+    const term = child.wait(io) catch return false;
+    return switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
+}
+
+fn buildInitPrompt(arena: std.mem.Allocator, cwd: []const u8, name: []const u8, branch: []const u8, bees_dir: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena,
+        \\You are setting up bees (autonomous multi-agent coding system) for this project.
+        \\
+        \\Project: {s}
+        \\Directory: {s}
+        \\Base branch: {s}
+        \\Config dir: {s}
+        \\
+        \\Read the project's key files to understand its tech stack (README, package.json,
+        \\Cargo.toml, go.mod, pyproject.toml, Makefile, build.zig, etc.), then create the
+        \\configuration files below. Be efficient — read only what you need.
+        \\
+        \\## 1. Config: {s}/config.json
+        \\
+        \\JSON object. Only include sections where the project needs non-default values.
+        \\
+        \\  project: {{"name": "{s}", "base_branch": "{s}"}}
+        \\  build: {{"command": "<cmd>", "test_command": "<cmd>", "setup_command": "<cmd>"}}
+        \\    Build commands must use absolute paths: "cd {s} && <build-cmd>"
+        \\    test_command: fast check (type-check/unit tests, not E2E). Null if none.
+        \\    setup_command: install deps, non-interactive (--yes flags). Null if none.
+        \\  workers: {{"count": 3}} — number of parallel coding agents
+        \\  merger: {{"merge_threshold": 3}} — merge after N workers complete
+        \\  daemon: {{"cooldown_minutes": 5, "worker_timeout_minutes": 60}}
+        \\  serve (optional, for web services):
+        \\    {{"systemd_unit": "<name>", "health_url": "http://localhost:<port>"}}
+        \\
+        \\## 2. Tasks: {s}/tasks.json
+        \\
+        \\JSON array of 5-8 task objects:
+        \\  {{"name": "<50 chars>", "weight": <1-5>, "prompt": "..."}}
+        \\
+        \\Each task is a job for an autonomous AI coding agent working alone.
+        \\Weight: 5=critical fix, 3=important, 1=polish.
+        \\Base tasks on REAL issues you find by reading the actual code.
+        \\Each prompt must: reference specific files, describe what to change, and
+        \\end with the build/test command and "Commit your work."
+        \\
+        \\## 3. Prompts: {s}/prompts/
+        \\
+        \\Create 5 prompt template files (each is a system prompt for an agent role):
+        \\
+        \\  worker.txt — Autonomous coding agent. Mention this project's tech stack,
+        \\    build/test commands, and coding conventions. 5-10 lines.
+        \\  review.txt — Code reviewer. Receives git diff via stdin. Respond ACCEPT
+        \\    or REJECT with reasoning. Only reject clearly wrong/harmful changes.
+        \\  conflict.txt — Merge conflict resolver. Resolve conflicts, verify build passes.
+        \\  fix.txt — Build/test failure fixer. Fix the issue, verify build is green.
+        \\  sre.txt — SRE monitor. CRITICAL: Must NEVER kill/restart/stop processes
+        \\    (no pkill, kill, systemctl stop/restart). Only inspect and adjust config.
+        \\
+        \\## Rules
+        \\- Write valid JSON (no comments, no trailing commas)
+        \\- Use the Write tool to create all files
+        \\- Do NOT modify any existing project source code
+        \\- Do NOT create files outside {s}
+        \\
+    , .{ name, cwd, branch, bees_dir, bees_dir, name, branch, cwd, bees_dir, bees_dir, bees_dir });
+}
+
+fn writeDefaultConfig(arena: std.mem.Allocator, config_path: []const u8, project_name: []const u8, base_branch: []const u8) !void {
+    const content = try std.fmt.allocPrint(arena,
         \\{{
         \\  "project": {{
         \\    "name": "{s}",
-        \\    "base_branch": "main"
+        \\    "base_branch": "{s}"
         \\  }},
         \\  "workers": {{
         \\    "count": 3
@@ -121,25 +261,13 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         \\  }}
         \\}}
         \\
-    , .{project_name});
+    , .{ project_name, base_branch });
     const file = try fs.createFile(config_path, .{});
-    fs.writeFile(file, default_config) catch {};
-    fs.closeFile(file);
-
-    // Write default approaches
-    const approaches_path = try std.fs.path.join(arena, &.{ bees_dir, "approaches.json" });
-    try writeDefaultApproaches(approaches_path);
-
-    // Write default prompts
-    try writeDefaultPrompts(arena, bees_dir);
-
-    // Add .bees/ to .gitignore
-    try addToGitignore(arena, cwd);
-
-    try stdout.print("Initialized bees project at {s}\n", .{bees_dir});
+    defer fs.closeFile(file);
+    try fs.writeFile(file, content);
 }
 
-fn writeDefaultApproaches(path: []const u8) !void {
+fn writeDefaultTasks(path: []const u8) !void {
     const file = try fs.createFile(path, .{});
     defer fs.closeFile(file);
     try fs.writeFile(file,
@@ -169,17 +297,18 @@ fn writeDefaultApproaches(path: []const u8) !void {
     );
 }
 
-fn writeDefaultPrompts(arena: std.mem.Allocator, bees_dir: []const u8) !void {
+fn ensureDefaultPrompts(arena: std.mem.Allocator, bees_dir: []const u8) !void {
     const prompts = [_]struct { name: []const u8, content: []const u8 }{
         .{ .name = "worker.txt", .content = "You are an autonomous coding agent working on this project. Your task is described in the prompt. Work independently, make changes, run tests, and commit your work. Each commit should be atomic and have a clear message. Do not ask questions — make your best judgment calls.\n" },
         .{ .name = "review.txt", .content = "You are a code reviewer. You will receive a git diff via stdin. Review the changes for correctness, safety, and code quality. Respond with either ACCEPT or REJECT followed by your reasoning. Be concise. Only reject changes that are clearly wrong or harmful.\n" },
         .{ .name = "conflict.txt", .content = "There are merge conflicts in this repository. Resolve all conflicts by examining both sides and making the correct choice. After resolving, ensure the code compiles and tests pass.\n" },
         .{ .name = "fix.txt", .content = "The build or tests are failing after a merge. Examine the error output and fix the issue. Ensure the build passes and tests are green before committing.\n" },
-        .{ .name = "sre.txt", .content = "You are the SRE agent monitoring the bees autonomous coding system. Use bees CLI commands to check system health. Identify and resolve systemic issues. Be conservative with configuration changes.\n\nCRITICAL: Do NOT kill, restart, or stop any processes (no pkill, kill, systemctl stop/restart). The daemon manages all service lifecycle. Do NOT run build commands. Only inspect and adjust configuration/approaches.\n" },
+        .{ .name = "sre.txt", .content = "You are the SRE agent monitoring the bees autonomous coding system. Use bees CLI commands to check system health. Identify and resolve systemic issues. Be conservative with configuration changes.\n\nCRITICAL: Do NOT kill, restart, or stop any processes (no pkill, kill, systemctl stop/restart). The daemon manages all service lifecycle. Do NOT run build commands. Only inspect and adjust configuration/tasks.\n" },
     };
 
     for (prompts) |p| {
         const path = try std.fs.path.join(arena, &.{ bees_dir, "prompts", p.name });
+        if (fs.access(path)) continue; // Don't overwrite Claude-generated prompts
         const file = fs.createFile(path, .{}) catch continue;
         fs.writeFile(file, p.content) catch {};
         fs.closeFile(file);
@@ -296,7 +425,7 @@ fn cmdRunWorker(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, id: ?u32) 
     var store = try store_mod.Store.open(db_path);
     defer store.close();
 
-    const pool = try approaches_mod.ApproachPool.load(arena, paths.approaches_file);
+    const pool = try tasks_mod.TaskPool.load(arena, paths.tasks_file);
 
     const log_path = try std.fs.path.join(arena, &.{ paths.logs_dir, "bees.log" });
     var logger = log_mod.Logger.init(log_path);
@@ -389,7 +518,7 @@ fn cmdRunStrategist(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void 
         }
     }
 
-    // Build context from LMDB (QA report + approach trends)
+    // Build context from LMDB (QA report + task trends)
     const context: ?[]const u8 = blk: {
         const rtxn = store.beginReadTxn() catch break :blk null;
         defer store_mod.Store.abortTxn(rtxn);
@@ -402,7 +531,7 @@ fn cmdRunStrategist(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void 
             parts.appendSlice(arena, q) catch break :blk null;
         }
         if (trends) |t| {
-            parts.appendSlice(arena, "\n\n## Approach Performance Trends\n") catch break :blk null;
+            parts.appendSlice(arena, "\n\n## Task Performance Trends\n") catch break :blk null;
             parts.appendSlice(arena, t) catch break :blk null;
         }
         break :blk parts.toOwnedSlice(arena) catch null;
@@ -545,7 +674,7 @@ fn cmdConfig(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
     }
 }
 
-fn cmdApproaches(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
+fn cmdTasks(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
     const project = try loadProject(arena);
     const paths = project[1];
 
@@ -554,11 +683,11 @@ fn cmdApproaches(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void
     var store = store_mod.Store.open(db_path) catch {
         // Fallback to file
         if (json) {
-            const content = try fs.readFileAlloc(arena, paths.approaches_file, 1024 * 1024);
+            const content = try fs.readFileAlloc(arena, paths.tasks_file, 1024 * 1024);
             try stdout.print("{s}\n", .{content});
         } else {
-            const pool = try approaches_mod.ApproachPool.load(arena, paths.approaches_file);
-            for (pool.approaches) |a| {
+            const pool = try tasks_mod.TaskPool.load(arena, paths.tasks_file);
+            for (pool.tasks) |a| {
                 try stdout.print("  {s} (weight={d})\n", .{ a.name, a.weight });
             }
         }
@@ -569,7 +698,7 @@ fn cmdApproaches(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void
     const txn = try store.beginReadTxn();
     defer store_mod.Store.abortTxn(txn);
 
-    var iter = try store.iterApproaches(txn);
+    var iter = try store.iterTasks(txn);
     defer iter.close();
 
     if (json) {
@@ -621,7 +750,7 @@ fn cmdApproaches(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void
     }
 }
 
-fn cmdApproachesSync(arena: std.mem.Allocator, stdout: *Io.Writer, file: ?[]const u8) !void {
+fn cmdTasksSync(arena: std.mem.Allocator, stdout: *Io.Writer, file: ?[]const u8) !void {
     const project = try loadProject(arena);
     const paths = project[1];
 
@@ -631,8 +760,8 @@ fn cmdApproachesSync(arena: std.mem.Allocator, stdout: *Io.Writer, file: ?[]cons
     var store = try store_mod.Store.open(db_path);
     defer store.close();
 
-    const approaches_path = file orelse paths.approaches_file;
-    try approaches_mod.syncFromFile(&store, approaches_path, arena);
+    const tasks_path = file orelse paths.tasks_file;
+    try tasks_mod.syncFromFile(&store, tasks_path, arena);
 
     // Backfill session meta for dashboard direct reads
     store.backfillSessionMeta() catch {};
@@ -643,7 +772,7 @@ fn cmdApproachesSync(arena: std.mem.Allocator, stdout: *Io.Writer, file: ?[]cons
         try stdout.print("Cleaned up {d} stale running sessions\n", .{cleaned});
     }
 
-    try stdout.print("Approaches synced to LMDB from {s}\n", .{approaches_path});
+    try stdout.print("Tasks synced to LMDB from {s}\n", .{tasks_path});
 }
 
 fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?types.SessionType, json: bool) !void {
@@ -663,7 +792,7 @@ fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?type
     if (json) {
         try stdout.print("[", .{});
     } else {
-        try stdout.print("  {s:<6} {s:<10} {s:<10} {s:<8} {s:<10} {s:<30}\n", .{ "ID", "Type", "Status", "Commits", "Cost", "Approach" });
+        try stdout.print("  {s:<6} {s:<10} {s:<10} {s:<8} {s:<10} {s:<30}\n", .{ "ID", "Type", "Status", "Commits", "Cost", "Task" });
         try stdout.print("  {s:-<6} {s:-<10} {s:-<10} {s:-<8} {s:-<10} {s:-<30}\n", .{ "", "", "", "", "", "" });
     }
 
@@ -680,11 +809,11 @@ fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?type
         if (json) {
             if (!first_json) try stdout.print(",", .{});
             first_json = false;
-            try stdout.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"approach\":", .{
+            try stdout.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"task\":", .{
                 entry.id, entry.view.header.@"type".label(), entry.view.header.status.label(),
                 entry.view.header.commit_count, @as(u64, entry.view.header.cost_microdollars) / 10000,
             });
-            try writeJsonStr(stdout, entry.view.approach);
+            try writeJsonStr(stdout, entry.view.task);
             try stdout.print(",\"branch\":", .{});
             try writeJsonStr(stdout, entry.view.branch);
             try stdout.print(",\"duration_ms\":{d},\"started_at\":{d}", .{
@@ -702,7 +831,7 @@ fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?type
         } else {
             try stdout.print("  {d:<6} {s:<10} {s:<10} {d:<8} ${d:<9.2} {s:<30}\n", .{
                 entry.id, entry.view.header.@"type".label(), entry.view.header.status.label(),
-                entry.view.header.commit_count, @as(f64, @floatFromInt(entry.view.header.cost_microdollars)) / 1000000.0, entry.view.approach,
+                entry.view.header.commit_count, @as(f64, @floatFromInt(entry.view.header.cost_microdollars)) / 1000000.0, entry.view.task,
             });
         }
         printed += 1;
@@ -731,12 +860,12 @@ fn cmdSession(arena: std.mem.Allocator, stdout: *Io.Writer, id: u64, json: bool)
     };
 
     if (json) {
-        try stdout.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"cost_microdollars\":{d},\"approach\":", .{
+        try stdout.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"cost_microdollars\":{d},\"task\":", .{
             id, session.header.@"type".label(), session.header.status.label(),
             session.header.commit_count, @as(u64, session.header.cost_microdollars) / 10000,
             session.header.cost_microdollars,
         });
-        try writeJsonStr(stdout, session.approach);
+        try writeJsonStr(stdout, session.task);
         try stdout.print(",\"branch\":", .{});
         try writeJsonStr(stdout, session.branch);
         try stdout.print(",\"turns\":{d},\"duration_ms\":{d},\"started_at\":{d}", .{
@@ -758,7 +887,7 @@ fn cmdSession(arena: std.mem.Allocator, stdout: *Io.Writer, id: u64, json: bool)
             session.header.status.label(), @as(f64, @floatFromInt(session.header.cost_microdollars)) / 1000000.0,
             session.header.commit_count, session.header.num_turns,
         });
-        if (session.approach.len > 0) try stdout.print("Approach: {s}\n\nEvents:\n", .{session.approach});
+        if (session.task.len > 0) try stdout.print("Task: {s}\n\nEvents:\n", .{session.task});
     }
 
     var event_iter = try store.iterSessionEvents(txn, id);
@@ -853,7 +982,7 @@ fn printUsage(stdout: *Io.Writer) !void {
         \\Usage: bees <command> [options]
         \\
         \\Commands:
-        \\  init                     Initialize bees in current project
+        \\  init [--skip-analysis]   Initialize bees in current project
         \\  daemon                   Run continuous orchestrator (workers + merger + SRE)
         \\  start                    Install and enable systemd service
         \\  stop                     Disable systemd service
@@ -865,8 +994,8 @@ fn printUsage(stdout: *Io.Writer) !void {
         \\  run qa                   Run QA agent (one-shot)
         \\  log [--follow]           Show log
         \\  config [--json]          Show config
-        \\  approaches [--json]      List approaches (from LMDB if available)
-        \\  approaches sync [file]   Sync approaches.json into LMDB
+        \\  tasks [--json]           List tasks (from LMDB if available)
+        \\  tasks sync [file]       Sync tasks.json into LMDB
         \\  sessions [--type X] [--json]  List sessions
         \\  session <id> [--json]    Show session detail (--json includes raw event data)
         \\  version                  Print version
@@ -918,7 +1047,7 @@ comptime {
     _ = claude;
     _ = git;
     _ = scheduler;
-    _ = approaches_mod;
+    _ = tasks_mod;
     _ = log_mod;
     _ = fs;
     _ = orchestrator;

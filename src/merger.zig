@@ -141,7 +141,7 @@ pub fn runMerger(
                     store.insertReview(t, wsid, rh, "Merged by review agent") catch {};
                     store_mod.Store.commitTxn(t) catch {};
                 }
-                incrementWorkerApproachStat(store, wsid, .accepted);
+                incrementWorkerTaskStat(store, wsid, .accepted);
             }
             cleanupWorktree(allocator, io, paths.root, candidate);
             logger.info("[merger] merged and cleaned up {s}", .{candidate.branch});
@@ -157,7 +157,7 @@ pub fn runMerger(
                     store.insertReview(t, wsid, rh, "Rejected by review agent") catch {};
                     store_mod.Store.commitTxn(t) catch {};
                 }
-                incrementWorkerApproachStat(store, wsid, .rejected);
+                incrementWorkerTaskStat(store, wsid, .rejected);
             }
         }
     }
@@ -286,25 +286,25 @@ fn reviewAndMerge(
     store.updateSessionStatus(session_id, .running, @truncate(now), updated_header) catch {};
 }
 
-/// Increment the approach stat for a worker session's approach.
-fn incrementWorkerApproachStat(store: *store_mod.Store, worker_session_id: u64, field: enum { accepted, rejected }) void {
+/// Increment the task stat for a worker session's task.
+fn incrementWorkerTaskStat(store: *store_mod.Store, worker_session_id: u64, field: enum { accepted, rejected }) void {
     const read_txn = store.beginReadTxn() catch return;
     const session = (store.getSession(read_txn, worker_session_id) catch null) orelse {
         store_mod.Store.abortTxn(read_txn);
         return;
     };
-    // Copy approach name before closing read txn (it points into mmap)
+    // Copy task name before closing read txn (it points into mmap)
     var name_buf: [256]u8 = undefined;
-    const name_len = @min(session.approach.len, name_buf.len);
+    const name_len = @min(session.task.len, name_buf.len);
     if (name_len == 0) {
         store_mod.Store.abortTxn(read_txn);
         return;
     }
-    @memcpy(name_buf[0..name_len], session.approach[0..name_len]);
+    @memcpy(name_buf[0..name_len], session.task[0..name_len]);
     store_mod.Store.abortTxn(read_txn);
 
     const write_txn = store.beginWriteTxn() catch return;
-    store.incrementApproachStat(write_txn, name_buf[0..name_len], switch (field) {
+    store.incrementTaskStat(write_txn, name_buf[0..name_len], switch (field) {
         .accepted => .accepted,
         .rejected => .rejected,
     }) catch {

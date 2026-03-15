@@ -564,7 +564,7 @@ pub fn collectToolErrors(
     return result.toOwnedSlice(allocator) catch null;
 }
 
-fn streamEvent(s: *Io.Writer, meta: types.EventMeta, line: []const u8) void {
+pub fn streamEvent(s: *Io.Writer, meta: types.EventMeta, line: []const u8) void {
     switch (meta.event_type) {
         .message => {
             if (meta.role == .assistant) {

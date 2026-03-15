@@ -28,7 +28,7 @@ pub fn runStrategist(
     };
     defer allocator.free(base_prompt);
 
-    // Append LMDB context (QA report + approach trends) if available
+    // Append LMDB context (QA report + task trends) if available
     const prompt = if (lmdb_context) |ctx|
         std.fmt.allocPrint(allocator, "{s}{s}", .{ base_prompt, ctx }) catch base_prompt
     else

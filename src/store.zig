@@ -9,7 +9,7 @@ pub const Store = struct {
     sessions_by_time: c.MDB_dbi,
     events: c.MDB_dbi,
     reviews: c.MDB_dbi,
-    approaches: c.MDB_dbi,
+    tasks: c.MDB_dbi,
     meta: c.MDB_dbi,
 
     pub fn open(path: []const u8) !Store {
@@ -37,7 +37,7 @@ pub const Store = struct {
         const sessions_by_time = try openDbi(txn, types.DbNames.sessions_by_time);
         const events = try openDbi(txn, types.DbNames.events);
         const reviews = try openDbi(txn, types.DbNames.reviews);
-        const approaches_dbi = try openDbi(txn, types.DbNames.approaches);
+        const tasks_dbi = try openDbi(txn, types.DbNames.tasks);
         const meta_dbi = try openDbi(txn, types.DbNames.meta);
 
         try check(c.mdb_txn_commit(txn));
@@ -49,7 +49,7 @@ pub const Store = struct {
             .sessions_by_time = sessions_by_time,
             .events = events,
             .reviews = reviews,
-            .approaches = approaches_dbi,
+            .tasks = tasks_dbi,
             .meta = meta_dbi,
         };
     }
@@ -110,7 +110,7 @@ pub const Store = struct {
     pub fn createSession(
         self: *Store,
         header: types.SessionHeader,
-        approach: []const u8,
+        task: []const u8,
         branch: []const u8,
         worktree: []const u8,
     ) !u64 {
@@ -125,7 +125,7 @@ pub const Store = struct {
         var key_bytes = key.toBytes();
         var key_val = mkValBytes(&key_bytes);
 
-        const value_size = types.sessionValueSize(approach, branch, worktree, null);
+        const value_size = types.sessionValueSize(task, branch, worktree, null);
         var data_val: c.MDB_val = .{ .mv_size = value_size, .mv_data = null };
         try check(c.mdb_put(txn, self.sessions, &key_val, &data_val, c.MDB_RESERVE));
 
@@ -134,7 +134,7 @@ pub const Store = struct {
         const dest = buf[0..value_size];
         @memcpy(dest[0..@sizeOf(types.SessionHeader)], std.mem.asBytes(&header));
         var offset: usize = @sizeOf(types.SessionHeader);
-        types.writeLenPrefixed(dest, &offset, approach);
+        types.writeLenPrefixed(dest, &offset, task);
         types.writeLenPrefixed(dest, &offset, branch);
         types.writeLenPrefixed(dest, &offset, worktree);
 
@@ -150,7 +150,7 @@ pub const Store = struct {
         try check(c.mdb_put(txn, self.sessions_by_time, &time_key_val, &empty_val, 0));
 
         // Write JSON summary to meta for dashboard direct reads
-        self.writeSessionMeta(txn, id, header, approach, branch) catch {};
+        self.writeSessionMeta(txn, id, header, task, branch) catch {};
 
         // Update session count
         var count_buf: [16]u8 = undefined;
@@ -214,7 +214,7 @@ pub const Store = struct {
 
         // Write JSON summary to meta for dashboard direct reads
         const view = types.SessionView.fromBytes(buf[0..old_size]);
-        self.writeSessionMeta(txn, id, new_header, view.approach, view.branch) catch {};
+        self.writeSessionMeta(txn, id, new_header, view.task, view.branch) catch {};
 
         // Update session count
         var count_buf: [16]u8 = undefined;
@@ -231,21 +231,21 @@ pub const Store = struct {
         txn: ?*c.MDB_txn,
         id: u64,
         h: types.SessionHeader,
-        approach: []const u8,
+        task: []const u8,
         branch: []const u8,
     ) !void {
         var json_buf: [4096]u8 = undefined;
-        // Build JSON with proper escaping for user-controlled strings (approach, branch).
+        // Build JSON with proper escaping for user-controlled strings (task, branch).
         // Enum labels are safe (compile-time literals).
         const prefix = std.fmt.bufPrint(&json_buf,
-            \\{{"id":{d},"type":"{s}","status":"{s}","commits":{d},"cost_cents":{d},"cost_microdollars":{d},"approach":"
+            \\{{"id":{d},"type":"{s}","status":"{s}","commits":{d},"cost_cents":{d},"cost_microdollars":{d},"task":"
         , .{
             id, h.@"type".label(), h.status.label(), h.commit_count,
             @as(u64, h.cost_microdollars) / 10000, h.cost_microdollars,
         }) catch return;
         var pos: usize = prefix.len;
 
-        pos = appendEscaped(&json_buf, pos, approach);
+        pos = appendEscaped(&json_buf, pos, task);
         const mid = std.fmt.bufPrint(json_buf[pos..],
             \\","branch":"
         , .{}) catch return;
@@ -456,46 +456,46 @@ pub const Store = struct {
         return types.ReviewView.fromBytes(ptr[0..data_val.mv_size]);
     }
 
-    // -- Approach operations --
+    // -- Task operations --
 
-    pub fn upsertApproach(self: *Store, txn: ?*c.MDB_txn, name: []const u8, header: types.ApproachHeader, prompt: []const u8) !void {
+    pub fn upsertTask(self: *Store, txn: ?*c.MDB_txn, name: []const u8, header: types.TaskHeader, prompt: []const u8) !void {
         var key_val = mkValSlice(name);
-        const value_size = types.approachValueSize(prompt);
+        const value_size = types.taskValueSize(prompt);
         var data_val: c.MDB_val = .{ .mv_size = value_size, .mv_data = null };
-        try check(c.mdb_put(txn, self.approaches, &key_val, &data_val, c.MDB_RESERVE));
+        try check(c.mdb_put(txn, self.tasks, &key_val, &data_val, c.MDB_RESERVE));
 
         const buf: [*]u8 = @ptrCast(data_val.mv_data);
         const dest = buf[0..value_size];
-        @memcpy(dest[0..@sizeOf(types.ApproachHeader)], std.mem.asBytes(&header));
-        var offset: usize = @sizeOf(types.ApproachHeader);
+        @memcpy(dest[0..@sizeOf(types.TaskHeader)], std.mem.asBytes(&header));
+        var offset: usize = @sizeOf(types.TaskHeader);
         types.writeLenPrefixed(dest, &offset, prompt);
     }
 
-    pub fn getApproach(self: *Store, txn: ?*c.MDB_txn, name: []const u8) !?types.ApproachView {
+    pub fn getTask(self: *Store, txn: ?*c.MDB_txn, name: []const u8) !?types.TaskView {
         var key_val = mkValSlice(name);
         var data_val: c.MDB_val = undefined;
 
-        const rc = c.mdb_get(txn, self.approaches, &key_val, &data_val);
+        const rc = c.mdb_get(txn, self.tasks, &key_val, &data_val);
         if (rc == c.MDB_NOTFOUND) return null;
         if (rc != 0) return lmdbError(rc);
 
-        if (data_val.mv_size < @sizeOf(types.ApproachHeader)) return null;
+        if (data_val.mv_size < @sizeOf(types.TaskHeader)) return null;
 
         const ptr: [*]const u8 = @ptrCast(data_val.mv_data);
-        return types.ApproachView.fromBytes(ptr[0..data_val.mv_size]);
+        return types.TaskView.fromBytes(ptr[0..data_val.mv_size]);
     }
 
-    pub fn incrementApproachStat(self: *Store, txn: ?*c.MDB_txn, name: []const u8, field: enum { total_runs, accepted, rejected, empty }) !void {
+    pub fn incrementTaskStat(self: *Store, txn: ?*c.MDB_txn, name: []const u8, field: enum { total_runs, accepted, rejected, empty }) !void {
         var key_val = mkValSlice(name);
         var data_val: c.MDB_val = undefined;
 
-        const rc = c.mdb_get(txn, self.approaches, &key_val, &data_val);
+        const rc = c.mdb_get(txn, self.tasks, &key_val, &data_val);
         if (rc == c.MDB_NOTFOUND) return;
         if (rc != 0) return lmdbError(rc);
-        if (data_val.mv_size < @sizeOf(types.ApproachHeader)) return;
+        if (data_val.mv_size < @sizeOf(types.TaskHeader)) return;
 
         // Copy full value (header + prompt) to local buffer
-        // 64KB is more than enough for any approach (prompts are typically < 1KB)
+        // 64KB is more than enough for any task (prompts are typically < 1KB)
         var buf: [65536]u8 = undefined;
         const size = data_val.mv_size;
         if (size > buf.len) return error.LmdbBadValSize;
@@ -503,8 +503,8 @@ pub const Store = struct {
         @memcpy(buf[0..size], src[0..size]);
 
         // Modify header field
-        var header: types.ApproachHeader = undefined;
-        @memcpy(std.mem.asBytes(&header), buf[0..@sizeOf(types.ApproachHeader)]);
+        var header: types.TaskHeader = undefined;
+        @memcpy(std.mem.asBytes(&header), buf[0..@sizeOf(types.TaskHeader)]);
 
         switch (field) {
             .total_runs => header.total_runs +|= 1,
@@ -513,21 +513,21 @@ pub const Store = struct {
             .empty => header.empty +|= 1,
         }
 
-        @memcpy(buf[0..@sizeOf(types.ApproachHeader)], std.mem.asBytes(&header));
+        @memcpy(buf[0..@sizeOf(types.TaskHeader)], std.mem.asBytes(&header));
 
         var new_data_val: c.MDB_val = .{ .mv_size = size, .mv_data = @ptrCast(&buf) };
-        try check(c.mdb_put(txn, self.approaches, &key_val, &new_data_val, 0));
+        try check(c.mdb_put(txn, self.tasks, &key_val, &new_data_val, 0));
     }
 
-    pub fn deleteApproach(self: *Store, txn: ?*c.MDB_txn, name: []const u8) !void {
+    pub fn deleteTask(self: *Store, txn: ?*c.MDB_txn, name: []const u8) !void {
         var key_val = mkValSlice(name);
-        const rc = c.mdb_del(txn, self.approaches, &key_val, null);
+        const rc = c.mdb_del(txn, self.tasks, &key_val, null);
         if (rc != 0 and rc != c.MDB_NOTFOUND) return lmdbError(rc);
     }
 
-    pub fn iterApproaches(self: *Store, txn: ?*c.MDB_txn) !ApproachIterator {
+    pub fn iterTasks(self: *Store, txn: ?*c.MDB_txn) !TaskIterator {
         var cursor: ?*c.MDB_cursor = null;
-        try check(c.mdb_cursor_open(txn, self.approaches, &cursor));
+        try check(c.mdb_cursor_open(txn, self.tasks, &cursor));
 
         var key_val: c.MDB_val = undefined;
         var data_val: c.MDB_val = undefined;
@@ -543,7 +543,7 @@ pub const Store = struct {
         return .{ .cursor = cursor, .exhausted = false, .first_key = key_val, .first_data = data_val, .has_first = true };
     }
 
-    pub const ApproachIterator = struct {
+    pub const TaskIterator = struct {
         cursor: ?*c.MDB_cursor,
         exhausted: bool,
         first_key: c.MDB_val = undefined,
@@ -552,10 +552,10 @@ pub const Store = struct {
 
         pub const Entry = struct {
             name: []const u8,
-            view: types.ApproachView,
+            view: types.TaskView,
         };
 
-        pub fn next(self: *ApproachIterator) ?Entry {
+        pub fn next(self: *TaskIterator) ?Entry {
             if (self.exhausted) return null;
 
             var key_val: c.MDB_val = undefined;
@@ -577,7 +577,7 @@ pub const Store = struct {
                 }
             }
 
-            if (data_val.mv_size < @sizeOf(types.ApproachHeader)) {
+            if (data_val.mv_size < @sizeOf(types.TaskHeader)) {
                 return self.next();
             }
 
@@ -586,11 +586,11 @@ pub const Store = struct {
 
             return .{
                 .name = key_ptr[0..key_val.mv_size],
-                .view = types.ApproachView.fromBytes(data_ptr[0..data_val.mv_size]),
+                .view = types.TaskView.fromBytes(data_ptr[0..data_val.mv_size]),
             };
         }
 
-        pub fn close(self: *ApproachIterator) void {
+        pub fn close(self: *TaskIterator) void {
             if (self.cursor) |cur| {
                 c.mdb_cursor_close(cur);
                 self.cursor = null;
@@ -729,7 +729,7 @@ pub const Store = struct {
                 write_txn,
                 entry.id,
                 entry.view.header,
-                entry.view.approach,
+                entry.view.task,
                 entry.view.branch,
             ) catch {
                 abortTxn(write_txn);
@@ -961,7 +961,7 @@ test "store create and get session" {
     defer Store.abortTxn(txn);
 
     const session = (try store.getSession(txn, id)).?;
-    try std.testing.expectEqualStrings("Bug hunt", session.approach);
+    try std.testing.expectEqualStrings("Bug hunt", session.task);
     try std.testing.expectEqualStrings("bee/test/worker-1", session.branch);
     try std.testing.expectEqual(types.SessionType.worker, session.header.@"type");
     try std.testing.expectEqual(types.SessionStatus.running, session.header.status);

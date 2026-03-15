@@ -7,7 +7,7 @@ const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 const git = @import("git.zig");
 const claude = @import("claude.zig");
-const approaches_mod = @import("approaches.zig");
+const tasks_mod = @import("tasks.zig");
 
 /// Entry point for the API server thread. Never returns unless fatal error.
 pub fn startApiServer(
@@ -147,7 +147,7 @@ fn route(
     if (std.mem.eql(u8, method, "GET")) {
         if (std.mem.eql(u8, path, "/api/status")) return handleStatus(w, store, cfg, paths);
         if (std.mem.eql(u8, path, "/api/sessions")) return handleSessions(w, store, null);
-        if (std.mem.eql(u8, path, "/api/approaches")) return handleApproaches(w, store);
+        if (std.mem.eql(u8, path, "/api/tasks")) return handleTasks(w, store);
         if (std.mem.eql(u8, path, "/api/config")) return handleConfig(w, paths);
         if (std.mem.eql(u8, path, "/api/log")) return handleLog(w, paths, allocator);
         if (std.mem.eql(u8, path, "/api/workers")) return handleSessions(w, store, .worker);
@@ -173,8 +173,8 @@ fn route(
     }
 
     if (std.mem.eql(u8, method, "POST") or std.mem.eql(u8, method, "PUT")) {
-        if (std.mem.eql(u8, path, "/api/approaches") or std.mem.eql(u8, path, "/api/approaches/sync")) {
-            return handleApproachesPost(w, store, paths, body, allocator);
+        if (std.mem.eql(u8, path, "/api/tasks") or std.mem.eql(u8, path, "/api/tasks/sync")) {
+            return handleTasksPost(w, store, paths, body, allocator);
         }
         if (std.mem.eql(u8, path, "/api/config")) {
             return handleConfigPost(w, paths, body, allocator);
@@ -235,7 +235,7 @@ fn handleSession(w: *Io.Writer, store: *store_mod.Store, id: u64) !void {
 
     try writeResponseHeader(w, 200, "application/json");
 
-    try w.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"cost_microdollars\":{d},\"approach\":", .{
+    try w.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"cost_microdollars\":{d},\"task\":", .{
         id,
         session.header.@"type".label(),
         session.header.status.label(),
@@ -243,7 +243,7 @@ fn handleSession(w: *Io.Writer, store: *store_mod.Store, id: u64) !void {
         @as(u64, session.header.cost_microdollars) / 10000,
         session.header.cost_microdollars,
     });
-    try writeJsonStr(w, session.approach);
+    try writeJsonStr(w, session.task);
     try w.print(",\"branch\":", .{});
     try writeJsonStr(w, session.branch);
     try w.print(",\"turns\":{d},\"duration_ms\":{d}", .{
@@ -376,14 +376,14 @@ fn handleSessionDiff(
     try w.print(",\"files_changed\":{d}}}", .{files_changed});
 }
 
-fn handleApproaches(w: *Io.Writer, store: *store_mod.Store) !void {
+fn handleTasks(w: *Io.Writer, store: *store_mod.Store) !void {
     const txn = try store.beginReadTxn();
     defer store_mod.Store.abortTxn(txn);
 
     try writeResponseHeader(w, 200, "application/json");
     try w.print("[", .{});
 
-    var iter = try store.iterApproaches(txn);
+    var iter = try store.iterTasks(txn);
     defer iter.close();
     var first = true;
 
@@ -410,7 +410,7 @@ fn handleApproaches(w: *Io.Writer, store: *store_mod.Store) !void {
     try w.print("]", .{});
 }
 
-fn handleApproachesPost(
+fn handleTasksPost(
     w: *Io.Writer,
     store: *store_mod.Store,
     paths: config_mod.ProjectPaths,
@@ -421,8 +421,8 @@ fn handleApproachesPost(
         return writeResponse(w, 400, "application/json", "{\"error\":\"Empty body\"}");
     }
 
-    // Write to approaches.json file
-    const file = fs.createFile(paths.approaches_file, .{}) catch
+    // Write to tasks.json file
+    const file = fs.createFile(paths.tasks_file, .{}) catch
         return writeResponse(w, 500, "application/json", "{\"error\":\"Failed to write file\"}");
     fs.writeFile(file, body) catch {
         fs.closeFile(file);
@@ -431,7 +431,7 @@ fn handleApproachesPost(
     fs.closeFile(file);
 
     // Sync to LMDB
-    approaches_mod.syncFromJson(store, body, .user, allocator) catch
+    tasks_mod.syncFromJson(store, body, .user, allocator) catch
         return writeResponse(w, 500, "application/json", "{\"error\":\"Failed to sync to database\"}");
 
     return writeResponse(w, 200, "application/json", "{\"ok\":true}");
@@ -558,14 +558,14 @@ fn writeSessionsArray(w: *Io.Writer, store: *store_mod.Store, txn: anytype, type
         if (!first) try w.print(",", .{});
         first = false;
 
-        try w.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"approach\":", .{
+        try w.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"task\":", .{
             entry.id,
             entry.view.header.@"type".label(),
             entry.view.header.status.label(),
             entry.view.header.commit_count,
             @as(u64, entry.view.header.cost_microdollars) / 10000,
         });
-        try writeJsonStr(w, entry.view.approach);
+        try writeJsonStr(w, entry.view.task);
         try w.print(",\"branch\":", .{});
         try writeJsonStr(w, entry.view.branch);
         try w.print(",\"duration_ms\":{d}", .{entry.view.header.duration_ms});

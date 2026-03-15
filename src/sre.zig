@@ -34,7 +34,7 @@ pub fn runSre(
 
     // Build the full prompt: base template + error context
     const prompt = if (error_context) |ctx|
-        std.fmt.allocPrint(allocator, "{s}\n\n## Tool Errors That Triggered This Run\n\nThe following tool errors were observed in session {d}. Diagnose the root cause and fix the configuration, prompts, or approaches to prevent recurrence.\n\n{s}", .{ base_prompt, trigger_session_id, ctx }) catch base_prompt
+        std.fmt.allocPrint(allocator, "{s}\n\n## Tool Errors That Triggered This Run\n\nThe following tool errors were observed in session {d}. Diagnose the root cause and fix the configuration, prompts, or tasks to prevent recurrence.\n\n{s}", .{ base_prompt, trigger_session_id, ctx }) catch base_prompt
     else
         base_prompt;
     defer if (prompt.ptr != base_prompt.ptr) allocator.free(prompt);

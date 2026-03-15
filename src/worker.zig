@@ -5,7 +5,7 @@ const config_mod = @import("config.zig");
 const store_mod = @import("store.zig");
 const git = @import("git.zig");
 const claude = @import("claude.zig");
-const approaches_mod = @import("approaches.zig");
+const tasks_mod = @import("tasks.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 
@@ -18,7 +18,7 @@ pub fn runWorkerWithTimeout(
     cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
     store: *store_mod.Store,
-    pool: *const approaches_mod.ApproachPool,
+    pool: *const tasks_mod.TaskPool,
     logger: *log_mod.Logger,
     io: Io,
     worker_id: u32,
@@ -32,7 +32,7 @@ pub fn runWorker(
     cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
     store: *store_mod.Store,
-    pool: *const approaches_mod.ApproachPool,
+    pool: *const tasks_mod.TaskPool,
     logger: *log_mod.Logger,
     io: Io,
     worker_id: u32,
@@ -46,7 +46,7 @@ fn runWorkerImpl(
     cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
     store: *store_mod.Store,
-    pool: *const approaches_mod.ApproachPool,
+    pool: *const tasks_mod.TaskPool,
     logger: *log_mod.Logger,
     io: Io,
     worker_id: u32,
@@ -66,12 +66,12 @@ fn runWorkerImpl(
     }
     defer releaseLock(lock_path);
 
-    // Select approach
-    const approach = pool.select() orelse {
-        logger.info("[worker:{d}] no active approaches, skipping", .{worker_id});
+    // Select task
+    const task = pool.select() orelse {
+        logger.info("[worker:{d}] no active tasks, skipping", .{worker_id});
         return .{};
     };
-    logger.info("[worker:{d}] start approach=\"{s}\"", .{ worker_id, approach.name });
+    logger.info("[worker:{d}] start task=\"{s}\"", .{ worker_id, task.name });
 
     // Create worktree
     var ts_buf: [32]u8 = undefined;
@@ -143,12 +143,12 @@ fn runWorkerImpl(
         .cache_read_tokens = 0,
     };
 
-    const session_id = store.createSession(header, approach.name, branch_name, worktree_dir) catch |e| {
+    const session_id = store.createSession(header, task.name, branch_name, worktree_dir) catch |e| {
         logger.err("[worker:{d}] session create failed: {}", .{ worker_id, e });
         return .{};
     };
 
-    // Build prompt with approach
+    // Build prompt with task
     const prompt_path = try std.fs.path.join(allocator, &.{ paths.prompts_dir, "worker.txt" });
     defer allocator.free(prompt_path);
 
@@ -179,7 +179,7 @@ fn runWorkerImpl(
         }
 
         const result = claude.runClaudeSession(store, io, .{
-            .prompt = if (claude_session_id != null) "Continue your work from where you left off. Complete all remaining tasks." else approach.prompt,
+            .prompt = if (claude_session_id != null) "Continue your work from where you left off. Complete all remaining tasks." else task.prompt,
             .cwd = worktree_dir,
             .append_prompt_file = prompt_path,
             .model = cfg.workers.model,
@@ -267,28 +267,28 @@ fn runWorkerImpl(
         }
     }
 
-    // Update approach stats
+    // Update task stats
     {
         const txn = store.beginWriteTxn() catch null;
         if (txn) |t| {
-            store.incrementApproachStat(t, approach.name, .total_runs) catch {};
-            if (commits == 0) store.incrementApproachStat(t, approach.name, .empty) catch {};
+            store.incrementTaskStat(t, task.name, .total_runs) catch {};
+            if (commits == 0) store.incrementTaskStat(t, task.name, .empty) catch {};
             store_mod.Store.commitTxn(t) catch {};
         }
     }
 
     if (result.tool_errors > 0) {
-        logger.info("[worker:{d}] done approach=\"{s}\" commits={d} cost=${d:.2} tool_errors={d}", .{
+        logger.info("[worker:{d}] done task=\"{s}\" commits={d} cost=${d:.2} tool_errors={d}", .{
             worker_id,
-            approach.name,
+            task.name,
             commits,
             @as(f64, @floatFromInt(result.cost_microdollars)) / 1000000.0,
             result.tool_errors,
         });
     } else {
-        logger.info("[worker:{d}] done approach=\"{s}\" commits={d} cost=${d:.2}", .{
+        logger.info("[worker:{d}] done task=\"{s}\" commits={d} cost=${d:.2}", .{
             worker_id,
-            approach.name,
+            task.name,
             commits,
             @as(f64, @floatFromInt(result.cost_microdollars)) / 1000000.0,
         });
@@ -301,7 +301,7 @@ pub fn runAllWorkers(
     cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
     store: *store_mod.Store,
-    pool: *const approaches_mod.ApproachPool,
+    pool: *const tasks_mod.TaskPool,
     logger: *log_mod.Logger,
     io: Io,
     allocator: std.mem.Allocator,
@@ -325,7 +325,7 @@ fn workerGroupTask(
     cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
     store: *store_mod.Store,
-    pool: *const approaches_mod.ApproachPool,
+    pool: *const tasks_mod.TaskPool,
     logger: *log_mod.Logger,
     io: Io,
     worker_id: u32,

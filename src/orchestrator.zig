@@ -7,7 +7,7 @@ const merger = @import("merger.zig");
 const sre_mod = @import("sre.zig");
 const strategist_mod = @import("strategist.zig");
 const qa_mod = @import("qa.zig");
-const approaches_mod = @import("approaches.zig");
+const tasks_mod = @import("tasks.zig");
 const git = @import("git.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
@@ -54,25 +54,25 @@ pub fn run(
     // Track merge cycles for strategist scheduling
     var merge_cycle: u32 = 0;
 
-    // Bootstrap: sync approaches.json into LMDB
-    approaches_mod.syncFromFile(store, paths.approaches_file, allocator) catch |e| {
-        logger.warn("[daemon] initial approach sync failed: {}", .{e});
+    // Bootstrap: sync tasks.json into LMDB
+    tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch |e| {
+        logger.warn("[daemon] initial task sync failed: {}", .{e});
     };
 
-    // Always run strategist at startup to refresh stale approaches before spawning workers
-    logger.info("[daemon] running startup strategist to refresh approaches", .{});
+    // Always run strategist at startup to refresh stale tasks before spawning workers
+    logger.info("[daemon] running startup strategist to refresh tasks", .{});
     runStrategistWithPrep(cfg, paths, store, logger, io, allocator);
-    approaches_mod.syncFromFile(store, paths.approaches_file, allocator) catch {};
+    tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
 
-    // Load approaches from LMDB (single source of truth)
-    var pool = approaches_mod.ApproachPool.loadFromStore(store, allocator) catch
-        try approaches_mod.ApproachPool.load(allocator, paths.approaches_file);
-    if (!pool.hasActiveApproaches()) {
-        logger.warn("[daemon] no active approaches after startup strategist, waiting for SRE/manual intervention", .{});
+    // Load tasks from LMDB (single source of truth)
+    var pool = tasks_mod.TaskPool.loadFromStore(store, allocator) catch
+        try tasks_mod.TaskPool.load(allocator, paths.tasks_file);
+    if (!pool.hasActiveTasks()) {
+        logger.warn("[daemon] no active tasks after startup strategist, waiting for SRE/manual intervention", .{});
     }
 
     // Spawn initial workers as green threads
-    if (pool.hasActiveApproaches()) {
+    if (pool.hasActiveTasks()) {
         const spawn_count = @min(cfg.workers.count, MAX_WORKERS);
         for (0..spawn_count) |_| {
             spawnWorker(cfg, paths, store, pool, logger, io, allocator, &state);
@@ -122,7 +122,7 @@ pub fn run(
             merge_cycle += 1;
             if (cfg.strategist.cycle_interval == 0 or merge_cycle % cfg.strategist.cycle_interval == 0) {
                 logger.info("[daemon] running strategist (cycle {d})", .{merge_cycle});
-                writeApproachTrends(cfg, paths, store, logger, allocator);
+                writeTaskTrends(cfg, paths, store, logger, allocator);
                 const ctx = buildStrategistContext(store, allocator);
                 defer if (ctx) |c| allocator.free(c);
                 strategist_mod.runStrategist(cfg, paths, store, logger, io, allocator, false, ctx) catch |e| {
@@ -140,21 +140,21 @@ pub fn run(
             logger.info("[daemon] cooling down for {d} minutes", .{cfg.daemon.cooldown_minutes});
             sleep_secs(io, cooldown_secs);
 
-            // Sync approaches.json into LMDB and reload from store
-            approaches_mod.syncFromFile(store, paths.approaches_file, allocator) catch {};
-            pool = approaches_mod.ApproachPool.loadFromStore(store, allocator) catch
-                approaches_mod.ApproachPool.load(allocator, paths.approaches_file) catch pool;
+            // Sync tasks.json into LMDB and reload from store
+            tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
+            pool = tasks_mod.TaskPool.loadFromStore(store, allocator) catch
+                tasks_mod.TaskPool.load(allocator, paths.tasks_file) catch pool;
 
-            if (!pool.hasActiveApproaches()) {
-                logger.info("[daemon] all approaches exhausted, running strategist", .{});
+            if (!pool.hasActiveTasks()) {
+                logger.info("[daemon] all tasks exhausted, running strategist", .{});
                 runStrategistWithPrep(cfg, paths, store, logger, io, allocator);
-                approaches_mod.syncFromFile(store, paths.approaches_file, allocator) catch {};
-                pool = approaches_mod.ApproachPool.loadFromStore(store, allocator) catch
-                    approaches_mod.ApproachPool.load(allocator, paths.approaches_file) catch pool;
+                tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
+                pool = tasks_mod.TaskPool.loadFromStore(store, allocator) catch
+                    tasks_mod.TaskPool.load(allocator, paths.tasks_file) catch pool;
             }
 
             // Refill workers (only if there's work to do)
-            if (pool.hasActiveApproaches()) {
+            if (pool.hasActiveTasks()) {
                 const current_active = @atomicLoad(u32, &state.active_count, .acquire);
                 const need = @min(cfg.workers.count, MAX_WORKERS) -| current_active;
                 if (need > 0) {
@@ -164,7 +164,7 @@ pub fn run(
                     }
                 }
             } else {
-                logger.warn("[daemon] no active approaches, skipping worker spawn — waiting for next cycle", .{});
+                logger.warn("[daemon] no active tasks, skipping worker spawn — waiting for next cycle", .{});
             }
         }
     }
@@ -175,7 +175,7 @@ fn spawnWorker(
     cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
     store: *store_mod.Store,
-    pool: approaches_mod.ApproachPool,
+    pool: tasks_mod.TaskPool,
     logger: *log_mod.Logger,
     io: Io,
     allocator: std.mem.Allocator,
@@ -199,7 +199,7 @@ fn workerTask(
     cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
     store: *store_mod.Store,
-    pool: approaches_mod.ApproachPool,
+    pool: tasks_mod.TaskPool,
     logger: *log_mod.Logger,
     io: Io,
     wid: u32,
@@ -347,7 +347,7 @@ fn runStrategistWithPrep(
     allocator: std.mem.Allocator,
 ) void {
     prepareForStrategist(cfg, paths, logger, io, allocator);
-    writeApproachTrends(cfg, paths, store, logger, allocator);
+    writeTaskTrends(cfg, paths, store, logger, allocator);
 
     const context = buildStrategistContext(store, allocator);
     defer if (context) |c| allocator.free(c);
@@ -383,7 +383,7 @@ fn buildStrategistContext(store: *store_mod.Store, allocator: std.mem.Allocator)
     return parts.toOwnedSlice(allocator) catch null;
 }
 
-fn writeApproachTrends(
+fn writeTaskTrends(
     cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
     store: *store_mod.Store,
@@ -391,13 +391,13 @@ fn writeApproachTrends(
     allocator: std.mem.Allocator,
 ) void {
     _ = cfg;
-    const pool = approaches_mod.ApproachPool.loadFromStore(store, allocator) catch
-        approaches_mod.ApproachPool.load(allocator, paths.approaches_file) catch return;
+    const pool = tasks_mod.TaskPool.loadFromStore(store, allocator) catch
+        tasks_mod.TaskPool.load(allocator, paths.tasks_file) catch return;
 
     var buf: [16384]u8 = undefined;
     var pos: usize = 0;
 
-    const header_text = "# Approach Performance Trends\n\n| Approach | Weight | Runs | Accepted | Rejected | Empty | Accept Rate |\n|----------|--------|------|----------|----------|-------|-------------|\n";
+    const header_text = "# Task Performance Trends\n\n| Task | Weight | Runs | Accepted | Rejected | Empty | Accept Rate |\n|------|--------|------|----------|----------|-------|-------------|\n";
     if (pos + header_text.len <= buf.len) {
         @memcpy(buf[pos..][0..header_text.len], header_text);
         pos += header_text.len;
@@ -406,8 +406,8 @@ fn writeApproachTrends(
     const read_txn = store.beginReadTxn() catch return;
     defer store_mod.Store.abortTxn(read_txn);
 
-    for (pool.approaches) |a| {
-        const view = (store.getApproach(read_txn, a.name) catch null) orelse continue;
+    for (pool.tasks) |a| {
+        const view = (store.getTask(read_txn, a.name) catch null) orelse continue;
         const h = view.header;
         const total = h.total_runs;
         const accept_rate: f64 = if (total > 0)
@@ -427,8 +427,8 @@ fn writeApproachTrends(
         pos += rec_header.len;
     }
 
-    for (pool.approaches) |a| {
-        const view = (store.getApproach(read_txn, a.name) catch null) orelse continue;
+    for (pool.tasks) |a| {
+        const view = (store.getTask(read_txn, a.name) catch null) orelse continue;
         const h = view.header;
         if (h.total_runs >= 5 and h.accepted == 0) {
             const line = std.fmt.bufPrint(buf[pos..], "- **{s}**: {d} runs, 0 accepted — consider replacing\n", .{ a.name, h.total_runs }) catch break;
@@ -445,5 +445,5 @@ fn writeApproachTrends(
         return;
     };
     store_mod.Store.commitTxn(write_txn) catch return;
-    logger.info("[daemon] wrote approach trends to LMDB ({d} bytes)", .{pos});
+    logger.info("[daemon] wrote task trends to LMDB ({d} bytes)", .{pos});
 }

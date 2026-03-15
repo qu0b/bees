@@ -5,37 +5,37 @@ const store_mod = @import("store.zig");
 
 var select_counter: u64 = 0;
 
-pub const Approach = struct {
+pub const Task = struct {
     name: []const u8,
     weight: u32,
     prompt: []const u8,
     cumulative: u32,
 };
 
-pub const ApproachPool = struct {
-    approaches: []Approach,
+pub const TaskPool = struct {
+    tasks: []Task,
     total_weight: u32,
 
-    /// Load approaches from JSON file (backward compatible path).
-    pub fn load(allocator: std.mem.Allocator, path: []const u8) !ApproachPool {
+    /// Load tasks from JSON file (backward compatible path).
+    pub fn load(allocator: std.mem.Allocator, path: []const u8) !TaskPool {
         const data = try fs.readFileAlloc(allocator, path, 1024 * 1024);
 
-        const JsonApproach = struct {
+        const JsonTask = struct {
             name: []const u8,
             weight: u32,
             prompt: []const u8,
         };
 
-        const parsed = try std.json.parseFromSlice([]const JsonApproach, allocator, data, .{
+        const parsed = try std.json.parseFromSlice([]const JsonTask, allocator, data, .{
             .allocate = .alloc_always,
         });
         const items = parsed.value;
 
-        var approaches = try allocator.alloc(Approach, items.len);
+        var tasks = try allocator.alloc(Task, items.len);
         var cumulative: u32 = 0;
         for (items, 0..) |item, i| {
             cumulative += item.weight;
-            approaches[i] = .{
+            tasks[i] = .{
                 .name = item.name,
                 .weight = item.weight,
                 .prompt = item.prompt,
@@ -44,21 +44,21 @@ pub const ApproachPool = struct {
         }
 
         return .{
-            .approaches = approaches,
+            .tasks = tasks,
             .total_weight = cumulative,
         };
     }
 
-    /// Load approaches from LMDB. Skips completed/retired approaches.
-    /// Auto-retires exhausted approaches (empty >= 3, accepted == 0, total_runs >= 3).
-    pub fn loadFromStore(store: *store_mod.Store, allocator: std.mem.Allocator) !ApproachPool {
+    /// Load tasks from LMDB. Skips completed/retired tasks.
+    /// Auto-retires exhausted tasks (empty >= 3, accepted == 0, total_runs >= 3).
+    pub fn loadFromStore(store: *store_mod.Store, allocator: std.mem.Allocator) !TaskPool {
         const txn = try store.beginReadTxn();
         defer store_mod.Store.abortTxn(txn);
 
-        // First pass: count active approaches
+        // First pass: count active tasks
         var count: usize = 0;
         {
-            var iter = try store.iterApproaches(txn);
+            var iter = try store.iterTasks(txn);
             defer iter.close();
             while (iter.next()) |entry| {
                 if (entry.view.header.status != .active) continue;
@@ -70,11 +70,11 @@ pub const ApproachPool = struct {
         }
 
         // Second pass: build pool
-        var approaches = try allocator.alloc(Approach, count);
+        var tasks = try allocator.alloc(Task, count);
         var cumulative: u32 = 0;
         var idx: usize = 0;
         {
-            var iter = try store.iterApproaches(txn);
+            var iter = try store.iterTasks(txn);
             defer iter.close();
             while (iter.next()) |entry| {
                 if (entry.view.header.status != .active) continue;
@@ -84,7 +84,7 @@ pub const ApproachPool = struct {
 
                 const w: u32 = @as(u32, entry.view.header.weight);
                 cumulative += w;
-                approaches[idx] = .{
+                tasks[idx] = .{
                     .name = try allocator.dupe(u8, entry.name),
                     .weight = w,
                     .prompt = try allocator.dupe(u8, entry.view.prompt),
@@ -95,52 +95,52 @@ pub const ApproachPool = struct {
         }
 
         return .{
-            .approaches = approaches[0..idx],
+            .tasks = tasks[0..idx],
             .total_weight = cumulative,
         };
     }
 
-    pub fn hasActiveApproaches(self: *const ApproachPool) bool {
+    pub fn hasActiveTasks(self: *const TaskPool) bool {
         return self.total_weight > 0;
     }
 
-    /// Select an approach. Uses round-robin so consecutive calls within a
-    /// batch always return different approaches (when batch size <= pool size).
-    /// Weight still matters across cycles — higher-weight approaches appear
+    /// Select a task. Uses round-robin so consecutive calls within a
+    /// batch always return different tasks (when batch size <= pool size).
+    /// Weight still matters across cycles — higher-weight tasks appear
     /// more often in the rotation order.
-    pub fn select(self: *const ApproachPool) ?*const Approach {
-        if (self.approaches.len == 0) return null;
+    pub fn select(self: *const TaskPool) ?*const Task {
+        if (self.tasks.len == 0) return null;
         if (self.total_weight == 0) return null;
 
         const counter = @atomicRmw(u64, &select_counter, .Add, 1, .monotonic);
-        const idx = counter % self.approaches.len;
-        return &self.approaches[@intCast(idx)];
+        const idx = counter % self.tasks.len;
+        return &self.tasks[@intCast(idx)];
     }
 };
 
-/// Auto-retirement: an approach is exhausted if it has been tried enough
+/// Auto-retirement: a task is exhausted if it has been tried enough
 /// times with no success.
-fn isExhausted(header: types.ApproachHeader) bool {
+fn isExhausted(header: types.TaskHeader) bool {
     return header.total_runs >= 3 and header.accepted == 0 and header.empty >= 3;
 }
 
-/// Reconcile a JSON approaches manifest into LMDB.
-/// - Creates new approaches
-/// - Updates weight/prompt for existing approaches (preserves stats)
-/// - Retires approaches no longer in JSON
+/// Reconcile a JSON tasks manifest into LMDB.
+/// - Creates new tasks
+/// - Updates weight/prompt for existing tasks (preserves stats)
+/// - Retires tasks no longer in JSON
 pub fn syncFromJson(
     store: *store_mod.Store,
     json_data: []const u8,
-    origin: types.ApproachOrigin,
+    origin: types.TaskOrigin,
     allocator: std.mem.Allocator,
 ) !void {
-    const JsonApproach = struct {
+    const JsonTask = struct {
         name: []const u8,
         weight: u32,
         prompt: []const u8,
     };
 
-    const parsed = try std.json.parseFromSlice([]const JsonApproach, allocator, json_data, .{
+    const parsed = try std.json.parseFromSlice([]const JsonTask, allocator, json_data, .{
         .allocate = .alloc_always,
     });
     const items = parsed.value;
@@ -148,32 +148,32 @@ pub fn syncFromJson(
     const txn = try store.beginWriteTxn();
     errdefer store_mod.Store.abortTxn(txn);
 
-    // Collect existing approach names before any writes
+    // Collect existing task names before any writes
     var existing_names: std.ArrayList([]const u8) = .empty;
     defer {
         for (existing_names.items) |name| allocator.free(name);
         existing_names.deinit(allocator);
     }
     {
-        var iter = try store.iterApproaches(txn);
+        var iter = try store.iterTasks(txn);
         defer iter.close();
         while (iter.next()) |entry| {
             try existing_names.append(allocator, try allocator.dupe(u8, entry.name));
         }
     }
 
-    // Upsert all JSON approaches
+    // Upsert all JSON tasks
     for (items) |item| {
-        const existing = try store.getApproach(txn, item.name);
+        const existing = try store.getTask(txn, item.name);
         if (existing) |view| {
             // Preserve stats, update weight + prompt + reactivate
             var header = view.header;
             header.weight = @truncate(item.weight);
             header.status = .active;
-            try store.upsertApproach(txn, item.name, header, item.prompt);
+            try store.upsertTask(txn, item.name, header, item.prompt);
         } else {
-            // New approach
-            const header = types.ApproachHeader{
+            // New task
+            const header = types.TaskHeader{
                 .weight = @truncate(item.weight),
                 .total_runs = 0,
                 .accepted = 0,
@@ -182,11 +182,11 @@ pub fn syncFromJson(
                 .status = .active,
                 .origin = origin,
             };
-            try store.upsertApproach(txn, item.name, header, item.prompt);
+            try store.upsertTask(txn, item.name, header, item.prompt);
         }
     }
 
-    // Retire approaches not in JSON
+    // Retire tasks not in JSON
     for (existing_names.items) |name| {
         var found = false;
         for (items) |item| {
@@ -196,32 +196,32 @@ pub fn syncFromJson(
             }
         }
         if (!found) {
-            if (try store.getApproach(txn, name)) |view| {
+            if (try store.getTask(txn, name)) |view| {
                 if (view.header.status == .active) {
                     var header = view.header;
                     header.status = .retired;
                     // Copy prompt before writing (same key invalidates old ptr)
                     const prompt_copy = try allocator.dupe(u8, view.prompt);
                     defer allocator.free(prompt_copy);
-                    try store.upsertApproach(txn, name, header, prompt_copy);
+                    try store.upsertTask(txn, name, header, prompt_copy);
                 }
             }
         }
     }
 
-    // Write approaches JSON to meta for dashboard direct reads
-    writeApproachesMeta(store, txn, allocator) catch {};
+    // Write tasks JSON to meta for dashboard direct reads
+    writeTasksMeta(store, txn, allocator) catch {};
 
     try store_mod.Store.commitTxn(txn);
 }
 
-/// Write a JSON array of all approaches to the meta sub-database.
-fn writeApproachesMeta(store: *store_mod.Store, txn: anytype, allocator: std.mem.Allocator) !void {
+/// Write a JSON array of all tasks to the meta sub-database.
+fn writeTasksMeta(store: *store_mod.Store, txn: anytype, allocator: std.mem.Allocator) !void {
     var json: std.ArrayList(u8) = .empty;
     defer json.deinit(allocator);
     try json.append(allocator, '[');
 
-    var iter = try store.iterApproaches(txn);
+    var iter = try store.iterTasks(txn);
     defer iter.close();
     var first = true;
 
@@ -230,7 +230,7 @@ fn writeApproachesMeta(store: *store_mod.Store, txn: anytype, allocator: std.mem
         first = false;
 
         const h = entry.view.header;
-        // Build JSON object — escape approach name and prompt
+        // Build JSON object — escape task name and prompt
         try json.appendSlice(allocator, "{\"name\":");
         try appendJsonStr(&json, allocator, entry.name);
         var stat_buf: [256]u8 = undefined;
@@ -243,7 +243,7 @@ fn writeApproachesMeta(store: *store_mod.Store, txn: anytype, allocator: std.mem
     }
 
     try json.append(allocator, ']');
-    try store.putMeta(txn, "approaches:all", json.items);
+    try store.putMeta(txn, "tasks:all", json.items);
 }
 
 /// Append a JSON-escaped string (with quotes) to an ArrayList.
@@ -266,15 +266,15 @@ fn appendJsonStr(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []co
     try list.append(allocator, '"');
 }
 
-/// Sync approaches from JSON file into LMDB.
+/// Sync tasks from JSON file into LMDB.
 pub fn syncFromFile(store: *store_mod.Store, path: []const u8, allocator: std.mem.Allocator) !void {
     const data = try fs.readFileAlloc(allocator, path, 1024 * 1024);
     try syncFromJson(store, data, .template, allocator);
 }
 
-test "approach pool select distribution" {
-    var pool = ApproachPool{
-        .approaches = @constCast(&[_]Approach{
+test "task pool select distribution" {
+    var pool = TaskPool{
+        .tasks = @constCast(&[_]Task{
             .{ .name = "a", .weight = 1, .prompt = "pa", .cumulative = 1 },
             .{ .name = "b", .weight = 1, .prompt = "pb", .cumulative = 2 },
         }),
@@ -282,7 +282,7 @@ test "approach pool select distribution" {
     };
 
     for (0..100) |_| {
-        const approach = pool.select() orelse unreachable;
-        try std.testing.expect(approach.name.len > 0);
+        const task = pool.select() orelse unreachable;
+        try std.testing.expect(task.name.len > 0);
     }
 }
