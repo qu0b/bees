@@ -65,13 +65,16 @@ const header = @as(*const SessionHeader, @ptrCast(@alignCast(value.ptr)));
 Every enum fits in the minimum number of bits. This matters in packed struct headers.
 
 ```zig
-/// 3 bits — 5 values (0-4), max 8
+/// 3 bits — 8 values (0-7), max 8
 const SessionType = enum(u3) {
     worker = 0,
     merger = 1,
     review = 2,
     conflict = 3,
     fix = 4,
+    sre = 5,
+    strategist = 6,
+    qa = 7,
 };
 
 /// 3 bits — 7 values (0-6), max 8
@@ -87,7 +90,7 @@ const SessionStatus = enum(u3) {
 
 /// 3 bits — 5 values for event types
 const EventType = enum(u3) {
-    init = 0,
+    init_event = 0,     // "init" is a Zig reserved word
     message = 1,
     tool_use = 2,
     tool_result = 3,
@@ -95,12 +98,12 @@ const EventType = enum(u3) {
 
     pub fn fromJsonString(s: []const u8) EventType {
         return switch (s.len) {
-            4 => if (std.mem.eql(u8, s, "init")) .init else @enumFromInt(4),
-            6 => if (std.mem.eql(u8, s, "result")) .result else @enumFromInt(4),
-            7 => if (std.mem.eql(u8, s, "message")) .message else @enumFromInt(4),
-            8 => if (std.mem.eql(u8, s, "tool_use")) .tool_use else @enumFromInt(4),
-            11 => if (std.mem.eql(u8, s, "tool_result")) .tool_result else @enumFromInt(4),
-            else => @enumFromInt(4),
+            4 => if (std.mem.eql(u8, s, "init")) .init_event else .result,
+            6 => if (std.mem.eql(u8, s, "result")) .result else .result,
+            7 => if (std.mem.eql(u8, s, "message")) .message else .result,
+            8 => if (std.mem.eql(u8, s, "tool_use")) .tool_use else .result,
+            11 => if (std.mem.eql(u8, s, "tool_result")) .tool_result else .result,
+            else => .result,
         };
     }
 };
@@ -124,19 +127,24 @@ const ToolName = enum(u4) {
 
     pub fn fromJsonString(s: []const u8) ToolName {
         return switch (s.len) {
-            4 => blk: {
-                if (std.mem.eql(u8, s, "Bash")) break :blk .bash;
-                if (std.mem.eql(u8, s, "Read")) break :blk .read;
-                if (std.mem.eql(u8, s, "Edit")) break :blk .edit;
-                if (std.mem.eql(u8, s, "Glob")) break :blk .glob;
-                if (std.mem.eql(u8, s, "Grep")) break :blk .grep;
-                break :blk .unknown;
+            4 => {
+                if (std.mem.eql(u8, s, "Bash")) return .bash;
+                if (std.mem.eql(u8, s, "Read")) return .read;
+                if (std.mem.eql(u8, s, "Edit")) return .edit;
+                if (std.mem.eql(u8, s, "Glob")) return .glob;
+                if (std.mem.eql(u8, s, "Grep")) return .grep;
+                return .unknown;
             },
-            5 => if (std.mem.eql(u8, s, "Write")) .write else .unknown,
+            5 => {
+                if (std.mem.eql(u8, s, "Write")) return .write;
+                if (std.mem.eql(u8, s, "Agent")) return .agent;
+                return .unknown;
+            },
+            7 => if (std.mem.eql(u8, s, "AskUser")) .ask_user else .unknown,
             8 => if (std.mem.eql(u8, s, "WebFetch")) .web_fetch else .unknown,
             9 => if (std.mem.eql(u8, s, "WebSearch")) .web_search else .unknown,
-            5 => if (std.mem.eql(u8, s, "Agent")) .agent else .unknown,
-            else => .unknown,
+            12 => if (std.mem.eql(u8, s, "NotebookEdit")) .notebook_edit else .unknown,
+            else => if (s.len > 4 and std.mem.startsWith(u8, s, "mcp__")) .mcp_tool else .unknown,
         };
     }
 };
@@ -155,10 +163,25 @@ const Role = enum(u2) {
 };
 
 /// 2 bits — 3 values
-const Model = enum(u2) {
+const ModelType = enum(u2) {
     opus = 0,
     sonnet = 1,
     haiku = 2,
+};
+
+/// 2 bits — 3 values (approach lifecycle)
+const ApproachStatus = enum(u2) {
+    active = 0,
+    completed = 1,
+    retired = 2,
+};
+
+/// 2 bits — 4 values (who created the approach)
+const ApproachOrigin = enum(u2) {
+    unknown = 0,
+    template = 1,
+    user = 2,
+    strategist = 3,
 };
 ```
 
@@ -166,15 +189,17 @@ const Model = enum(u2) {
 
 | Enum | Values | Bits | Wasted states |
 |------|--------|------|---------------|
-| SessionType | 5 | 3 | 3 |
+| SessionType | 8 | 3 | 0 |
 | SessionStatus | 7 | 3 | 1 |
 | EventType | 5 | 3 | 3 |
 | ToolName | 13 | 4 | 3 |
 | Verdict | 2 | 1 | 0 |
 | Role | 3 | 2 | 1 |
-| Model | 3 | 2 | 1 |
+| ModelType | 3 | 2 | 1 |
+| ApproachStatus | 3 | 2 | 1 |
+| ApproachOrigin | 4 | 2 | 0 |
 
-Display: each enum has `pub fn name(self) []const u8` returning a comptime string literal (no allocation).
+Display: each enum has `pub fn label(self) []const u8` returning a comptime string literal (no allocation).
 
 ---
 
@@ -184,13 +209,13 @@ Display: each enum has `pub fn name(self) []const u8` returning a comptime strin
 
 ```zig
 const DbNames = struct {
-    const sessions = "s";           // session_id → SessionRecord
+    const sessions = "s";           // session_id → SessionHeader + variable strings
     const sessions_by_status = "ss"; // (status, started_at, session_id) → void
     const sessions_by_time = "st";  // (started_at, session_id) → void
-    const events = "e";             // (session_id, seq) → EventRecord
-    const reviews = "r";            // worker_session_id → ReviewRecord
-    const approaches = "a";         // approach_name → ApproachRecord
-    const meta = "m";               // "next_session_id" → u64, etc.
+    const events = "e";             // (session_id, seq) → EventHeader + raw JSON
+    const reviews = "r";            // worker_session_id → ReviewHeader + reason
+    const approaches = "a";         // approach_name → ApproachHeader + prompt
+    const meta = "m";               // string keys → various (next_session_id: u64, report:qa: text, report:sre: text, report:trends: text)
 };
 ```
 
@@ -202,21 +227,23 @@ All keys are fixed-size byte arrays. Big-endian for correct lexicographic orderi
 
 ```zig
 /// sessions primary key: 8 bytes
-const SessionKey = packed struct(u64) {
+const SessionKey = struct {
     id: u64,
 
     pub fn toBytes(self: SessionKey) [8]u8 {
-        return std.mem.toBytes(std.mem.nativeToBig(u64, @bitCast(self)));
+        var buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &buf, self.id, .big);
+        return buf;
     }
 
     pub fn fromBytes(bytes: *const [8]u8) SessionKey {
-        return @bitCast(std.mem.bigToNative(u64, std.mem.bytesToValue(u64, bytes)));
+        return .{ .id = std.mem.readInt(u64, bytes, .big) };
     }
 };
 
 /// events composite key: 12 bytes
 /// Ordered by (session_id, seq) — range scan gets all events for a session.
-const EventKey = packed struct {
+const EventKey = struct {
     session_id: u64,
     seq: u32,
 
@@ -226,13 +253,20 @@ const EventKey = packed struct {
         std.mem.writeInt(u32, buf[8..12], self.seq, .big);
         return buf;
     }
+
+    pub fn fromBytes(bytes: *const [12]u8) EventKey {
+        return .{
+            .session_id = std.mem.readInt(u64, bytes[0..8], .big),
+            .seq = std.mem.readInt(u32, bytes[8..12], .big),
+        };
+    }
 };
 
-/// sessions_by_status index key: 12 bytes
+/// sessions_by_status index key: 9 bytes
 /// (status:u8, started_at:u40, session_id:u24)
 /// u40 for timestamp: seconds since epoch, good until year 36812
 /// u24 for session_id: up to 16M sessions before rollover
-const StatusIndexKey = packed struct {
+const StatusIndexKey = struct {
     status: u8,
     started_at_bytes: [5]u8,  // u40 big-endian
     session_id_bytes: [3]u8,  // u24 big-endian
@@ -240,37 +274,56 @@ const StatusIndexKey = packed struct {
     pub fn init(status: SessionStatus, started_at: u64, session_id: u64) StatusIndexKey {
         var key: StatusIndexKey = undefined;
         key.status = @intFromEnum(status);
-        // Truncate to 40 bits (5 bytes) — sufficient for timestamps
-        std.mem.writeInt(u40, &key.started_at_bytes, @truncate(started_at), .big);
-        std.mem.writeInt(u24, &key.session_id_bytes, @truncate(session_id), .big);
+        const ts: u40 = @truncate(started_at);
+        key.started_at_bytes = @bitCast(std.mem.nativeToBig(u40, ts));
+        const sid: u24 = @truncate(session_id);
+        key.session_id_bytes = @bitCast(std.mem.nativeToBig(u24, sid));
         return key;
+    }
+
+    pub fn toBytes(self: *const StatusIndexKey) *const [9]u8 {
+        return @ptrCast(self);
     }
 };
 
-/// sessions_by_time index key: 11 bytes
+/// sessions_by_time index key: 9 bytes
 /// (started_at:u40, session_id:u24, type:u8)
-const TimeIndexKey = packed struct {
+const TimeIndexKey = struct {
     started_at_bytes: [5]u8,
     session_id_bytes: [3]u8,
     type_byte: u8,
+
+    pub fn init(started_at: u64, session_id: u64, session_type: SessionType) TimeIndexKey {
+        var key: TimeIndexKey = undefined;
+        const ts: u40 = @truncate(started_at);
+        key.started_at_bytes = @bitCast(std.mem.nativeToBig(u40, ts));
+        const sid: u24 = @truncate(session_id);
+        key.session_id_bytes = @bitCast(std.mem.nativeToBig(u24, sid));
+        key.type_byte = @intFromEnum(session_type);
+        return key;
+    }
+
+    pub fn toBytes(self: *const TimeIndexKey) *const [9]u8 {
+        return @ptrCast(self);
+    }
 };
 ```
 
 ### Value Formats: Packed Records
 
-#### SessionRecord — 32 bytes fixed header + variable tail
+#### SessionRecord — 48 bytes fixed header + variable tail
 
 ```zig
-/// Fixed portion: 32 bytes. Bit-packed.
-const SessionHeader = packed struct(u256) {
+/// Fixed portion: 48 bytes. Bit-packed.
+const SessionHeader = packed struct(u384) {
     // Byte 0: type + status + flags (8 bits)
-    type: SessionType,          // 3 bits
+    @"type": SessionType,       // 3 bits
     status: SessionStatus,      // 3 bits
     has_exit_code: bool,        // 1 bit
     has_cost: bool,             // 1 bit
 
     // Byte 1: more flags + model (8 bits)
-    model: Model,               // 2 bits
+    model: ModelType,           // 2 bits
     has_tokens: bool,           // 1 bit
     has_duration: bool,         // 1 bit
     has_diff_summary: bool,     // 1 bit
@@ -286,32 +339,40 @@ const SessionHeader = packed struct(u256) {
     // Bytes 6-7: exit_code (16 bits, sentinel -1 = N/A if !has_exit_code)
     exit_code: i16,
 
-    // Bytes 8-9: pid (16 bits)
-    pid: u16,
+    // Bytes 8-12: started_at (40 bits = ~34,800 years from epoch)
+    started_at: u40,
 
-    // Bytes 10-15: started_at (48 bits = ~8900 years from epoch)
-    started_at: u48,
+    // Bytes 13-17: finished_at (40 bits, 0 = not finished)
+    finished_at: u40,
 
-    // Bytes 16-21: finished_at (48 bits, 0 = not finished)
-    finished_at: u48,
-
-    // Bytes 22-25: duration_ms (32 bits, up to ~49 days)
+    // Bytes 18-21: duration_ms (32 bits, up to ~49 days)
     duration_ms: u32,
 
-    // Bytes 26-29: cost in micro-dollars (32 bits, up to $4,294)
+    // Bytes 22-25: cost in micro-dollars (32 bits, up to $4,294)
     cost_microdollars: u32,     // $1.47 → 1_470_000. Avoids f64.
 
-    // Bytes 30-31: token counts (16 bits each, in thousands)
-    token_input_k: u16,         // Tokens / 1000. 65535 = 65M tokens max.
-    token_output_k: u16,
+    // Bytes 26-29: input token count (raw, u32)
+    input_tokens: u32,
+
+    // Bytes 30-33: output token count (raw, u32)
+    output_tokens: u32,
+
+    // Bytes 34-37: cache creation token count (raw, u32)
+    cache_creation_tokens: u32,
+
+    // Bytes 38-41: cache read token count (raw, u32)
+    cache_read_tokens: u32,
+
+    // Bytes 42-47: padding to 48-byte boundary
+    _pad: u48,
 
     comptime {
-        std.debug.assert(@sizeOf(SessionHeader) == 32);
+        std.debug.assert(@sizeOf(SessionHeader) == 48);
     }
 };
 
 /// Full session record: header + variable-length strings
-/// Layout: [SessionHeader: 32 bytes]
+/// Layout: [SessionHeader: 48 bytes]
 ///         [approach_len: u16][approach: ...]
 ///         [branch_len: u16][branch: ...]
 ///         [worktree_len: u16][worktree: ...]
@@ -325,17 +386,19 @@ const SessionHeader = packed struct(u256) {
 
 - **`cost_microdollars: u32` instead of `f64`** — avoids floating point. $1.47 = 1,470,000 microdollars. Integer comparison and arithmetic. 32 bits covers up to $4,294 per session (more than enough at $30 cap). Saves 4 bytes vs f64.
 
-- **`token_input_k: u16`** — tokens divided by 1000. 65535 = 65M tokens max per field. Saves 6 bytes vs u64 per field.
+- **Raw token counts (`u32`)** — `input_tokens`, `output_tokens`, `cache_creation_tokens`, `cache_read_tokens` store exact counts (not divided by 1000). u32 covers up to ~4.29 billion tokens per field. Four separate fields enable accurate cost breakdown and cache hit ratio analysis.
 
-- **`started_at: u48`** — 48-bit unix timestamp covers until year ~10,889. Saves 2 bytes vs u64.
+- **`started_at: u40`** — 40-bit unix timestamp covers until year ~36,812. Saves 3 bytes vs u64. Matches the u40 used in index keys.
+
+- **No `pid` field** — removed; process ID is not needed in the persistent record.
 
 - **`commit_count: u8`** — no single session produces >255 commits. Saves 3 bytes vs u32.
 
 - **`has_*` flags** — bit flags indicate which optional fields contain meaningful data vs sentinel values. Avoids Zig's `?T` overhead (tag byte + alignment padding).
 
-- **Comptime size assertion** — guarantees the header is exactly 32 bytes. Build fails if layout drifts.
+- **Comptime size assertion** — guarantees the header is exactly 48 bytes. Build fails if layout drifts.
 
-#### EventRecord — 4 bytes fixed header + variable JSON
+#### EventHeader — 4 bytes fixed header + variable JSON
 
 ```zig
 /// Event header: 4 bytes. Bit-packed.
@@ -368,7 +431,7 @@ const EventHeader = packed struct(u32) {
 
 **4 bytes overhead per event vs SQLite's ~50+.** For 6000 events/day, that's 24KB vs 300KB of overhead alone. Plus zero-copy reads.
 
-#### ReviewRecord — 8 bytes fixed header + variable reason
+#### ReviewHeader — 8 bytes fixed header + variable reason
 
 ```zig
 const ReviewHeader = packed struct(u64) {
@@ -376,7 +439,7 @@ const ReviewHeader = packed struct(u64) {
     _reserved: u7,              // 7 bits
 
     review_session_id: u24,     // Which session performed the review
-    reviewed_at: u40,           // Unix timestamp (40 bits)
+    reviewed_at: u32,           // Unix timestamp (32 bits, good until 2106)
 
     comptime {
         std.debug.assert(@sizeOf(ReviewHeader) == 8);
@@ -388,23 +451,28 @@ const ReviewHeader = packed struct(u64) {
 
 Since LMDB tells us the total value length, the last variable field doesn't need a length prefix. `reason.len = value.len - @sizeOf(ReviewHeader)`.
 
-#### ApproachRecord — 16 bytes, fully fixed
+#### ApproachHeader — 16 bytes fixed header + variable prompt
 
 ```zig
-const ApproachRecord = packed struct(u128) {
-    weight: u16,
-    total_runs: u32,
-    accepted: u32,
-    rejected: u32,
-    empty: u32,
+const ApproachHeader = packed struct(u128) {
+    weight: u16,                // Selection weight (higher = more likely)
+    total_runs: u24,            // Total times this approach was used
+    accepted: u24,              // Times the result was accepted
+    rejected: u24,              // Times the result was rejected
+    empty: u24,                 // Times the result was empty/no changes
+    status: ApproachStatus,     // 2 bits: active, completed, retired
+    origin: ApproachOrigin,     // 2 bits: unknown, template, user, strategist
+    _reserved: u12,             // 12 bits for future use
 
     comptime {
-        std.debug.assert(@sizeOf(ApproachRecord) == 16);
+        std.debug.assert(@sizeOf(ApproachHeader) == 16);
     }
 };
 ```
 
-Key is the approach name (variable-length string). Value is always exactly 16 bytes.
+Key is the approach name (variable-length string). Value layout: `[ApproachHeader: 16 bytes][prompt_len: u16][prompt: ...]`.
+
+Note: run counters use u24 (max ~16M) instead of u32, freeing 4 bytes for `status`, `origin`, and reserved bits within the same 16-byte packed struct.
 
 ---
 
@@ -432,9 +500,9 @@ const SessionGood = struct {
     cost_microdollars: u32, // 4 bytes. 0 = unknown.
     duration_ms: u32,       // 4 bytes. 0 = unknown.
     exit_code: i16,         // 2 bytes. sentinel: has_exit_code flag in flags byte.
-    token_input_k: u16,     // 2 bytes. 0 = unknown.
-    finished_at: u48,       // 6 bytes. 0 = not finished.
-    // Total: 18 bytes for 5 fields. 4x smaller.
+    input_tokens: u32,      // 4 bytes. 0 = unknown.
+    finished_at: u40,       // 5 bytes. 0 = not finished.
+    // Total: 17 bytes for 5 fields. 4x smaller.
 };
 ```
 
@@ -467,105 +535,43 @@ const Compact = struct {
 
 ### Application to Key Structs
 
-#### In-Memory Session (for CLI display, read from LMDB)
+#### In-Memory SessionView (for CLI display, read from LMDB)
 
 ```zig
-/// 40 bytes. Designed for arrays (CLI session list).
-/// Zero-copy string fields point into LMDB mmap — valid for read transaction lifetime.
-const Session = struct {
-    // 8-byte aligned fields first
-    id: u64,                    // 8 bytes
-    started_at: u48,            // 6 bytes (packed after id due to struct rules...
-                                // actually for non-packed, this becomes u64 for alignment)
-    approach_ptr: [*]const u8,  // 8 bytes (pointer into LMDB mmap)
-    branch_ptr: [*]const u8,    // 8 bytes (pointer into LMDB mmap)
+/// Zero-copy view into LMDB mmap. String fields point directly into the
+/// value bytes — valid for the read transaction's lifetime.
+const SessionView = struct {
+    header: SessionHeader,      // 48 bytes (copied from mmap for alignment safety)
+    approach: []const u8,       // slice into LMDB mmap
+    branch: []const u8,         // slice into LMDB mmap
+    worktree: []const u8,       // slice into LMDB mmap
+    diff_summary: []const u8,   // slice into LMDB mmap (empty if !has_diff_summary)
 
-    // 4-byte aligned
-    cost_microdollars: u32,     // 4 bytes
-    duration_ms: u32,           // 4 bytes
-    approach_len: u16,          // 2 bytes
-    branch_len: u16,            // 2 bytes
-
-    // 1-byte aligned
-    flags: Flags,               // 1 byte packed
-    commit_count: u8,           // 1 byte
-    worker_id_lo: u8,           // low byte of worker_id (0-255 sufficient for workers)
-    _pad: u8,                   // explicit padding
-
-    const Flags = packed struct(u8) {
-        type: SessionType,      // 3 bits
-        status: SessionStatus,  // 3 bits
-        has_verdict: bool,      // 1 bit
-        verdict: Verdict,       // 1 bit (0=accept, 1=reject; meaningful only if has_verdict)
-    };
-
-    /// Zero-copy slice into LMDB mmap.
-    pub fn approach(self: Session) []const u8 {
-        return self.approach_ptr[0..self.approach_len];
-    }
-
-    pub fn branch(self: Session) []const u8 {
-        return self.branch_ptr[0..self.branch_len];
-    }
-
-    comptime {
-        // Verify no unexpected padding
-        std.debug.assert(@sizeOf(Session) <= 56);
+    pub fn fromBytes(value: []const u8) SessionView {
+        var header: SessionHeader = undefined;
+        @memcpy(std.mem.asBytes(&header), value[0..@sizeOf(SessionHeader)]);
+        var offset: usize = @sizeOf(SessionHeader);
+        const approach = readLenPrefixed(value, &offset);
+        const branch = readLenPrefixed(value, &offset);
+        const worktree = readLenPrefixed(value, &offset);
+        const diff_summary = if (header.has_diff_summary) readLenPrefixed(value, &offset) else "";
+        return .{
+            .header = header,
+            .approach = approach,
+            .branch = branch,
+            .worktree = worktree,
+            .diff_summary = diff_summary,
+        };
     }
 };
 ```
 
-**Key point:** `approach_ptr` and `branch_ptr` point directly into LMDB's mmap. No copy. Valid for the read transaction's lifetime. CLI commands hold a read transaction open for their duration, so these pointers remain valid until the command completes.
+**Key point:** The header is `@memcpy`'d from the mmap to avoid unaligned pointer access on the packed struct. The variable-length string slices point directly into LMDB's mmap. CLI commands hold a read transaction open for their duration, so these pointers remain valid until the command completes.
 
 #### EventMeta (stack-only, per NDJSON line)
 
 ```zig
-/// 8 bytes on stack. No optionals, no pointers.
-const EventMeta = packed struct(u64) {
-    event_type: EventType,          // 3 bits
-    tool_name: ToolName,            // 4 bits
-    role: Role,                     // 2 bits
-    is_error: bool,                 // 1 bit
-    _reserved: u6,                  // 6 bits
-
-    // Result event fields (only meaningful when event_type == .result)
-    cost_microdollars: u16,         // 16 bits (in units of $0.01, max $655.35)
-    duration_ms: u16,               // 16 bits (max ~65 seconds... see note)
-    num_turns: u8,                  // 8 bits (max 255 turns)
-    _pad: u8,                       // 8 bits
-
-    comptime {
-        std.debug.assert(@sizeOf(EventMeta) == 8);
-    }
-};
-```
-
-Wait — `duration_ms: u16` caps at 65 seconds, but sessions run for minutes. Let me fix this:
-
-```zig
-/// 8 bytes on stack. Revised.
-const EventMeta = packed struct(u64) {
-    event_type: EventType,          // 3 bits
-    tool_name: ToolName,            // 4 bits
-    role: Role,                     // 2 bits
-    is_error: bool,                 // 1 bit
-    _reserved: u6,                  // 6 bits
-
-    // Result fields (meaningful only when event_type == .result)
-    cost_microdollars: u24,         // 24 bits ($0.000001 units, max $16.77... no)
-    duration_secs: u16,             // 16 bits (seconds, max ~18 hours)
-    num_turns: u8,                  // 8 bits
-
-    comptime {
-        std.debug.assert(@sizeOf(EventMeta) == 8);
-    }
-};
-```
-
-Hmm, the cost field needs more thought. Let me use a different unit:
-
-```zig
-/// 8 bytes on stack. Final version.
+/// 8 bytes on stack. Fits in a single register (u64). Passed by value, never allocated.
 const EventMeta = packed struct(u64) {
     // Byte 0 bits 0-7: classification
     event_type: EventType,          // 3 bits
@@ -579,11 +585,14 @@ const EventMeta = packed struct(u64) {
     // Bytes 2-3: result duration
     duration_secs: u16,             // max 65535 seconds (~18 hours)
 
-    // Bytes 4-6: result cost in centidollars ($0.01 units)
+    // Bytes 4-5: result cost in centidollars ($0.01 units)
     cost_cents: u16,                // max $655.35 per session
 
-    // Byte 7: result turns
+    // Byte 6: result turns
     num_turns: u8,                  // max 255
+
+    // Byte 7: padding
+    _pad: u8,
 
     comptime {
         std.debug.assert(@sizeOf(EventMeta) == 8);
@@ -591,9 +600,7 @@ const EventMeta = packed struct(u64) {
 };
 ```
 
-`cost_cents: u16` → $0.01 precision, max $655.35 per session. Our budget cap is $30. Plenty of headroom.
-
-This fits in a single register (u64). Passed by value, never allocated.
+`cost_cents: u16` -- $0.01 precision, max $655.35 per session. Our budget cap is $30. Plenty of headroom.
 
 #### WorkerRow (CLI display)
 
@@ -633,7 +640,7 @@ Program Lifetime (GlobalArena)
 │
 ├─ Config           — JSON file buffer + parsed structs
 ├─ Approaches       — JSON file buffer + parsed structs
-├─ Prompt templates — file contents loaded once
+├─ Prompt templates — 7 files loaded once (see Prompt Templates section)
 ├─ LMDB env handle  — single mmap for entire database
 └─ Sub-database handles (7)
 
@@ -772,7 +779,7 @@ const LmdbConfig = struct {
 | Component | Memory | Lifetime | Notes |
 |-----------|--------|----------|-------|
 | Config + Approaches | ~10 KB | Program | JSON file buffer + slices |
-| Prompt templates | ~20 KB | Program | 4 files loaded once |
+| Prompt templates | ~30 KB | Program | 7 files loaded once |
 | LMDB env + mmap overhead | ~4 KB | Program | Actual mmap pages loaded on demand by OS |
 | Per-worker line buffer | 1 MB initial | Per-session | Dynamically grows for large lines, reused across lines |
 | EventMeta | 8 bytes | Stack/per-line | Single register |
@@ -802,6 +809,47 @@ Down from ~1.5 MB with the SQLite design. The main savings: no prepared statemen
 - All `sqlite3_column_text` → arena copies
 - SQLite's internal page cache copies on read
 - Prepared statement overhead
+
+---
+
+## Dead Letter Queue
+
+When an LMDB event write fails (DB full, transaction error, etc.), the event is appended to a binary file instead of being lost. On the next session start, the queue is automatically drained back into LMDB.
+
+```
+File: <project>/.bees/db/dead-letters.bin
+
+Binary format per entry:
+  [u64 session_id] [u32 seq] [4 bytes EventHeader] [u32 json_len] [json bytes]
+  Total: 20 + json_len bytes per entry
+
+All integers are little-endian.
+```
+
+**Drain behavior:**
+
+- On next session start, the orchestrator reads the entire DLQ file and replays entries into LMDB.
+- If all entries replay successfully, the file is deleted.
+- If replay partially succeeds (LMDB still broken), the file is rewritten with only the remaining entries.
+- If LMDB is still unavailable, entries stay in the file until the next drain attempt.
+
+---
+
+## Prompt Templates
+
+Prompt templates are external files stored at `<project>/.bees/prompts/`. Loaded once at startup into the global arena.
+
+| File | Role | Usage |
+|------|------|-------|
+| `worker.txt` | Worker | Appended/system prompt for worker sessions |
+| `review.txt` | Merger | Appended/system prompt for review sessions |
+| `conflict.txt` | Merger | Appended/system prompt for conflict resolution sessions |
+| `fix.txt` | Merger | Appended/system prompt for build-fix sessions |
+| `strategist.txt` | Strategist | Main prompt, loaded at runtime |
+| `sre-main.txt` | SRE | Main prompt, loaded at runtime |
+| `qa.txt` | QA | Main prompt, loaded at runtime |
+
+The first four (`worker.txt`, `review.txt`, `conflict.txt`, `fix.txt`) are appended/system prompts -- they augment the dynamically constructed prompt. The last three (`strategist.txt`, `sre-main.txt`, `qa.txt`) are main prompts -- they are the primary instruction passed to the Claude CLI session.
 
 ---
 

@@ -17,11 +17,10 @@ Bees is a generic, project-agnostic orchestration system that runs multiple auto
 ### AI Agent Transport: Claude CLI
 
 - All invocations use `--dangerously-skip-permissions` for full autonomy
-- Model is configurable per-role: strategist defaults to Opus, workers/merger/SRE default to Sonnet
-- All invocations use `--effort high`
+- Model is configurable per-role: strategist defaults to Opus, workers/merger/SRE default to Sonnet. QA defaults to Opus with medium effort. Model and effort configurable per-role.
+- All invocations use `--effort high` (unless overridden per-role)
 - Budget cap: `--max-budget-usd 30` per session
 - Workers: `-p --output-format stream-json` for headless execution with full event capture
-- Reviews: `-p --output-format json` for simple verdict output
 - Conflict resolution: `-p` with tool access in worktree
 
 ### Data & Config
@@ -32,22 +31,30 @@ Bees is a generic, project-agnostic orchestration system that runs multiple auto
 - `bees init` uses Claude to analyze the project and generate config
 - Database: LMDB at `<project>/.bees/db/` — 7 sub-databases with bit-packed records
 - All Claude CLI stream-json events stored with 4-byte packed headers + raw JSON in LMDB
-- Prompt templates: external files in `<project>/.bees/prompts/`
+- Reports stored in LMDB `meta` sub-database (report:qa, report:sre, report:trends)
+- Dead letter queue at `<project>/.bees/db/dead-letters.bin` for failed LMDB writes
+- Prompt templates: external files in `<project>/.bees/prompts/` — loaded at runtime, editable without recompiling
+- LMDB is single source of truth for approaches (synced from approaches.json)
 
 ### Scheduling & Interface
 
-- systemd user timers (`systemctl --user`) for worker and merger scheduling
+- Continuous daemon mode (`bees daemon`) with configurable cooldown between cycles
 - CLI only for v1
 - TUI deferred to v2
-- Web application for session replay and analytics deferred
-- Screenshots/visual verification deferred
+- REST API server (configurable port, default 3002) for dashboard integration
+- Web dashboard at bees-dashboard (Next.js, dark theme, real-time monitoring)
 
 ## Architecture
 
-- **Workers** (N instances): Spawn in isolated git worktrees, investigate codebase, commit fixes
+- **Workers** (N instances): Spawn in isolated git worktrees, implement approaches, commit fixes
 - **Merger** (1 instance): Reviews diffs via AI, merges, resolves conflicts, builds, tests, deploys
-- Coordination via filesystem markers + LMDB as source of truth
-- All sessions (worker, review, conflict, fix) captured with full event streams
+- **SRE agent**: Monitors system health, adjusts approach weights, cleans up resources
+- **Strategist**: Visual design review via Chrome MCP screenshots, writes approaches to approaches.json
+- **QA agent**: Diff-aware visual/functional verification after every merge cycle
+- Coordination via LMDB as single source of truth + filesystem markers for worktrees
+- All sessions captured with full event streams in LMDB
+- Reports (QA, SRE, approach trends) stored in LMDB meta, not disk files
+- REST API server for dashboard integration
 
 ## Memory Model & Data Structure Rules
 
@@ -60,7 +67,8 @@ Bees is a generic, project-agnostic orchestration system that runs multiple auto
 
 ### Bit Packing Rules
 - All enums use minimum bit widths: SessionType(u3), SessionStatus(u3), EventType(u3), ToolName(u4), Verdict(u1), Role(u2), Model(u2).
-- On-disk records use `packed struct` with comptime size assertions. SessionHeader: 32 bytes. EventHeader: 4 bytes. ReviewHeader: 8 bytes. ApproachRecord: 16 bytes.
+- SessionType(u3) has 8 values: worker=0, merger=1, review=2, conflict=3, fix=4, sre=5, strategist=6, qa=7.
+- On-disk records use `packed struct` with comptime size assertions. SessionHeader: 48 bytes. EventHeader: 4 bytes. ReviewHeader: 8 bytes. ApproachHeader: 24 bytes.
 - Monetary values stored as integer microdollars or centidollars. Never f64.
 - Timestamps stored as u48 (unix seconds, good until year ~10889). Never ISO strings.
 - Token counts stored as u16 in thousands. Commit counts as u8.
@@ -83,6 +91,8 @@ Bees is a generic, project-agnostic orchestration system that runs multiple auto
 - Secondary indexes maintained atomically in the same write transaction as primary records.
 - Map size: 1 GB default (virtual address reservation, not physical allocation).
 - Diffs NOT stored — derive from git on demand.
+- Event writes are non-fatal — failed writes go to dead letter queue, auto-drained on next session.
+- Reports stored in meta sub-database for quick access; full history in session events.
 
 ### Target Memory Budget
 - Steady-state: < 512 KB for the orchestrator process (excluding OS mmap pages and Claude CLI children).
@@ -96,3 +106,6 @@ Bees is a generic, project-agnostic orchestration system that runs multiple auto
 - Always high effort, always $30 budget cap
 - Generic tool: build/test/deploy commands are configurable per-project in config.json
 - Worktrees managed by bees (not Claude CLI's --worktree flag) for full control over naming, state, and cleanup
+- QA agent runs after every merge cycle (not periodic like strategist)
+- Strategist receives QA report and approach trends injected from LMDB into prompt
+- No reports written to disk — all report data stored in LMDB

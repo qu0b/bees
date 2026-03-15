@@ -105,6 +105,15 @@ pub fn runStrategist(
         logger.err("[strategist] session update failed: {}", .{e});
     };
 
+    // Store strategist's result as the updated VISION in LMDB
+    if (result.result_text.len > 0) {
+        const meta_txn = store.beginWriteTxn() catch null;
+        if (meta_txn) |t| {
+            store.putMeta(t, "report:vision", result.result_text) catch {};
+            store_mod.Store.commitTxn(t) catch {};
+        }
+    }
+
     logger.info("[strategist] review complete. cost=${d:.2}", .{
         @as(f64, @floatFromInt(result.cost_microdollars)) / 1000000.0,
     });

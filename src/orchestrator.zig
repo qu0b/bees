@@ -464,22 +464,28 @@ fn runStrategistWithPrep(
 }
 
 /// Build context string from LMDB reports for the strategist prompt.
+/// Injects: previous VISION, latest QA report, approach trends.
 fn buildStrategistContext(store: *store_mod.Store, allocator: std.mem.Allocator) ?[]const u8 {
     const txn = store.beginReadTxn() catch return null;
     defer store_mod.Store.abortTxn(txn);
 
+    const vision = store.getMeta(txn, "report:vision") catch null;
     const qa_report = store.getMeta(txn, "report:qa") catch null;
     const trends = store.getMeta(txn, "report:trends") catch null;
 
-    if (qa_report == null and trends == null) return null;
+    if (vision == null and qa_report == null and trends == null) return null;
 
     var parts: std.ArrayList(u8) = .empty;
+    if (vision) |v| {
+        parts.appendSlice(allocator, "\n\n## Your Previous VISION\nThis is what you wrote last cycle. Update it at the end of your response.\n\n") catch return null;
+        parts.appendSlice(allocator, v) catch return null;
+    }
     if (qa_report) |qr| {
         parts.appendSlice(allocator, "\n\n## Latest QA Report\n") catch return null;
         parts.appendSlice(allocator, qr) catch return null;
     }
     if (trends) |tr| {
-        parts.appendSlice(allocator, "\n\n## Approach Performance Trends\n") catch return null;
+        parts.appendSlice(allocator, "\n\n") catch return null;
         parts.appendSlice(allocator, tr) catch return null;
     }
     return parts.toOwnedSlice(allocator) catch null;

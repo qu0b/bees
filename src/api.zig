@@ -150,6 +150,8 @@ fn route(
         if (std.mem.eql(u8, path, "/api/workers")) return handleSessions(w, store, .worker);
         if (std.mem.eql(u8, path, "/api/analytics")) return handleSessions(w, store, null);
         if (std.mem.eql(u8, path, "/api/branches")) return handleBranches(w, paths, io, allocator);
+        if (std.mem.eql(u8, path, "/api/vision")) return handleVisionGet(w, store);
+        if (std.mem.startsWith(u8, path, "/api/reports/")) return handleReportGet(w, store, path);
 
         if (std.mem.startsWith(u8, path, "/api/sessions/")) {
             const rest = path["/api/sessions/".len..];
@@ -167,12 +169,15 @@ fn route(
         return writeResponse(w, 404, "application/json", "{\"error\":\"Not found\"}");
     }
 
-    if (std.mem.eql(u8, method, "POST")) {
+    if (std.mem.eql(u8, method, "POST") or std.mem.eql(u8, method, "PUT")) {
         if (std.mem.eql(u8, path, "/api/approaches") or std.mem.eql(u8, path, "/api/approaches/sync")) {
             return handleApproachesPost(w, store, paths, body, allocator);
         }
         if (std.mem.eql(u8, path, "/api/config")) {
             return handleConfigPost(w, paths, body);
+        }
+        if (std.mem.eql(u8, path, "/api/vision")) {
+            return handleVisionPut(w, store, body);
         }
         return writeResponse(w, 404, "application/json", "{\"error\":\"Not found\"}");
     }
@@ -602,6 +607,58 @@ fn parseContentLength(headers: []const u8) usize {
         }
     }
     return 0;
+}
+
+fn handleVisionGet(w: *Io.Writer, store: *store_mod.Store) !void {
+    const txn = store.beginReadTxn() catch
+        return writeResponse(w, 500, "application/json", "{\"error\":\"DB read failed\"}");
+    defer store_mod.Store.abortTxn(txn);
+
+    const vision = (store.getMeta(txn, "report:vision") catch null) orelse "";
+
+    try writeResponseHeader(w, 200, "application/json");
+    try w.print("{{\"vision\":", .{});
+    try writeJsonStr(w, vision);
+    try w.print("}}", .{});
+}
+
+fn handleVisionPut(w: *Io.Writer, store: *store_mod.Store, body: []const u8) !void {
+    if (body.len == 0) return writeResponse(w, 400, "application/json", "{\"error\":\"Empty body\"}");
+
+    // Body is the raw vision text (or JSON with {"vision": "..."})
+    // Try to extract from JSON first, fall back to raw text
+    const vision = if (claude.findJsonStringValue(body, "\"vision\"")) |v| v else body;
+
+    const txn = store.beginWriteTxn() catch
+        return writeResponse(w, 500, "application/json", "{\"error\":\"DB write failed\"}");
+    store.putMeta(txn, "report:vision", vision) catch {
+        store_mod.Store.abortTxn(txn);
+        return writeResponse(w, 500, "application/json", "{\"error\":\"Write failed\"}");
+    };
+    store_mod.Store.commitTxn(txn) catch
+        return writeResponse(w, 500, "application/json", "{\"error\":\"Commit failed\"}");
+
+    return writeResponse(w, 200, "application/json", "{\"ok\":true}");
+}
+
+fn handleReportGet(w: *Io.Writer, store: *store_mod.Store, path: []const u8) !void {
+    const key_suffix = path["/api/reports/".len..];
+    // Map URL to LMDB meta key: /api/reports/qa → report:qa
+    var key_buf: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "report:{s}", .{key_suffix}) catch
+        return writeResponse(w, 400, "application/json", "{\"error\":\"Invalid report key\"}");
+
+    const txn = store.beginReadTxn() catch
+        return writeResponse(w, 500, "application/json", "{\"error\":\"DB read failed\"}");
+    defer store_mod.Store.abortTxn(txn);
+
+    const content = (store.getMeta(txn, key) catch null) orelse
+        return writeResponse(w, 404, "application/json", "{\"error\":\"Report not found\"}");
+
+    try writeResponseHeader(w, 200, "application/json");
+    try w.print("{{\"key\":\"{s}\",\"content\":", .{key});
+    try writeJsonStr(w, content);
+    try w.print("}}", .{});
 }
 
 fn writeJsonStr(w: *Io.Writer, s: []const u8) !void {

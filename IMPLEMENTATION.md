@@ -51,6 +51,9 @@ claude \
 | Review | `--system-prompt-file <project>/.bees/prompts/review.txt` diff piped via stdin |
 | Conflict | `--append-system-prompt-file <project>/.bees/prompts/conflict.txt` run from worktree dir |
 | Fix | `--append-system-prompt-file <project>/.bees/prompts/fix.txt` run from worktree dir |
+| SRE | `--append-system-prompt-file sre.txt`, main prompt loaded from `sre-main.txt` |
+| Strategist | Main prompt loaded from `strategist.txt`, `--mcp-config mcp-chrome.json` |
+| QA | Main prompt loaded from `qa.txt`, `--mcp-config mcp-chrome.json` |
 
 ### Future Transport: Agent SDK
 
@@ -93,8 +96,15 @@ src/
 ├── claude.zig        # Claude CLI process management + stream parsing
 ├── git.zig           # Git/worktree operations
 ├── scheduler.zig     # systemd unit generation
-├── approaches.zig    # Weighted random selection
-└── log.zig           # Central logging
+├── approaches.zig    # Weighted random selection + LMDB sync
+├── log.zig           # Central logging
+├── orchestrator.zig  # Daemon main loop (workers, merger, QA, strategist, SRE)
+├── strategist.zig    # Strategist agent (loads external prompt)
+├── sre.zig           # SRE agent (loads external prompt)
+├── qa.zig            # QA agent (diff-aware, Chrome MCP)
+├── dlq.zig           # Dead letter queue for failed LMDB writes
+├── api.zig           # REST API server for dashboard
+└── fs.zig            # Global Io wrapper module
 ```
 
 Add `@import` for each module in `main.zig` to verify compilation. Add comptime size assertions for all packed structs in `types.zig`.
@@ -129,8 +139,14 @@ const Config = struct {
     project: struct { name: []const u8, base_branch: []const u8 = "main" },
     workers: struct { count: u32 = 5, model: []const u8 = "opus", effort: []const u8 = "high", max_budget_usd: f64 = 30.0, schedule: []const u8 = "0 * * * *" },
     merger: struct { model: []const u8 = "opus", effort: []const u8 = "high", max_budget_usd: f64 = 30.0, schedule: []const u8 = "45 * * * *", max_conflict_files: u32 = 5 },
+    sre: struct { ... },
+    strategist: struct { ... },
+    qa: struct { ... },
+    api: struct { ... },
+    daemon: struct { ... },
     git: struct { shallow_worktrees: bool = true },
     build: struct { command: ?[]const u8 = null, test_command: ?[]const u8 = null, deploy_command: ?[]const u8 = null },
+    serve: struct { ... },
     smoke_test: struct { enabled: bool = false, urls: []const []const u8 = &.{}, port: u16 = 8080, startup_wait_secs: u32 = 10 },
     timeouts: struct { max_idle_secs: u32 = 600, stale_hours: u32 = 24, cleanup_hours: u32 = 72 },
 };
@@ -529,6 +545,14 @@ After stream ends:
 - Update session record in LMDB with final status, cost, duration, exit code
 - Return `SessionResult`
 
+### Non-fatal LMDB writes and DLQ
+
+Event writes during stream parsing are non-fatal: errors are caught and the failed write is enqueued to a dead letter queue (DLQ) file in `db_dir`. On the next session start, the DLQ is auto-drained back into LMDB. This ensures a transient LMDB error (e.g., map full) never kills an active Claude session.
+
+The `ClaudeOptions` struct includes:
+- `stream_output: bool` — when true, raw Claude output is also written to stdout for interactive one-shot runs
+- `db_dir: ?[]const u8` — directory for DLQ file location (defaults to `.bees/db/`)
+
 ### Commit 5.4: Timeout and hang detection
 
 - Track timestamp of last received line
@@ -723,9 +747,13 @@ bees stop                     # Stop and disable systemd timers
 bees status [--json]          # Show current state
 bees run worker [--id N]      # Run one worker (or all workers)
 bees run merger               # Run the merger
+bees run strategist           # Run the strategist agent
+bees run sre                  # Run the SRE agent
+bees run qa                   # Run the QA agent
 bees log [--follow]           # Show/tail central log
 bees config [--json]          # Print resolved config
 bees approaches [--json]      # List approaches with stats
+bees approaches sync [file]   # Sync approaches from JSON file to LMDB
 bees sessions [--type X] [--json]  # List recent sessions
 bees session <id> [--json]    # Show session detail + events
 bees version                  # Print version
@@ -807,6 +835,47 @@ Simple cron-to-systemd converter for the subset we support (e.g., `0 * * * *` �
 
 ---
 
+## Phase 10: QA Agent
+
+**Goal:** Diff-aware visual and functional verification after every merge cycle.
+
+The QA agent runs after each merge cycle completes. It receives the merged diff and uses Chrome MCP (`--mcp-config mcp-chrome.json`) to take screenshots and verify that changes render correctly. The main prompt is loaded from the external file `qa.txt` at runtime. QA reports are stored in the LMDB `meta` sub-database.
+
+Source: `src/qa.zig`
+
+---
+
+## Phase 11: Template-Based Prompts
+
+**Goal:** Strategist, SRE, and QA prompts loaded from external files at runtime — editable without recompiling.
+
+All three agent types load their main prompt from files in `<project>/.bees/prompts/`:
+- `strategist.txt` — Strategist agent prompt
+- `sre-main.txt` — SRE agent main prompt (with `sre.txt` as append system prompt)
+- `qa.txt` — QA agent prompt
+
+Prompts are read into the per-session arena at spawn time.
+
+---
+
+## Phase 12: REST API
+
+**Goal:** HTTP server for dashboard integration.
+
+`src/api.zig` implements an HTTP server that serves session, approach, and status data as JSON. Designed for consumption by the bees-dashboard Next.js application. Configured via the `api` section in `config.json`.
+
+---
+
+## Phase 13: Non-Fatal Observability
+
+**Goal:** Ensure observability never kills an active session.
+
+- Dead letter queue (`src/dlq.zig`) for failed LMDB writes during stream parsing
+- DLQ auto-drains on next session start
+- QA and SRE reports stored in LMDB `meta` sub-database instead of disk files
+
+---
+
 ## Phase Summary
 
 | Phase | Commits | What it delivers |
@@ -815,12 +884,16 @@ Simple cron-to-systemd converter for the subset we support (e.g., `0 * * * *` �
 | 2. Config | 4 | `bees init` creates config, JSON loads and validates |
 | 3. Database | 6 | LMDB environment, bit-packed CRUD for sessions/events/reviews/approaches/stats |
 | 4. Git | 4 | Worktree CRUD, diffs, merges, conflict detection |
-| 5. Claude | 4 | Process spawn, zero-alloc stream parsing, event capture, timeout |
+| 5. Claude | 4 | Process spawn, zero-alloc stream parsing, event capture, timeout, non-fatal DLQ |
 | 6. Worker | 4 | Full worker lifecycle with approach selection and logging |
 | 7. Merger | 6 | Full merger pipeline: review, merge, conflict, build, deploy, cleanup |
 | 8. CLI | 4 | All subcommands functional |
 | 9. systemd | 2 | Timer generation, start/stop commands |
-| **Total** | **38** | **Complete MVP** |
+| 10. QA Agent | — | Diff-aware visual/functional verification via Chrome MCP |
+| 11. Template Prompts | — | External prompt files for strategist, SRE, QA |
+| 12. REST API | — | HTTP server for dashboard integration |
+| 13. Non-Fatal Observability | — | DLQ for failed LMDB writes, reports in LMDB meta |
+| **Total** | **38+** | **Complete system** |
 
 ## Testing Strategy
 
@@ -847,9 +920,9 @@ Zig's built-in `test` blocks used throughout. Run with `zig build test`.
 
 - TUI dashboard (deferred to v2)
 - Web application (v2)
-- Screenshot verification
 - Live site verification + auto-rollback (post-deploy)
-- Approach learning (dynamic weight adjustment)
 - Multi-repo support
 - Cost budgeting (daily limits)
 - Agent SDK transport (alternative to CLI)
+- Persistent browser daemon (Chrome MCP cold-starts each session)
+- Automated prompt regeneration from CLI help output
