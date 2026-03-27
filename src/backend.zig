@@ -1,0 +1,499 @@
+const std = @import("std");
+const Io = std.Io;
+const types = @import("types.zig");
+const store_mod = @import("store.zig");
+const dlq_mod = @import("dlq.zig");
+const fs = @import("fs.zig");
+const claude = @import("claude.zig");
+const backend_codex = @import("backend_codex.zig");
+const backend_opencode = @import("backend_opencode.zig");
+const backend_pi = @import("backend_pi.zig");
+
+// Re-export shared helpers used by callers (api.zig, main.zig, orchestrator.zig)
+pub const findJsonStringValue = claude.findJsonStringValue;
+pub const findJsonNumberValue = claude.findJsonNumberValue;
+pub const collectToolErrors = claude.collectToolErrors;
+pub const streamEvent = claude.streamEvent;
+
+// === Shared spawn helpers (used by per-backend spawners) ===
+
+/// Build a filtered environ map excluding CLAUDECODE to prevent
+/// "cannot launch inside another Claude Code session" errors.
+pub fn buildFilteredEnvMap(allocator: std.mem.Allocator) std.process.Environ.Map {
+    var env_map = std.process.Environ.Map.init(allocator);
+    var i: usize = 0;
+    while (std.c.environ[i]) |entry| : (i += 1) {
+        const entry_str: [*:0]const u8 = @ptrCast(entry);
+        const entry_slice = std.mem.sliceTo(entry_str, 0);
+        const eq_pos = std.mem.indexOfScalar(u8, entry_slice, '=') orelse continue;
+        const key = entry_slice[0..eq_pos];
+        if (std.mem.eql(u8, key, "CLAUDECODE")) continue;
+        const value = entry_slice[eq_pos + 1 ..];
+        env_map.put(key, value) catch continue;
+    }
+    return env_map;
+}
+
+/// Prepend timeout args to an arg list if timeout_secs > 0.
+pub fn appendTimeoutArgs(args: *std.ArrayList([]const u8), allocator: std.mem.Allocator, timeout_buf: *[32]u8, timeout_secs: u32) !void {
+    if (timeout_secs > 0) {
+        try args.append(allocator, "timeout");
+        try args.append(allocator, "--kill-after=10");
+        const timeout_str = std.fmt.bufPrint(timeout_buf, "{d}", .{timeout_secs}) catch "3600";
+        try args.append(allocator, timeout_str);
+    }
+}
+
+/// Write stdin data to child process and close stdin pipe.
+pub fn writeStdinAndClose(child: *std.process.Child, io: Io, data: ?[]const u8) void {
+    const payload = data orelse return;
+    if (child.stdin) |stdin| {
+        var write_buf: [8192]u8 = undefined;
+        var writer = stdin.writerStreaming(io, &write_buf);
+        writer.interface.writeAll(payload) catch {};
+        writer.interface.flush() catch {};
+        stdin.close(io);
+    }
+    child.stdin = null;
+}
+
+/// Read system/append prompt files and build a combined prompt string.
+/// Returns the combined prompt (caller owns memory via allocator).
+pub fn buildPromptWithFiles(allocator: std.mem.Allocator, prompt: []const u8, system_prompt_file: ?[]const u8, append_prompt_file: ?[]const u8) ![]const u8 {
+    var buf: std.ArrayList(u8) = .empty;
+
+    if (system_prompt_file) |spf| {
+        if (fs.readFileAlloc(allocator, spf, 256 * 1024)) |content| {
+            defer allocator.free(content);
+            try buf.appendSlice(allocator, content);
+            try buf.append(allocator, '\n');
+        } else |_| {}
+    }
+
+    try buf.appendSlice(allocator, prompt);
+
+    if (append_prompt_file) |apf| {
+        if (fs.readFileAlloc(allocator, apf, 256 * 1024)) |content| {
+            defer allocator.free(content);
+            try buf.append(allocator, '\n');
+            try buf.appendSlice(allocator, content);
+        } else |_| {}
+    }
+
+    return buf.toOwnedSlice(allocator) catch prompt;
+}
+
+pub const BackendOptions = struct {
+    backend: types.BackendType = .claude,
+    prompt: []const u8,
+    cwd: []const u8,
+    system_prompt_file: ?[]const u8 = null,
+    append_prompt_file: ?[]const u8 = null,
+    model: []const u8 = "opus",
+    effort: []const u8 = "high",
+    max_budget_usd: f64 = 30.0,
+    stdin_data: ?[]const u8 = null,
+    timeout_secs: u32 = 0,
+    resume_session_id: ?[]const u8 = null,
+    mcp_config: ?[]const u8 = null,
+    max_turns: u32 = 0,
+    stream_output: bool = false,
+    db_dir: ?[]const u8 = null,
+};
+
+pub const ResultAccumulator = struct {
+    cost_microdollars: u32 = 0,
+    input_tokens: u32 = 0,
+    output_tokens: u32 = 0,
+    cache_creation_tokens: u32 = 0,
+    cache_read_tokens: u32 = 0,
+    num_turns: u8 = 0,
+    result_text: []const u8 = "",
+    session_id: []const u8 = "",
+    is_error: bool = false,
+    tool_errors: u16 = 0,
+    duration_secs: u16 = 0,
+};
+
+/// Resolve the effective backend: use role-specific override if non-empty, else project default.
+pub fn resolveBackend(default_backend: []const u8, role_backend: []const u8) types.BackendType {
+    const effective = if (role_backend.len > 0) role_backend else default_backend;
+    return types.BackendType.fromString(effective);
+}
+
+/// Dispatch spawn to the appropriate backend.
+fn spawn(backend: types.BackendType, allocator: std.mem.Allocator, io: Io, options: BackendOptions) !std.process.Child {
+    return switch (backend) {
+        .claude => claude.spawnClaude(allocator, io, .{
+            .prompt = options.prompt,
+            .cwd = options.cwd,
+            .system_prompt_file = options.system_prompt_file,
+            .append_prompt_file = options.append_prompt_file,
+            .model = options.model,
+            .effort = options.effort,
+            .max_budget_usd = options.max_budget_usd,
+            .stdin_data = options.stdin_data,
+            .timeout_secs = options.timeout_secs,
+            .resume_session_id = options.resume_session_id,
+            .mcp_config = options.mcp_config,
+            .max_turns = options.max_turns,
+            .stream_output = options.stream_output,
+            .db_dir = options.db_dir,
+        }),
+        .codex => backend_codex.spawnCodex(allocator, io, options),
+        .opencode => backend_opencode.spawnOpenCode(allocator, io, options),
+        .pi => backend_pi.spawnPi(allocator, io, options),
+    };
+}
+
+/// Dispatch event processing to the appropriate backend normalizer.
+fn processEvent(backend: types.BackendType, line: []const u8, acc: *ResultAccumulator) types.EventMeta {
+    return switch (backend) {
+        .claude => claudeProcessEvent(line, acc),
+        .codex => backend_codex.processEvent(line, acc),
+        .opencode => backend_opencode.processEvent(line, acc),
+        .pi => backend_pi.processEvent(line, acc),
+    };
+}
+
+/// Claude adapter: wraps existing parseEventMeta + result field extraction into the accumulator pattern.
+/// NOTE: acc.result_text and acc.session_id are set to slices into `line`.
+/// Callers must dupe these before freeing the line buffer.
+fn claudeProcessEvent(line: []const u8, acc: *ResultAccumulator) types.EventMeta {
+    const meta = claude.parseEventMeta(line);
+
+    if (meta.event_type == .tool_result and meta.is_error) {
+        acc.tool_errors +|= 1;
+    }
+
+    if (meta.event_type == .init_event) {
+        if (claude.findJsonStringValue(line, "\"session_id\"")) |sid| {
+            acc.session_id = sid;
+        }
+    }
+
+    if (meta.event_type == .result) {
+        acc.is_error = meta.is_error;
+        acc.duration_secs = meta.duration_secs;
+        acc.num_turns = meta.num_turns;
+
+        if (claude.findJsonStringValue(line, "\"result\"")) |rt| {
+            acc.result_text = rt;
+        }
+        if (claude.findJsonNumberValue(line, "\"total_cost_usd\"")) |cost| {
+            acc.cost_microdollars = @intFromFloat(@min(@max(cost * 1000000.0, 0.0), @as(f64, @floatFromInt(@as(u32, std.math.maxInt(u32))))));
+        }
+        if (claude.findJsonNumberValue(line, "\"input_tokens\"")) |v| {
+            acc.input_tokens = @intFromFloat(@max(v, 0.0));
+        }
+        if (claude.findJsonNumberValue(line, "\"output_tokens\"")) |v| {
+            acc.output_tokens = @intFromFloat(@max(v, 0.0));
+        }
+        if (claude.findJsonNumberValue(line, "\"cache_creation_input_tokens\"")) |v| {
+            acc.cache_creation_tokens = @intFromFloat(@max(v, 0.0));
+        }
+        if (claude.findJsonNumberValue(line, "\"cache_read_input_tokens\"")) |v| {
+            acc.cache_read_tokens = @intFromFloat(@max(v, 0.0));
+        }
+    }
+
+    return meta;
+}
+
+pub const SessionResult = claude.SessionResult;
+
+/// Unified session loop — runs any backend, stores events in LMDB, streams output.
+pub fn runSession(
+    store: *store_mod.Store,
+    io: Io,
+    options: BackendOptions,
+    session_id: u64,
+    allocator: std.mem.Allocator,
+) !SessionResult {
+    var child = try spawn(options.backend, allocator, io, options);
+
+    // Set up stdout writer for streaming mode
+    var stream_buf: [8192]u8 = undefined;
+    var stream_writer = Io.File.stdout().writerStreaming(io, &stream_buf);
+    const stream = if (options.stream_output) &stream_writer.interface else null;
+
+    // Dead letter queue for failed LMDB writes
+    var dlq: ?dlq_mod.DeadLetterQueue = if (options.db_dir) |db_dir|
+        dlq_mod.DeadLetterQueue.init(db_dir, allocator) catch null
+    else
+        null;
+
+    // Try draining any previously queued events before starting
+    if (dlq) |*q| {
+        const drained = q.drain(store);
+        if (drained > 0) {
+            std.debug.print("[dlq] replayed {d} dead-lettered events\n", .{drained});
+        }
+    }
+
+    var seq: u32 = 0;
+    var acc = ResultAccumulator{};
+    const session_start = fs.timestamp();
+
+    // Store the user prompt as a synthetic event so the dashboard can display it.
+    {
+        var prompt_json_buf: [8192]u8 = undefined;
+        const prefix = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"";
+        const suffix = if (options.stdin_data != null) " [+ stdin data]\"}]}}}" else "\"}]}}";
+        if (prefix.len < prompt_json_buf.len) {
+            @memcpy(prompt_json_buf[0..prefix.len], prefix);
+            var pos: usize = prefix.len;
+            const prompt_preview = if (options.prompt.len > 3000) options.prompt[0..3000] else options.prompt;
+            for (prompt_preview) |ch| {
+                if (pos + 2 >= prompt_json_buf.len - suffix.len) break;
+                switch (ch) {
+                    '"' => { prompt_json_buf[pos] = '\\'; prompt_json_buf[pos + 1] = '"'; pos += 2; },
+                    '\\' => { prompt_json_buf[pos] = '\\'; prompt_json_buf[pos + 1] = '\\'; pos += 2; },
+                    '\n' => { prompt_json_buf[pos] = '\\'; prompt_json_buf[pos + 1] = 'n'; pos += 2; },
+                    '\r' => { prompt_json_buf[pos] = '\\'; prompt_json_buf[pos + 1] = 'r'; pos += 2; },
+                    '\t' => { prompt_json_buf[pos] = '\\'; prompt_json_buf[pos + 1] = 't'; pos += 2; },
+                    else => {
+                        if (ch >= 0x20) { prompt_json_buf[pos] = ch; pos += 1; }
+                    },
+                }
+            }
+            if (pos + suffix.len <= prompt_json_buf.len) {
+                @memcpy(prompt_json_buf[pos..][0..suffix.len], suffix);
+                pos += suffix.len;
+                const prompt_header = types.EventHeader{
+                    .event_type = .message,
+                    .tool_name = .none,
+                    .role = .user,
+                    .timestamp_offset_ms = 0,
+                };
+                store_event: {
+                    const txn = store.beginWriteTxn() catch break :store_event;
+                    store.insertEvent(txn, session_id, seq, prompt_header, prompt_json_buf[0..pos]) catch {
+                        store_mod.Store.abortTxn(txn);
+                        break :store_event;
+                    };
+                    store_mod.Store.commitTxn(txn) catch break :store_event;
+                }
+                seq += 1;
+            }
+        }
+    }
+
+    // Read stdout line by line
+    if (child.stdout) |stdout_file| {
+        var read_buf: [256 * 1024]u8 = undefined;
+        var reader = stdout_file.readerStreaming(io, &read_buf);
+
+        while (true) {
+            const line = reader.interface.takeDelimiter('\n') catch |e| switch (e) {
+                error.ReadFailed => break,
+                error.StreamTooLong => {
+                    _ = reader.interface.discardDelimiterInclusive('\n') catch break;
+                    continue;
+                },
+            };
+            if (line == null) break;
+            const line_data = line.?;
+            if (line_data.len == 0) continue;
+
+            const line_copy = try allocator.dupe(u8, line_data);
+            defer allocator.free(line_copy);
+
+            const meta = processEvent(options.backend, line_copy, &acc);
+
+            // processEvent stores slices into line_copy for result_text/session_id.
+            // Dupe them now before line_copy is freed at end of iteration.
+            {
+                const base = @intFromPtr(line_copy.ptr);
+                const end = base + line_copy.len;
+                if (acc.result_text.len > 0) {
+                    const p = @intFromPtr(acc.result_text.ptr);
+                    if (p >= base and p < end)
+                        acc.result_text = try allocator.dupe(u8, acc.result_text);
+                }
+                if (acc.session_id.len > 0) {
+                    const p = @intFromPtr(acc.session_id.ptr);
+                    if (p >= base and p < end)
+                        acc.session_id = try allocator.dupe(u8, acc.session_id);
+                }
+            }
+
+            const now: u64 = fs.timestamp();
+            const offset_ms: u16 = @truncate((now -| session_start) *| 1000);
+
+            const header = types.EventHeader{
+                .event_type = meta.event_type,
+                .tool_name = meta.tool_name,
+                .role = meta.role,
+                .timestamp_offset_ms = offset_ms,
+            };
+
+            // Write event to LMDB (non-fatal)
+            store_event: {
+                const txn = store.beginWriteTxn() catch |e| {
+                    std.debug.print("[lmdb] write txn failed: {}\n", .{e});
+                    if (dlq) |*q| q.enqueue(session_id, seq, header, line_copy);
+                    break :store_event;
+                };
+                store.insertEvent(txn, session_id, seq, header, line_copy) catch |e| {
+                    store_mod.Store.abortTxn(txn);
+                    std.debug.print("[lmdb] insertEvent failed: {}\n", .{e});
+                    if (dlq) |*q| q.enqueue(session_id, seq, header, line_copy);
+                    break :store_event;
+                };
+                store_mod.Store.commitTxn(txn) catch |e| {
+                    std.debug.print("[lmdb] commit failed: {}\n", .{e});
+                    if (dlq) |*q| q.enqueue(session_id, seq, header, line_copy);
+                    break :store_event;
+                };
+            }
+
+            // Stream human-readable output to stdout for interactive runs
+            if (stream) |s| {
+                streamEvent(s, meta, line_copy);
+            }
+
+            seq += 1;
+        }
+    }
+
+    // Wait for process
+    const term = child.wait(io) catch {
+        return .{
+            .event_count = seq,
+            .duration_secs = acc.duration_secs,
+            .num_turns = acc.num_turns,
+            .is_error = true,
+            .exit_code = -1,
+            .result_text = acc.result_text,
+            .claude_session_id = acc.session_id,
+            .cost_microdollars = acc.cost_microdollars,
+            .input_tokens = acc.input_tokens,
+            .output_tokens = acc.output_tokens,
+            .cache_creation_tokens = acc.cache_creation_tokens,
+            .cache_read_tokens = acc.cache_read_tokens,
+            .tool_errors = acc.tool_errors,
+        };
+    };
+
+    const exit_code: i16 = switch (term) {
+        .exited => |code| @as(i16, @intCast(code)),
+        .signal => |sig| -@as(i16, @intCast(@intFromEnum(sig))),
+        else => -1,
+    };
+
+    // Clean up Chrome tabs if this session used MCP (chrome-devtools)
+    if (options.mcp_config != null) {
+        cleanupChromeTabs(io);
+    }
+
+    return .{
+        .event_count = seq,
+        .duration_secs = acc.duration_secs,
+        .num_turns = acc.num_turns,
+        .is_error = acc.is_error or exit_code != 0,
+        .exit_code = exit_code,
+        .result_text = acc.result_text,
+        .claude_session_id = acc.session_id,
+        .cost_microdollars = acc.cost_microdollars,
+        .input_tokens = acc.input_tokens,
+        .output_tokens = acc.output_tokens,
+        .cache_creation_tokens = acc.cache_creation_tokens,
+        .cache_read_tokens = acc.cache_read_tokens,
+        .tool_errors = acc.tool_errors,
+    };
+}
+
+/// Close all Chrome DevTools tabs except about:blank.
+/// Called after MCP-enabled sessions to prevent tab accumulation and memory leaks.
+/// Entirely non-fatal — if Chrome isn't running or anything fails, silently returns.
+fn cleanupChromeTabs(io: Io) void {
+    const addr = Io.net.IpAddress.parse("127.0.0.1", 9222) catch return;
+
+    // GET /json — list all open tabs
+    var tab_buf: [65536]u8 = undefined;
+    const tab_json = cdpGet(io, addr, "/json", &tab_buf) orelse return;
+
+    // Scan for tab objects: extract "id" and "url" pairs, close non-blank tabs.
+    // Response is a JSON array of objects like: [{"id":"ABC123","url":"http://...","title":"..."}, ...]
+    // We iterate by finding each "id":"..." and the nearest following "url":"..." within the same object.
+    var pos: usize = 0;
+    var closed: u32 = 0;
+    while (pos < tab_json.len) {
+        const id_key = std.mem.indexOf(u8, tab_json[pos..], "\"id\":\"") orelse break;
+        const id_start = pos + id_key + 6;
+        const id_end_rel = std.mem.indexOfScalar(u8, tab_json[id_start..], '"') orelse break;
+        const id = tab_json[id_start..][0..id_end_rel];
+
+        // Find the "url" field after this "id" (within ~500 chars, same object)
+        const search_end = @min(id_start + 500, tab_json.len);
+        const url_region = tab_json[id_start..search_end];
+
+        var is_blank = false;
+        if (std.mem.indexOf(u8, url_region, "\"url\":\"")) |url_key| {
+            const url_start = url_key + 7;
+            const url_end_rel = std.mem.indexOfScalar(u8, url_region[url_start..], '"') orelse 0;
+            const url = url_region[url_start..][0..url_end_rel];
+            is_blank = std.mem.eql(u8, url, "about:blank");
+        }
+
+        if (!is_blank) {
+            // GET /json/close/{id}
+            var path_buf: [128]u8 = undefined;
+            const close_path = std.fmt.bufPrint(&path_buf, "/json/close/{s}", .{id}) catch {
+                pos = id_start + id_end_rel;
+                continue;
+            };
+            var discard_buf: [1024]u8 = undefined;
+            _ = cdpGet(io, addr, close_path, &discard_buf);
+            closed += 1;
+        }
+
+        pos = id_start + id_end_rel;
+    }
+    if (closed > 0) {
+        std.debug.print("[chrome] cleaned up {d} tab(s)\n", .{closed});
+    }
+}
+
+/// Send a GET request to the Chrome DevTools Protocol HTTP endpoint.
+/// Returns the response body (slice into `buf`), or null on any failure.
+fn cdpGet(io: Io, addr: Io.net.IpAddress, path: []const u8, buf: []u8) ?[]const u8 {
+    var stream = Io.net.IpAddress.connect(addr, io, .{ .mode = .stream }) catch return null;
+    defer stream.close(io);
+
+    // Send request
+    var write_buf: [512]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    const w = &writer.interface;
+    w.writeAll("GET ") catch return null;
+    w.writeAll(path) catch return null;
+    w.writeAll(" HTTP/1.0\r\nHost: 127.0.0.1:9222\r\nConnection: close\r\n\r\n") catch return null;
+    w.flush() catch return null;
+
+    // Read response
+    var total: usize = 0;
+    while (total < buf.len) {
+        var iov = [1][]u8{buf[total..]};
+        const n = io.vtable.netRead(io.userdata, stream.socket.handle, &iov) catch break;
+        if (n == 0) break;
+        total += n;
+    }
+    if (total == 0) return null;
+
+    // Skip HTTP headers — find \r\n\r\n
+    const body_start = (std.mem.indexOf(u8, buf[0..total], "\r\n\r\n") orelse return null) + 4;
+    if (body_start >= total) return null;
+    return buf[body_start..total];
+}
+
+test "resolveBackend defaults to claude" {
+    try std.testing.expectEqual(types.BackendType.claude, resolveBackend("claude", ""));
+    try std.testing.expectEqual(types.BackendType.claude, resolveBackend("", ""));
+}
+
+test "resolveBackend role override" {
+    try std.testing.expectEqual(types.BackendType.codex, resolveBackend("claude", "codex"));
+    try std.testing.expectEqual(types.BackendType.opencode, resolveBackend("claude", "opencode"));
+    try std.testing.expectEqual(types.BackendType.pi, resolveBackend("pi", ""));
+}
