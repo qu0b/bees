@@ -166,19 +166,45 @@ pub const ModelType = enum(u2) {
     opus = 0,
     sonnet = 1,
     haiku = 2,
+    other = 3,
 
     pub fn label(self: ModelType) []const u8 {
         return switch (self) {
             .opus => "opus",
             .sonnet => "sonnet",
             .haiku => "haiku",
+            .other => "other",
         };
     }
 
     pub fn fromString(s: []const u8) ModelType {
         if (std.mem.eql(u8, s, "opus")) return .opus;
         if (std.mem.eql(u8, s, "haiku")) return .haiku;
-        return .sonnet;
+        if (std.mem.eql(u8, s, "sonnet")) return .sonnet;
+        return .other;
+    }
+};
+
+pub const BackendType = enum(u2) {
+    claude = 0,
+    opencode = 1,
+    pi = 2,
+    codex = 3,
+
+    pub fn label(self: BackendType) []const u8 {
+        return switch (self) {
+            .claude => "claude",
+            .opencode => "opencode",
+            .pi => "pi",
+            .codex => "codex",
+        };
+    }
+
+    pub fn fromString(s: []const u8) BackendType {
+        if (std.mem.eql(u8, s, "opencode")) return .opencode;
+        if (std.mem.eql(u8, s, "pi")) return .pi;
+        if (std.mem.eql(u8, s, "codex")) return .codex;
+        return .claude;
     }
 };
 
@@ -284,7 +310,8 @@ pub const SessionHeader = packed struct(u384) {
     has_tokens: bool,
     has_duration: bool,
     has_diff_summary: bool,
-    _reserved: u3 = 0,
+    backend: BackendType = .claude,
+    _reserved: u1 = 0,
     worker_id: u16,
     commit_count: u8,
     num_turns: u8,
@@ -505,6 +532,7 @@ test "enum sizes" {
     try std.testing.expectEqual(@as(usize, 1), @sizeOf(Verdict));
     try std.testing.expectEqual(@as(usize, 1), @sizeOf(Role));
     try std.testing.expectEqual(@as(usize, 1), @sizeOf(ModelType));
+    try std.testing.expectEqual(@as(usize, 1), @sizeOf(BackendType));
 }
 
 test "packed struct sizes" {

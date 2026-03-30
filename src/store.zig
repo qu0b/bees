@@ -22,10 +22,15 @@ pub const Store = struct {
 
         try check(c.mdb_env_set_maxdbs(env, 8));
         try check(c.mdb_env_set_mapsize(env, 1 * 1024 * 1024 * 1024));
-        try check(c.mdb_env_set_maxreaders(env, 8));
+        // With MDB_NOTLS, each concurrent read txn needs its own reader slot.
+        // 3 workers + merger + strategist + QA + SRE + CLI = ~32 max concurrent.
+        try check(c.mdb_env_set_maxreaders(env, 32));
         // MDB_NOTLS: don't use thread-local storage for reader slots.
         // Required because io_uring green threads can migrate between OS threads.
-        try check(c.mdb_env_open(env, path_z, c.MDB_NOSUBDIR | c.MDB_NOTLS, 0o644));
+        try check(c.mdb_env_open(env, path_z, c.MDB_NOTLS, 0o644));
+
+        // Clean up stale reader slots from crashed processes
+        _ = c.mdb_reader_check(env, null);
 
         // Open all sub-databases in a single write transaction
         var txn: ?*c.MDB_txn = null;
@@ -915,20 +920,28 @@ fn check(rc: c_int) LmdbError!void {
 }
 
 test "store open and close" {
-    const tmp_path = "/tmp/bees-test-store";
-    defer _ = std.c.unlink(tmp_path);
-    defer _ = std.c.unlink("/tmp/bees-test-store-lock");
+    const tmp_dir = "/tmp/bees-test-store";
+    _ = std.c.mkdir(tmp_dir, 0o755);
+    defer {
+        _ = std.c.unlink(tmp_dir ++ "/data.mdb");
+        _ = std.c.unlink(tmp_dir ++ "/lock.mdb");
+        _ = std.c.rmdir(tmp_dir);
+    }
 
-    var store = try Store.open(tmp_path);
+    var store = try Store.open(tmp_dir);
     defer store.close();
 }
 
 test "store create and get session" {
-    const tmp_path = "/tmp/bees-test-session";
-    defer _ = std.c.unlink(tmp_path);
-    defer _ = std.c.unlink("/tmp/bees-test-session-lock");
+    const tmp_dir = "/tmp/bees-test-session";
+    _ = std.c.mkdir(tmp_dir, 0o755);
+    defer {
+        _ = std.c.unlink(tmp_dir ++ "/data.mdb");
+        _ = std.c.unlink(tmp_dir ++ "/lock.mdb");
+        _ = std.c.rmdir(tmp_dir);
+    }
 
-    var store = try Store.open(tmp_path);
+    var store = try Store.open(tmp_dir);
     defer store.close();
 
     const header = types.SessionHeader{
@@ -968,11 +981,15 @@ test "store create and get session" {
 }
 
 test "store insert and iterate events" {
-    const tmp_path = "/tmp/bees-test-events";
-    defer _ = std.c.unlink(tmp_path);
-    defer _ = std.c.unlink("/tmp/bees-test-events-lock");
+    const tmp_dir = "/tmp/bees-test-events";
+    _ = std.c.mkdir(tmp_dir, 0o755);
+    defer {
+        _ = std.c.unlink(tmp_dir ++ "/data.mdb");
+        _ = std.c.unlink(tmp_dir ++ "/lock.mdb");
+        _ = std.c.rmdir(tmp_dir);
+    }
 
-    var store = try Store.open(tmp_path);
+    var store = try Store.open(tmp_dir);
     defer store.close();
 
     const session_id: u64 = 1;

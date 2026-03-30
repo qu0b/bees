@@ -49,7 +49,7 @@ Bees is a generic, project-agnostic orchestration system that runs multiple auto
 - **Workers** (N instances): Spawn in isolated git worktrees, implement tasks, commit fixes
 - **Merger** (1 instance): Reviews diffs via AI, merges, resolves conflicts, builds, tests, deploys
 - **SRE agent**: Monitors system health, adjusts task weights, cleans up resources
-- **Strategist**: Visual design review via Chrome MCP screenshots, writes tasks to tasks.json
+- **Strategist**: Product visionary — maintains evolving VISION, writes ambitious tasks to tasks.json, uses Chrome MCP for visual review
 - **QA agent**: Diff-aware visual/functional verification after every merge cycle
 - Coordination via LMDB as single source of truth + filesystem markers for worktrees
 - All sessions captured with full event streams in LMDB
@@ -84,6 +84,8 @@ Bees is a generic, project-agnostic orchestration system that runs multiple auto
 - **LMDB read transaction** — CLI commands open read txn, access zero-copy pointers into mmap, close txn.
 
 ### LMDB Rules
+- **Directory mode (no `MDB_NOSUBDIR`)**: LMDB is opened with the directory path, NOT a file path. The data file is `data.mdb` and the lock file is `lock.mdb`, both inside the db directory. Any external consumer (e.g. node-lmdb, lmdb-js, Python lmdb) MUST open the same directory — never open `data.mdb` directly with `MDB_NOSUBDIR`, as this creates a separate lock file (`data.mdb-lock`) and concurrent access through different lock files silently corrupts the database.
+- Sub-database short names: `s` (sessions), `ss` (sessions_by_status), `st` (sessions_by_time), `e` (events), `r` (reviews), `a` (tasks), `m` (meta).
 - 7 sub-databases: sessions, sessions_by_status, sessions_by_time, events, reviews, tasks, meta.
 - All keys are fixed-size, big-endian for correct lexicographic ordering.
 - Values are packed struct headers + length-prefixed variable strings.

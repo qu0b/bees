@@ -7,6 +7,7 @@ const types = @import("types.zig");
 const worker = @import("worker.zig");
 const merger = @import("merger.zig");
 const claude = @import("claude.zig");
+const backend = @import("backend.zig");
 const orchestrator = @import("orchestrator.zig");
 const sre_mod = @import("sre.zig");
 const strategist_mod = @import("strategist.zig");
@@ -364,7 +365,7 @@ fn cmdDaemon(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     fs.makePath(paths.db_dir) catch {};
     fs.makePath(paths.logs_dir) catch {};
 
-    const db_path = try std.fs.path.join(arena, &.{ paths.db_dir, "data.mdb" });
+    const db_path = paths.db_dir;
     var store = try store_mod.Store.open(db_path);
     defer store.close();
 
@@ -375,7 +376,10 @@ fn cmdDaemon(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     try stdout.print("bees daemon starting for {s}...\n", .{cfg.project.name});
     try stdout.flush();
 
-    try orchestrator.run(cfg, paths, &store, &logger, io, arena);
+    // Use c_allocator for the daemon loop so free() actually returns memory
+    // to the OS. The process arena never reclaims pages, causing unbounded
+    // growth in a long-running daemon (every worker/merger/QA session leaks).
+    try orchestrator.run(cfg, paths, &store, &logger, io, std.heap.c_allocator);
 }
 
 fn cmdStatus(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
@@ -383,7 +387,7 @@ fn cmdStatus(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
     const cfg = project[0];
     const paths = project[1];
 
-    const db_path = try std.fs.path.join(arena, &.{ paths.db_dir, "data.mdb" });
+    const db_path = paths.db_dir;
     var store = store_mod.Store.open(db_path) catch {
         try stdout.print("No database found. Run `bees run worker` first.\n", .{});
         return;
@@ -421,7 +425,7 @@ fn cmdRunWorker(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, id: ?u32) 
 
     fs.makePath(paths.db_dir) catch {};
 
-    const db_path = try std.fs.path.join(arena, &.{ paths.db_dir, "data.mdb" });
+    const db_path = paths.db_dir;
     var store = try store_mod.Store.open(db_path);
     defer store.close();
 
@@ -447,7 +451,7 @@ fn cmdRunMerger(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
 
     fs.makePath(paths.db_dir) catch {};
 
-    const db_path = try std.fs.path.join(arena, &.{ paths.db_dir, "data.mdb" });
+    const db_path = paths.db_dir;
     var store = try store_mod.Store.open(db_path);
     defer store.close();
 
@@ -467,7 +471,7 @@ fn cmdRunStrategist(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void 
     fs.makePath(paths.db_dir) catch {};
     fs.makePath(paths.logs_dir) catch {};
 
-    const db_path = try std.fs.path.join(arena, &.{ paths.db_dir, "data.mdb" });
+    const db_path = paths.db_dir;
     var store = try store_mod.Store.open(db_path);
     defer store.close();
 
@@ -552,7 +556,7 @@ fn cmdRunSre(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     fs.makePath(paths.db_dir) catch {};
     fs.makePath(paths.logs_dir) catch {};
 
-    const db_path = try std.fs.path.join(arena, &.{ paths.db_dir, "data.mdb" });
+    const db_path = paths.db_dir;
     var store = try store_mod.Store.open(db_path);
     defer store.close();
 
@@ -575,7 +579,7 @@ fn cmdRunQa(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     fs.makePath(paths.db_dir) catch {};
     fs.makePath(paths.logs_dir) catch {};
 
-    const db_path = try std.fs.path.join(arena, &.{ paths.db_dir, "data.mdb" });
+    const db_path = paths.db_dir;
     var store = try store_mod.Store.open(db_path);
     defer store.close();
 
@@ -679,7 +683,7 @@ fn cmdTasks(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
     const paths = project[1];
 
     // Try LMDB first
-    const db_path = try std.fs.path.join(arena, &.{ paths.db_dir, "data.mdb" });
+    const db_path = paths.db_dir;
     var store = store_mod.Store.open(db_path) catch {
         // Fallback to file
         if (json) {
@@ -756,7 +760,7 @@ fn cmdTasksSync(arena: std.mem.Allocator, stdout: *Io.Writer, file: ?[]const u8)
 
     fs.makePath(paths.db_dir) catch {};
 
-    const db_path = try std.fs.path.join(arena, &.{ paths.db_dir, "data.mdb" });
+    const db_path = paths.db_dir;
     var store = try store_mod.Store.open(db_path);
     defer store.close();
 
@@ -779,7 +783,7 @@ fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?type
     const project = try loadProject(arena);
     const paths = project[1];
 
-    const db_path = try std.fs.path.join(arena, &.{ paths.db_dir, "data.mdb" });
+    const db_path = paths.db_dir;
     var store = store_mod.Store.open(db_path) catch {
         try stdout.print("No database found\n", .{});
         return;
@@ -844,7 +848,7 @@ fn cmdSession(arena: std.mem.Allocator, stdout: *Io.Writer, id: u64, json: bool)
     const project = try loadProject(arena);
     const paths = project[1];
 
-    const db_path = try std.fs.path.join(arena, &.{ paths.db_dir, "data.mdb" });
+    const db_path = paths.db_dir;
     var store = store_mod.Store.open(db_path) catch {
         try stdout.print("No database found\n", .{});
         return;
@@ -1034,7 +1038,7 @@ fn printError(stdout: *Io.Writer, e: anyerror) !void {
         error.NotABeesProject => "Not a bees project. Run `bees init` first.",
         else => "An error occurred",
     };
-    try stdout.print("Error: {s}\n", .{msg});
+    try stdout.print("Error: {s} ({s})\n", .{ msg, @errorName(e) });
 }
 
 comptime {
@@ -1045,6 +1049,10 @@ comptime {
     _ = worker;
     _ = merger;
     _ = claude;
+    _ = backend;
+    _ = @import("backend_codex.zig");
+    _ = @import("backend_opencode.zig");
+    _ = @import("backend_pi.zig");
     _ = git;
     _ = scheduler;
     _ = tasks_mod;

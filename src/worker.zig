@@ -4,7 +4,7 @@ const types = @import("types.zig");
 const config_mod = @import("config.zig");
 const store_mod = @import("store.zig");
 const git = @import("git.zig");
-const claude = @import("claude.zig");
+const backend = @import("backend.zig");
 const tasks_mod = @import("tasks.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
@@ -119,6 +119,7 @@ fn runWorkerImpl(
     }
 
     // Create session in LMDB
+    const bt = backend.resolveBackend(cfg.default_backend, cfg.workers.backend);
     const model = types.ModelType.fromString(cfg.workers.model);
     const header = types.SessionHeader{
         .@"type" = .worker,
@@ -129,6 +130,7 @@ fn runWorkerImpl(
         .has_tokens = false,
         .has_duration = false,
         .has_diff_summary = false,
+        .backend = bt,
         .worker_id = @truncate(worker_id),
         .commit_count = 0,
         .num_turns = 0,
@@ -154,7 +156,7 @@ fn runWorkerImpl(
 
     // Run Claude with restart-on-timeout support
     var claude_session_id: ?[]const u8 = null;
-    var last_result: ?claude.SessionResult = null;
+    var last_result: ?backend.SessionResult = null;
     var attempt: u32 = 0;
     const total_start = now;
 
@@ -178,7 +180,8 @@ fn runWorkerImpl(
             break;
         }
 
-        const result = claude.runClaudeSession(store, io, .{
+        const result = backend.runSession(store, io, .{
+            .backend = bt,
             .prompt = if (claude_session_id != null) "Continue your work from where you left off. Complete all remaining tasks." else task.prompt,
             .cwd = worktree_dir,
             .append_prompt_file = prompt_path,
@@ -190,7 +193,7 @@ fn runWorkerImpl(
             .stream_output = stream_output,
             .db_dir = paths.db_dir,
         }, session_id, allocator) catch |e| {
-            logger.err("[worker:{d}] claude session failed: {}", .{ worker_id, e });
+            logger.err("[worker:{d}] session failed: {}", .{ worker_id, e });
             break;
         };
 
@@ -214,6 +217,10 @@ fn runWorkerImpl(
     }
 
     const result = last_result orelse return .{ .session_id = session_id };
+    defer {
+        if (result.result_text.len > 0) allocator.free(result.result_text);
+        if (result.claude_session_id.len > 0) allocator.free(result.claude_session_id);
+    }
 
     // Count commits
     const commits = git.getCommitsAhead(allocator, io, paths.root, branch_name, cfg.project.base_branch) catch 0;
@@ -230,6 +237,7 @@ fn runWorkerImpl(
         .has_tokens = has_tokens,
         .has_duration = true,
         .has_diff_summary = false,
+        .backend = bt,
         .worker_id = @truncate(worker_id),
         .commit_count = @intCast(@min(commits, 255)),
         .num_turns = result.num_turns,

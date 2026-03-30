@@ -19,6 +19,7 @@ pub const TaskPool = struct {
     /// Load tasks from JSON file (backward compatible path).
     pub fn load(allocator: std.mem.Allocator, path: []const u8) !TaskPool {
         const data = try fs.readFileAlloc(allocator, path, 1024 * 1024);
+        defer allocator.free(data);
 
         const JsonTask = struct {
             name: []const u8,
@@ -29,6 +30,7 @@ pub const TaskPool = struct {
         const parsed = try std.json.parseFromSlice([]const JsonTask, allocator, data, .{
             .allocate = .alloc_always,
         });
+        defer parsed.deinit();
         const items = parsed.value;
 
         var tasks = try allocator.alloc(Task, items.len);
@@ -36,9 +38,9 @@ pub const TaskPool = struct {
         for (items, 0..) |item, i| {
             cumulative += item.weight;
             tasks[i] = .{
-                .name = item.name,
+                .name = try allocator.dupe(u8, item.name),
                 .weight = item.weight,
-                .prompt = item.prompt,
+                .prompt = try allocator.dupe(u8, item.prompt),
                 .cumulative = cumulative,
             };
         }
@@ -100,6 +102,19 @@ pub const TaskPool = struct {
         };
     }
 
+    /// Free all owned memory. Only call on pools created by loadFromStore
+    /// (which dupes strings). Pools from load() alias into the JSON parse
+    /// buffer and must not be individually freed.
+    pub fn deinit(self: *TaskPool, allocator: std.mem.Allocator) void {
+        for (self.tasks) |t| {
+            allocator.free(t.name);
+            allocator.free(t.prompt);
+        }
+        allocator.free(self.tasks);
+        self.tasks = &.{};
+        self.total_weight = 0;
+    }
+
     pub fn hasActiveTasks(self: *const TaskPool) bool {
         return self.total_weight > 0;
     }
@@ -143,6 +158,7 @@ pub fn syncFromJson(
     const parsed = try std.json.parseFromSlice([]const JsonTask, allocator, json_data, .{
         .allocate = .alloc_always,
     });
+    defer parsed.deinit();
     const items = parsed.value;
 
     const txn = try store.beginWriteTxn();
@@ -269,6 +285,7 @@ fn appendJsonStr(list: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []co
 /// Sync tasks from JSON file into LMDB.
 pub fn syncFromFile(store: *store_mod.Store, path: []const u8, allocator: std.mem.Allocator) !void {
     const data = try fs.readFileAlloc(allocator, path, 1024 * 1024);
+    defer allocator.free(data);
     try syncFromJson(store, data, .template, allocator);
 }
 

@@ -171,6 +171,43 @@ pub fn getChangedFiles(allocator: std.mem.Allocator, io: Io, repo_path: []const 
     return result.stdout;
 }
 
+pub fn getDefaultBranch(allocator: std.mem.Allocator, io: Io, repo_path: []const u8) ?[]const u8 {
+    // Try remote HEAD first (works when origin is configured)
+    const refs = [_][]const u8{
+        "refs/remotes/origin/HEAD",
+        "HEAD", // fallback: current branch (works even in empty repos)
+    };
+    for (refs) |ref| {
+        const result = run(allocator, io, &.{ "git", "symbolic-ref", ref }, repo_path) catch continue;
+        defer allocator.free(result.stderr);
+        if (result.exit_code == 0) {
+            const trimmed = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
+            if (std.mem.lastIndexOfScalar(u8, trimmed, '/')) |pos| {
+                const branch = allocator.dupe(u8, trimmed[pos + 1 ..]) catch {
+                    allocator.free(result.stdout);
+                    continue;
+                };
+                allocator.free(result.stdout);
+                return branch;
+            }
+        }
+        allocator.free(result.stdout);
+    }
+
+    // Last resort: check if 'main' or 'master' ref exists (requires commits)
+    const r2 = run(allocator, io, &.{ "git", "rev-parse", "--verify", "main" }, repo_path) catch return null;
+    allocator.free(r2.stdout);
+    allocator.free(r2.stderr);
+    if (r2.exit_code == 0) return "main";
+
+    const r3 = run(allocator, io, &.{ "git", "rev-parse", "--verify", "master" }, repo_path) catch return null;
+    allocator.free(r3.stdout);
+    allocator.free(r3.stderr);
+    if (r3.exit_code == 0) return "master";
+
+    return null;
+}
+
 pub fn isGitRepo(allocator: std.mem.Allocator, io: Io, path: []const u8) bool {
     const result = run(allocator, io, &.{ "git", "rev-parse", "--git-dir" }, path) catch return false;
     allocator.free(result.stdout);

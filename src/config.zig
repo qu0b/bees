@@ -3,6 +3,7 @@ const fs = @import("fs.zig");
 
 pub const Config = struct {
     project: Project,
+    default_backend: []const u8 = "claude",
     workers: Workers = .{},
     merger: Merger = .{},
     sre: Sre = .{},
@@ -27,6 +28,7 @@ pub const Config = struct {
         effort: []const u8 = "high",
         max_budget_usd: f64 = 30.0,
         schedule: []const u8 = "0 * * * *",
+        backend: []const u8 = "",
     };
 
     pub const Merger = struct {
@@ -36,6 +38,7 @@ pub const Config = struct {
         schedule: []const u8 = "45 * * * *",
         max_conflict_files: u32 = 5,
         merge_threshold: u32 = 3,
+        backend: []const u8 = "",
     };
 
     pub const Sre = struct {
@@ -45,6 +48,7 @@ pub const Config = struct {
         cooldown_minutes: u32 = 60,
         max_turns: u32 = 10,
         tool_error_threshold: u32 = 3,
+        backend: []const u8 = "",
     };
 
     pub const Strategist = struct {
@@ -53,6 +57,7 @@ pub const Config = struct {
         max_budget_usd: f64 = 30.0,
         cycle_interval: u32 = 3,
         mcp_config: ?[]const u8 = null,
+        backend: []const u8 = "",
     };
 
     pub const Qa = struct {
@@ -60,6 +65,7 @@ pub const Config = struct {
         effort: []const u8 = "medium",
         max_budget_usd: f64 = 30.0,
         mcp_config: ?[]const u8 = null,
+        backend: []const u8 = "",
     };
 
     pub const Api = struct {
@@ -73,6 +79,12 @@ pub const Config = struct {
         worker_timeout_minutes: u32 = 60,
         restart_timeout_minutes: u32 = 20,
         max_restarts: u32 = 2,
+        /// UTC hour (0-23) when quiet period starts. Null = disabled.
+        quiet_start_utc: ?u8 = null,
+        /// UTC hour (0-23) when quiet period ends. Null = disabled.
+        quiet_end_utc: ?u8 = null,
+        /// If true (default), quiet hours only apply Mon-Fri.
+        quiet_weekdays_only: bool = true,
     };
 
     pub const Git = struct {

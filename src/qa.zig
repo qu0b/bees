@@ -3,7 +3,7 @@ const Io = std.Io;
 const types = @import("types.zig");
 const config_mod = @import("config.zig");
 const store_mod = @import("store.zig");
-const claude = @import("claude.zig");
+const backend = @import("backend.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 
@@ -41,6 +41,7 @@ pub fn runQa(
 
     const now: u64 = fs.timestamp();
     const model = types.ModelType.fromString(cfg.qa.model);
+    const bt = backend.resolveBackend(cfg.default_backend, cfg.qa.backend);
     const header = types.SessionHeader{
         .@"type" = .qa,
         .status = .running,
@@ -50,6 +51,7 @@ pub fn runQa(
         .has_tokens = false,
         .has_duration = false,
         .has_diff_summary = false,
+        .backend = bt,
         .worker_id = 0,
         .commit_count = 0,
         .num_turns = 0,
@@ -66,7 +68,8 @@ pub fn runQa(
 
     const session_id = try store.createSession(header, "QA review", "", paths.root);
 
-    const result = claude.runClaudeSession(store, io, .{
+    const result = backend.runSession(store, io, .{
+        .backend = bt,
         .prompt = prompt,
         .cwd = paths.root,
         .model = cfg.qa.model,
@@ -76,9 +79,13 @@ pub fn runQa(
         .stream_output = stream_output,
         .db_dir = paths.db_dir,
     }, session_id, allocator) catch |e| {
-        logger.err("[qa] claude session failed: {}", .{e});
+        logger.err("[qa] session failed: {}", .{e});
         return;
     };
+    defer {
+        if (result.result_text.len > 0) allocator.free(result.result_text);
+        if (result.claude_session_id.len > 0) allocator.free(result.claude_session_id);
+    }
 
     const finish_time: u64 = fs.timestamp();
     const has_tokens = (result.input_tokens > 0 or result.output_tokens > 0);
@@ -91,6 +98,7 @@ pub fn runQa(
         .has_tokens = has_tokens,
         .has_duration = true,
         .has_diff_summary = false,
+        .backend = bt,
         .worker_id = 0,
         .commit_count = 0,
         .num_turns = result.num_turns,

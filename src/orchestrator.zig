@@ -14,7 +14,7 @@ const fs = @import("fs.zig");
 const types = @import("types.zig");
 const MAX_WORKERS = 32;
 
-const claude = @import("claude.zig");
+const backend = @import("backend.zig");
 
 /// Shared daemon state — accessed via atomics for cross-green-thread safety.
 const DaemonState = struct {
@@ -31,6 +31,29 @@ const DaemonState = struct {
 /// (API server, workers, SRE) keep making progress.
 pub fn sleep_secs(io: Io, secs: u64) void {
     io.sleep(Io.Duration.fromSeconds(@intCast(secs)), .awake) catch {};
+}
+
+/// Returns true if current UTC time is within the configured quiet window.
+/// During quiet hours the daemon suppresses new work to conserve usage quota.
+fn isQuietHour(daemon: config_mod.Config.Daemon) bool {
+    const start = daemon.quiet_start_utc orelse return false;
+    const end = daemon.quiet_end_utc orelse return false;
+    if (start > 23 or end > 23) return false;
+
+    const now = fs.timestamp();
+
+    if (daemon.quiet_weekdays_only) {
+        // 0=Sun 1=Mon .. 5=Fri 6=Sat  (Jan 1 1970 = Thursday)
+        const day = @as(u8, @intCast(((now / 86400) + 4) % 7));
+        if (day == 0 or day == 6) return false;
+    }
+
+    const hour = @as(u8, @intCast((now % 86400) / 3600));
+    if (start <= end) {
+        return hour >= start and hour < end;
+    } else {
+        return hour >= start or hour < end;
+    }
 }
 
 pub fn run(
@@ -59,6 +82,18 @@ pub fn run(
         logger.warn("[daemon] initial task sync failed: {}", .{e});
     };
 
+    // Wait out quiet hours before spending quota on startup strategist
+    if (isQuietHour(cfg.daemon)) {
+        logger.info("[daemon] quiet hours active (UTC {d}:00-{d}:00, weekdays only={s}), waiting...", .{
+            cfg.daemon.quiet_start_utc.?, cfg.daemon.quiet_end_utc.?,
+            if (cfg.daemon.quiet_weekdays_only) "yes" else "no",
+        });
+        while (isQuietHour(cfg.daemon)) {
+            sleep_secs(io, 300);
+        }
+        logger.info("[daemon] quiet hours ended, resuming", .{});
+    }
+
     // Always run strategist at startup to refresh stale tasks before spawning workers
     logger.info("[daemon] running startup strategist to refresh tasks", .{});
     runStrategistWithPrep(cfg, paths, store, logger, io, allocator);
@@ -80,8 +115,23 @@ pub fn run(
     }
 
     // Main loop — polls via cooperative sleep
+    var was_quiet = false;
     while (true) {
         sleep_secs(io, 10);
+
+        // Quiet hours — let running workers finish but don't start new work
+        if (isQuietHour(cfg.daemon)) {
+            if (!was_quiet) {
+                logger.info("[daemon] entering quiet hours, pausing new work", .{});
+                was_quiet = true;
+            }
+            sleep_secs(io, 300);
+            continue;
+        }
+        if (was_quiet) {
+            logger.info("[daemon] quiet hours ended, resuming", .{});
+            was_quiet = false;
+        }
 
         // Check completion threshold
         const current_done = @atomicLoad(u32, &state.done_count, .acquire);
@@ -142,15 +192,13 @@ pub fn run(
 
             // Sync tasks.json into LMDB and reload from store
             tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
-            pool = tasks_mod.TaskPool.loadFromStore(store, allocator) catch
-                tasks_mod.TaskPool.load(allocator, paths.tasks_file) catch pool;
+            reloadPool(&pool, store, paths.tasks_file, allocator);
 
             if (!pool.hasActiveTasks()) {
                 logger.info("[daemon] all tasks exhausted, running strategist", .{});
                 runStrategistWithPrep(cfg, paths, store, logger, io, allocator);
                 tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
-                pool = tasks_mod.TaskPool.loadFromStore(store, allocator) catch
-                    tasks_mod.TaskPool.load(allocator, paths.tasks_file) catch pool;
+                reloadPool(&pool, store, paths.tasks_file, allocator);
             }
 
             // Refill workers (only if there's work to do)
@@ -263,7 +311,7 @@ fn drainSreTriggers(
         if (sid == 0) continue;
         if (first_session_id == 0) first_session_id = sid;
 
-        if (claude.collectToolErrors(store, sid, allocator)) |errors| {
+        if (backend.collectToolErrors(store, sid, allocator)) |errors| {
             defer allocator.free(errors);
             context.appendSlice(allocator, errors) catch continue;
             context.append(allocator, '\n') catch continue;
@@ -391,8 +439,9 @@ fn writeTaskTrends(
     allocator: std.mem.Allocator,
 ) void {
     _ = cfg;
-    const pool = tasks_mod.TaskPool.loadFromStore(store, allocator) catch
+    var pool = tasks_mod.TaskPool.loadFromStore(store, allocator) catch
         tasks_mod.TaskPool.load(allocator, paths.tasks_file) catch return;
+    defer pool.deinit(allocator);
 
     var buf: [16384]u8 = undefined;
     var pos: usize = 0;
@@ -446,4 +495,12 @@ fn writeTaskTrends(
     };
     store_mod.Store.commitTxn(write_txn) catch return;
     logger.info("[daemon] wrote task trends to LMDB ({d} bytes)", .{pos});
+}
+
+/// Reload the task pool, freeing the old one only on success.
+fn reloadPool(pool: *tasks_mod.TaskPool, store: *store_mod.Store, tasks_file: []const u8, allocator: std.mem.Allocator) void {
+    const new_pool = tasks_mod.TaskPool.loadFromStore(store, allocator) catch
+        tasks_mod.TaskPool.load(allocator, tasks_file) catch return;
+    pool.deinit(allocator);
+    pool.* = new_pool;
 }

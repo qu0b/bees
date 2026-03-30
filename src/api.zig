@@ -235,10 +235,11 @@ fn handleSession(w: *Io.Writer, store: *store_mod.Store, id: u64) !void {
 
     try writeResponseHeader(w, 200, "application/json");
 
-    try w.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"cost_microdollars\":{d},\"task\":", .{
+    try w.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"backend\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"cost_microdollars\":{d},\"task\":", .{
         id,
         session.header.@"type".label(),
         session.header.status.label(),
+        session.header.backend.label(),
         session.header.commit_count,
         @as(u64, session.header.cost_microdollars) / 10000,
         session.header.cost_microdollars,
@@ -558,10 +559,11 @@ fn writeSessionsArray(w: *Io.Writer, store: *store_mod.Store, txn: anytype, type
         if (!first) try w.print(",", .{});
         first = false;
 
-        try w.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"task\":", .{
+        try w.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"backend\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"task\":", .{
             entry.id,
             entry.view.header.@"type".label(),
             entry.view.header.status.label(),
+            entry.view.header.backend.label(),
             entry.view.header.commit_count,
             @as(u64, entry.view.header.cost_microdollars) / 10000,
         });

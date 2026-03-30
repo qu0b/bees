@@ -3,7 +3,7 @@ const Io = std.Io;
 const types = @import("types.zig");
 const config_mod = @import("config.zig");
 const store_mod = @import("store.zig");
-const claude = @import("claude.zig");
+const backend = @import("backend.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 
@@ -41,6 +41,7 @@ pub fn runSre(
 
     const now: u64 = fs.timestamp();
     const model = types.ModelType.fromString(cfg.sre.model);
+    const bt = backend.resolveBackend(cfg.default_backend, cfg.sre.backend);
     const header = types.SessionHeader{
         .@"type" = .sre,
         .status = .running,
@@ -50,6 +51,7 @@ pub fn runSre(
         .has_tokens = false,
         .has_duration = false,
         .has_diff_summary = false,
+        .backend = bt,
         .worker_id = 0,
         .commit_count = 0,
         .num_turns = 0,
@@ -69,7 +71,8 @@ pub fn runSre(
     const sre_prompt_path = try std.fs.path.join(allocator, &.{ paths.prompts_dir, "sre.txt" });
     defer allocator.free(sre_prompt_path);
 
-    const result = claude.runClaudeSession(store, io, .{
+    const result = backend.runSession(store, io, .{
+        .backend = bt,
         .prompt = prompt,
         .cwd = paths.root,
         .system_prompt_file = sre_prompt_path,
@@ -80,9 +83,13 @@ pub fn runSre(
         .stream_output = stream_output,
         .db_dir = paths.db_dir,
     }, session_id, allocator) catch |e| {
-        logger.err("[sre] claude session failed: {}", .{e});
+        logger.err("[sre] session failed: {}", .{e});
         return;
     };
+    defer {
+        if (result.result_text.len > 0) allocator.free(result.result_text);
+        if (result.claude_session_id.len > 0) allocator.free(result.claude_session_id);
+    }
 
     const finish_time: u64 = fs.timestamp();
     const has_tokens = (result.input_tokens > 0 or result.output_tokens > 0);
@@ -95,6 +102,7 @@ pub fn runSre(
         .has_tokens = has_tokens,
         .has_duration = true,
         .has_diff_summary = false,
+        .backend = bt,
         .worker_id = 0,
         .commit_count = 0,
         .num_turns = result.num_turns,

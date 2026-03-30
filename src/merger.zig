@@ -4,7 +4,7 @@ const types = @import("types.zig");
 const config_mod = @import("config.zig");
 const store_mod = @import("store.zig");
 const git = @import("git.zig");
-const claude = @import("claude.zig");
+const backend = @import("backend.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 
@@ -201,6 +201,7 @@ fn reviewAndMerge(
 
     const merger_model = types.ModelType.fromString(cfg.merger.model);
     const now: u64 = fs.timestamp();
+    const review_bt = backend.resolveBackend(cfg.default_backend, cfg.merger.backend);
     const header = types.SessionHeader{
         .@"type" = .review,
         .status = .running,
@@ -210,6 +211,7 @@ fn reviewAndMerge(
         .has_tokens = false,
         .has_duration = false,
         .has_diff_summary = false,
+        .backend = review_bt,
         .worker_id = 0,
         .commit_count = 0,
         .num_turns = 0,
@@ -255,7 +257,8 @@ fn reviewAndMerge(
 
     logger.info("[merger] reviewing {s}", .{candidate.branch});
 
-    const result = claude.runClaudeSession(store, io, .{
+    const result = backend.runSession(store, io, .{
+        .backend = review_bt,
         .prompt = review_prompt,
         .cwd = paths.root,
         .append_prompt_file = review_prompt_path,
@@ -268,6 +271,10 @@ fn reviewAndMerge(
         logger.err("[merger] review session failed for {s}: {}", .{ candidate.branch, e });
         return;
     };
+    defer {
+        if (result.result_text.len > 0) allocator.free(result.result_text);
+        if (result.claude_session_id.len > 0) allocator.free(result.claude_session_id);
+    }
 
     // Update session status
     var updated_header = header;
@@ -387,6 +394,7 @@ fn runBuildStep(
         .has_tokens = false,
         .has_duration = false,
         .has_diff_summary = false,
+        .backend = backend.resolveBackend(cfg.default_backend, cfg.merger.backend),
         .worker_id = 0,
         .commit_count = 0,
         .num_turns = 0,
@@ -409,7 +417,8 @@ fn runBuildStep(
     const error_context = try std.fmt.allocPrint(allocator, "The {s} command `{s}` failed with:\n{s}\n{s}\nFix the issue.", .{ step_name, command, result.stdout, result.stderr });
     defer allocator.free(error_context);
 
-    const fix_result = claude.runClaudeSession(store, io, .{
+    const fix_result = backend.runSession(store, io, .{
+        .backend = header.backend,
         .prompt = error_context,
         .cwd = paths.root,
         .append_prompt_file = fix_prompt_path,
@@ -422,6 +431,10 @@ fn runBuildStep(
         git.resetHard(allocator, io, paths.root, saved_head) catch {};
         return false;
     };
+    defer {
+        if (fix_result.result_text.len > 0) allocator.free(fix_result.result_text);
+        if (fix_result.claude_session_id.len > 0) allocator.free(fix_result.claude_session_id);
+    }
 
     const retry = try runShellCommand(allocator, io, command, paths.root);
     defer allocator.free(retry.stdout);
