@@ -383,6 +383,20 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: 
         }
     }
 
+    // Initialize SQLite database with schema
+    {
+        const sqlite_path = try std.fs.path.join(arena, &.{ bees_dir, "db", "data.sqlite" });
+        var sql_db = sqlite.Db.open(sqlite_path) catch null;
+        if (sql_db) |*db| {
+            const schema = @import("db/schema.zig");
+            inline for (schema.all_ddl) |ddl| {
+                db.execMulti(ddl) catch {};
+            }
+            db.close();
+            try stdout.print("  Created SQLite database at {s}/db/data.sqlite\n", .{bees_dir});
+        }
+    }
+
     // Add .bees/ to .gitignore
     try addToGitignore(arena, cwd);
 
@@ -473,6 +487,13 @@ fn buildInitPrompt(arena: std.mem.Allocator, cwd: []const u8, name: []const u8, 
         \\    (no pkill, kill, systemctl stop/restart). Only inspect and adjust config.
         \\
         \\Do NOT create tasks.json — the strategist generates tasks on its first run.
+        \\
+        \\## Database Architecture
+        \\bees uses three embedded databases (KV, relational, OLAP):
+        \\  - LMDB (data.mdb) — hot path writes during agent sessions
+        \\  - SQLite (data.sqlite) — queryable mirror for dashboard/CLI/API reads
+        \\  - DuckDB (data.duckdb) — analytical queries (cost trends, task effectiveness)
+        \\These are managed by bees automatically. Do NOT create or configure database files.
         \\
         \\## Rules
         \\- Write valid JSON (no comments, no trailing commas)
@@ -644,6 +665,21 @@ fn cmdDaemon(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
 
     fs.makePath(paths.db_dir) catch {};
     fs.makePath(paths.logs_dir) catch {};
+
+    // Ensure SQLite schema is up to date
+    {
+        const sqlite_path = std.fs.path.join(arena, &.{ paths.db_dir, "data.sqlite" }) catch null;
+        if (sqlite_path) |sp| {
+            var sql_db = sqlite.Db.open(sp) catch null;
+            if (sql_db) |*db| {
+                const schema = @import("db/schema.zig");
+                inline for (schema.all_ddl) |ddl| {
+                    db.execMulti(ddl) catch {};
+                }
+                db.close();
+            }
+        }
+    }
 
     const db_path = paths.db_dir;
     var store = try store_mod.Store.open(db_path);

@@ -260,6 +260,9 @@ pub fn run(
             // Drain any remaining SRE triggers not handled by workflow
             drainSreTriggers(cfg, paths, store, logger, io, allocator, &state);
 
+            // Clean up leaked Chrome renderer processes between cycles
+            backend.cleanupChrome(io);
+
             // Cooldown
             const cooldown_secs = @as(u64, cfg.daemon.cooldown_minutes) * 60;
             logger.info("[daemon] cooling down for {d} minutes", .{cfg.daemon.cooldown_minutes});

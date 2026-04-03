@@ -465,9 +465,14 @@ pub fn runSession(
     };
 }
 
-/// Close all Chrome DevTools tabs except about:blank.
-/// Called after MCP-enabled sessions to prevent tab accumulation and memory leaks.
+/// Close all Chrome DevTools tabs except about:blank and force GC on renderers.
+/// Public so the orchestrator can call it between cycles for periodic cleanup.
+/// Called after MCP-enabled sessions to prevent tab/process accumulation.
 /// Entirely non-fatal — if Chrome isn't running or anything fails, silently returns.
+pub fn cleanupChrome(io: Io) void {
+    cleanupChromeTabs(io);
+}
+
 fn cleanupChromeTabs(io: Io) void {
     const addr = Io.net.IpAddress.parse("127.0.0.1", 9222) catch return;
 
@@ -476,8 +481,6 @@ fn cleanupChromeTabs(io: Io) void {
     const tab_json = cdpGet(io, addr, "/json", &tab_buf) orelse return;
 
     // Scan for tab objects: extract "id" and "url" pairs, close non-blank tabs.
-    // Response is a JSON array of objects like: [{"id":"ABC123","url":"http://...","title":"..."}, ...]
-    // We iterate by finding each "id":"..." and the nearest following "url":"..." within the same object.
     var pos: usize = 0;
     var closed: u32 = 0;
     while (pos < tab_json.len) {
@@ -486,7 +489,6 @@ fn cleanupChromeTabs(io: Io) void {
         const id_end_rel = std.mem.indexOfScalar(u8, tab_json[id_start..], '"') orelse break;
         const id = tab_json[id_start..][0..id_end_rel];
 
-        // Find the "url" field after this "id" (within ~500 chars, same object)
         const search_end = @min(id_start + 500, tab_json.len);
         const url_region = tab_json[id_start..search_end];
 
@@ -499,7 +501,6 @@ fn cleanupChromeTabs(io: Io) void {
         }
 
         if (!is_blank) {
-            // GET /json/close/{id}
             var path_buf: [128]u8 = undefined;
             const close_path = std.fmt.bufPrint(&path_buf, "/json/close/{s}", .{id}) catch {
                 pos = id_start + id_end_rel;
@@ -512,7 +513,25 @@ fn cleanupChromeTabs(io: Io) void {
 
         pos = id_start + id_end_rel;
     }
+
+    // Force Chrome to GC stale renderers by creating+closing a temp tab.
+    // This triggers Chrome's internal cleanup of orphaned renderer processes.
     if (closed > 0) {
+        var new_buf: [4096]u8 = undefined;
+        if (cdpGet(io, addr, "/json/new?about:blank", &new_buf)) |new_json| {
+            // Extract the new tab's id and close it immediately
+            if (std.mem.indexOf(u8, new_json, "\"id\":\"")) |new_id_key| {
+                const new_id_start = new_id_key + 6;
+                if (std.mem.indexOfScalar(u8, new_json[new_id_start..], '"')) |new_id_end| {
+                    const new_id = new_json[new_id_start..][0..new_id_end];
+                    var close_buf: [128]u8 = undefined;
+                    if (std.fmt.bufPrint(&close_buf, "/json/close/{s}", .{new_id})) |cp| {
+                        var discard: [1024]u8 = undefined;
+                        _ = cdpGet(io, addr, cp, &discard);
+                    } else |_| {}
+                }
+            }
+        }
         std.debug.print("[chrome] cleaned up {d} tab(s)\n", .{closed});
     }
 }
