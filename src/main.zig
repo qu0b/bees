@@ -19,6 +19,7 @@ const tasks_mod = @import("tasks.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 const ctx_mod = @import("context.zig");
+const roles_default = @import("roles_default.zig");
 
 pub const version = "0.1.0";
 
@@ -367,6 +368,9 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: 
     }
 
     try ensureDefaultPrompts(arena, bees_dir);
+
+    // Generate roles + workflow structure
+    roles_default.generateDefaults(bees_dir, arena);
 
     // Interactive strategy conversation — generates a tailored strategist.txt
     if (!skip_analysis) {
