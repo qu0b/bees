@@ -37,7 +37,7 @@ pub const RoleSet = struct {
         return self.roles.get(name);
     }
 
-    pub fn deinit(self: *RoleSet) {
+    pub fn deinit(self: *RoleSet) void {
         self.roles.deinit();
     }
 };
@@ -101,7 +101,7 @@ pub fn loadRoles(paths: config_mod.ProjectPaths, allocator: std.mem.Allocator) !
 pub fn resolveContextSources(role: RoleConfig, allocator: std.mem.Allocator) []const context.Source {
     if (role.sources.len == 0) return &.{};
 
-    var sources = std.ArrayList(context.Source).init(allocator);
+    var sources: std.ArrayList(context.Source) = .empty;
     for (role.sources) |s| {
         if (std.mem.eql(u8, s, "user_profiles")) {
             sources.append(allocator, .user_profiles) catch continue;

@@ -5,15 +5,15 @@ const store_mod = @import("store.zig");
 const worker = @import("worker.zig");
 const merger = @import("merger.zig");
 const sre_mod = @import("sre.zig");
-const strategist_mod = @import("strategist.zig");
-const qa_mod = @import("qa.zig");
-const user_mod = @import("user.zig");
 const tasks_mod = @import("tasks.zig");
 const git = @import("git.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 const types = @import("types.zig");
 const ctx = @import("context.zig");
+const role_mod = @import("role.zig");
+const workflow_mod = @import("workflow.zig");
+const executor = @import("executor.zig");
 const MAX_WORKERS = 32;
 
 const backend = @import("backend.zig");
@@ -187,47 +187,77 @@ pub fn run(
             } else null;
             defer if (changed_files) |cf| allocator.free(cf);
 
-            // Build + restart once (serves both QA and strategist)
+            // Build + restart once (serves QA, user agent, and strategist)
             prepareForStrategist(cfg, paths, logger, io, allocator);
 
-            // Build worker summary once — shared by QA, user agent, and strategist
+            // Precompute shared context values
             const worker_summary = ctx.buildWorkerSummary(store, allocator);
             defer if (worker_summary) |ws| allocator.free(ws);
             const extras = ctx.Extras{ .changed_files = changed_files, .worker_summary = worker_summary };
 
-            // QA: validates features work + evaluates through user lens
-            logger.info("[daemon] running QA agent", .{});
-            const qa_ctx = ctx.build(store, paths, &.{ .user_profiles, .changed_files, .worker_summary }, extras, allocator);
-            defer if (qa_ctx) |qc| allocator.free(qc);
-            qa_mod.runQa(cfg, paths, store, logger, io, allocator, qa_ctx, false) catch |e| {
-                logger.err("[daemon] QA failed: {}", .{e});
+            // Load workflow and roles
+            const wf = workflow_mod.load(paths, allocator);
+            const roles = role_mod.loadRoles(paths, allocator) catch role_mod.RoleSet{
+                .roles = std.StringHashMap(role_mod.RoleConfig).init(allocator),
+                .allocator = allocator,
             };
 
-            // User agent: simulated persona engagement via browser/devtools
-            logger.info("[daemon] running user engagement agent", .{});
-            const user_ctx = ctx.build(store, paths, &.{ .user_profiles, .worker_summary }, extras, allocator);
-            defer if (user_ctx) |uc| allocator.free(uc);
-            user_mod.runUser(cfg, paths, store, logger, io, allocator, user_ctx, false) catch |e| {
-                logger.err("[daemon] user agent failed: {}", .{e});
-            };
-
-            // Run strategist every N merge cycles
             merge_cycle += 1;
-            if (cfg.strategist.cycle_interval == 0 or merge_cycle % cfg.strategist.cycle_interval == 0) {
-                logger.info("[daemon] running strategist (cycle {d})", .{merge_cycle});
-                writeTaskTrends(cfg, paths, store, logger, allocator);
-                const strat_ctx = ctx.build(store, paths, &.{
-                    .user_profiles, .operator_feedback, .report_user, .report_qa, .report_sre, .task_trends,
-                }, .{}, allocator);
-                defer if (strat_ctx) |sc| allocator.free(sc);
-                strategist_mod.runStrategist(cfg, paths, store, logger, io, allocator, false, strat_ctx) catch |e| {
-                    logger.err("[daemon] strategist failed: {}", .{e});
+
+            // Execute post-merger workflow steps (skip worker and merger — already handled)
+            for (wf.steps) |step| {
+                if (@atomicLoad(u32, &state.shutdown_requested, .acquire) != 0) break;
+
+                // Worker and merger are handled by the outer loop
+                if (std.mem.eql(u8, step.role, "worker")) continue;
+                if (std.mem.eql(u8, step.role, "merger")) continue;
+
+                // Periodic steps: skip if not this cycle
+                if (!workflow_mod.Workflow.shouldRunStep(&step, merge_cycle)) {
+                    logger.info("[daemon] skipping {s} (cycle {d}, every {d})", .{ step.role, merge_cycle, step.every });
+                    continue;
+                }
+
+                // Conditional steps
+                if (std.mem.eql(u8, step.condition, "tool_errors")) {
+                    if (@atomicLoad(u32, &state.sre_trigger_count, .acquire) == 0) continue;
+                    drainSreTriggers(cfg, paths, store, logger, io, allocator, &state);
+                    continue;
+                }
+
+                // Write task trends before strategist
+                if (std.mem.eql(u8, step.role, "strategist")) {
+                    writeTaskTrends(cfg, paths, store, logger, allocator);
+                }
+
+                // Resolve role config — try roles dir, fall back to hardcoded defaults
+                const role_cfg = roles.get(step.role) orelse role_mod.RoleConfig{ .name = step.role };
+
+                // Build context from role's declared sources
+                const sources = role_mod.resolveContextSources(role_cfg, allocator);
+                const step_ctx = if (sources.len > 0)
+                    ctx.build(store, paths, sources, extras, allocator)
+                else
+                    null;
+                defer if (step_ctx) |sc| allocator.free(sc);
+
+                // Map role name to session type
+                const session_type = mapRoleToSessionType(step.role) orelse {
+                    logger.warn("[daemon] unknown role '{s}', skipping", .{step.role});
+                    continue;
                 };
-            } else {
-                logger.info("[daemon] skipping strategist (cycle {d}, interval {d})", .{ merge_cycle, cfg.strategist.cycle_interval });
+
+                // Run through generic executor
+                executor.runRole(
+                    role_cfg, session_type, step.role,
+                    paths, store, logger, io, allocator,
+                    step_ctx, false, cfg.default_backend,
+                ) catch |e| {
+                    logger.err("[daemon] {s} failed: {}", .{ step.role, e });
+                };
             }
 
-            // Check for tool-error-triggered SRE
+            // Drain any remaining SRE triggers not handled by workflow
             drainSreTriggers(cfg, paths, store, logger, io, allocator, &state);
 
             // Cooldown
@@ -459,14 +489,44 @@ fn runStrategistWithPrep(
     prepareForStrategist(cfg, paths, logger, io, allocator);
     writeTaskTrends(cfg, paths, store, logger, allocator);
 
-    const context = ctx.build(store, paths, &.{
-        .user_profiles, .operator_feedback, .report_user, .report_qa, .report_sre, .task_trends,
-    }, .{}, allocator);
+    // Load role config for strategist
+    const roles = role_mod.loadRoles(paths, allocator) catch return;
+    const role_cfg = roles.get("strategist") orelse role_mod.RoleConfig{
+        .name = "strategist",
+        .model = "opus",
+        .fallback_model = "sonnet",
+        .stores_report = true,
+    };
+    const sources = role_mod.resolveContextSources(role_cfg, allocator);
+    const context = if (sources.len > 0)
+        ctx.build(store, paths, sources, .{}, allocator)
+    else
+        ctx.build(store, paths, &.{
+            .user_profiles, .operator_feedback, .report_user, .report_qa, .report_sre, .task_trends,
+        }, .{}, allocator);
     defer if (context) |cc| allocator.free(cc);
 
-    strategist_mod.runStrategist(cfg, paths, store, logger, io, allocator, false, context) catch |e| {
+    executor.runRole(
+        role_cfg, .strategist, "strategist",
+        paths, store, logger, io, allocator,
+        context, false, cfg.default_backend,
+    ) catch |e| {
         logger.err("[daemon] strategist failed: {}", .{e});
     };
+}
+
+/// Map a role name string to the corresponding SessionType enum.
+fn mapRoleToSessionType(name: []const u8) ?types.SessionType {
+    if (std.mem.eql(u8, name, "worker")) return .worker;
+    if (std.mem.eql(u8, name, "merger")) return .merger;
+    if (std.mem.eql(u8, name, "review")) return .review;
+    if (std.mem.eql(u8, name, "conflict")) return .conflict;
+    if (std.mem.eql(u8, name, "fix")) return .fix;
+    if (std.mem.eql(u8, name, "sre")) return .sre;
+    if (std.mem.eql(u8, name, "strategist")) return .strategist;
+    if (std.mem.eql(u8, name, "qa")) return .qa;
+    if (std.mem.eql(u8, name, "user")) return .user;
+    return null; // Unknown role — custom roles get .user type by default
 }
 
 fn writeTaskTrends(
