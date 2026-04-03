@@ -11,8 +11,9 @@ Bees is a generic, project-agnostic orchestration system that runs multiple auto
 - Using Zig 0.16.0-dev.2682+02142a54d (installed at /opt/zig, symlinked to /usr/local/bin/zig)
 - Target Zig 1.0 when it lands (expected 2026)
 - LMDB via vendored C source (`@cImport("lmdb.h")`) — zero-copy reads via mmap
+- SQLite via vendored amalgamation (`vendor/sqlite/sqlite3.c`) — queryable read replica
+- DuckDB via runtime `dlopen("libduckdb.so")` — analytical queries, optional dependency
 - Config via `std.json` (stdlib, zero dependencies)
-- No third-party Zig package dependencies in MVP
 
 ### AI Agent Transport: Claude CLI
 
@@ -29,12 +30,20 @@ Bees is a generic, project-agnostic orchestration system that runs multiple auto
 - `bees` auto-detects project by walking up from CWD looking for `.bees/config.json`
 - `--config <path>` overrides auto-detection
 - `bees init` uses Claude to analyze the project and generate config
-- Database: LMDB at `<project>/.bees/db/` — 7 sub-databases with bit-packed records
-- All Claude CLI stream-json events stored with 4-byte packed headers + raw JSON in LMDB
-- Reports stored in LMDB `meta` sub-database (report:qa, report:sre, report:trends)
 - Dead letter queue at `<project>/.bees/db/dead-letters.bin` for failed LMDB writes
 - Prompt templates: external files in `<project>/.bees/prompts/` — loaded at runtime, editable without recompiling
-- LMDB is single source of truth for tasks (synced from tasks.json)
+
+### Database: LMDB + SQLite + DuckDB
+
+Three embedded databases — KV, relational, and OLAP. Use whichever fits the access pattern:
+
+- **LMDB** (KV) — `<project>/.bees/db/data.mdb`. Fast key-value access, zero-copy mmap reads, bit-packed records.
+- **SQLite** (relational) — `<project>/.bees/db/data.sqlite`. SQL queries, joins, WAL concurrent reads.
+- **DuckDB** (OLAP) — `<project>/.bees/db/data.duckdb`. Columnar compression, aggregations, window functions. Runtime-loaded via `libduckdb.so`. Can ATTACH SQLite files directly.
+
+Schema is defined once in `src/db/schema.zig` (comptime) and generates DDL + bind functions for all databases.
+
+**Key files:** `src/store.zig` (LMDB), `src/db/sqlite.zig`, `src/db/duckdb.zig`, `src/db/schema.zig`, `src/db/sync.zig`
 
 ### Scheduling & Interface
 
@@ -51,9 +60,8 @@ Bees is a generic, project-agnostic orchestration system that runs multiple auto
 - **SRE agent**: Monitors system health, adjusts task weights, cleans up resources
 - **Strategist**: Product visionary — maintains evolving VISION, writes ambitious tasks to tasks.json, uses Chrome MCP for visual review
 - **QA agent**: Diff-aware visual/functional verification after every merge cycle
-- Coordination via LMDB as single source of truth + filesystem markers for worktrees
-- All sessions captured with full event streams in LMDB
-- Reports (QA, SRE, task trends) stored in LMDB meta, not disk files
+- Coordination via trifecta database architecture (LMDB, SQLite, DuckDB — see Data & Config)
+- All sessions and events captured and queryable across the database tier
 - REST API server for dashboard integration
 
 ## Memory Model & Data Structure Rules
@@ -109,5 +117,5 @@ Bees is a generic, project-agnostic orchestration system that runs multiple auto
 - Generic tool: build/test/deploy commands are configurable per-project in config.json
 - Worktrees managed by bees (not Claude CLI's --worktree flag) for full control over naming, state, and cleanup
 - QA agent runs after every merge cycle (not periodic like strategist)
-- Strategist receives QA report and task trends injected from LMDB into prompt
-- No reports written to disk — all report data stored in LMDB
+- Strategist receives QA report and task trends derived from the database tier
+- No reports written to disk — derived on demand via queries

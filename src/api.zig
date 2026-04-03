@@ -8,6 +8,8 @@ const fs = @import("fs.zig");
 const git = @import("git.zig");
 const claude = @import("claude.zig");
 const tasks_mod = @import("tasks.zig");
+const sqlite = @import("db/sqlite.zig");
+const query = @import("db/query.zig");
 
 /// Entry point for the API server thread. Never returns unless fatal error.
 pub fn startApiServer(
@@ -33,6 +35,10 @@ fn runServer(
     allocator: std.mem.Allocator,
     port: u16,
 ) !void {
+    // Open a read-only SQLite connection for API queries
+    const sqlite_path = std.fs.path.join(allocator, &.{ paths.db_dir, "data.sqlite" }) catch
+        return error.SqliteError;
+    var sql_db = sqlite.Db.openReadOnly(sqlite_path) catch null;
     // Bind to localhost only — the dashboard proxies via Next.js API routes.
     // Use 0.0.0.0 only if explicitly configured (e.g., behind a reverse proxy with auth).
     const bind_addr = if (cfg.api.bind_address.len > 0) cfg.api.bind_address else "127.0.0.1";
@@ -47,7 +53,7 @@ fn runServer(
             continue;
         };
 
-        handleConnection(stream, store, cfg, paths, logger, io, allocator);
+        handleConnection(stream, store, cfg, paths, logger, io, allocator, &sql_db);
         stream.close(io);
     }
 }
@@ -60,8 +66,9 @@ fn handleConnection(
     logger: *log_mod.Logger,
     io: Io,
     allocator: std.mem.Allocator,
+    sql_db: *?sqlite.Db,
 ) void {
-    handleConnectionInner(stream, store, cfg, paths, logger, io, allocator) catch {};
+    handleConnectionInner(stream, store, cfg, paths, logger, io, allocator, sql_db) catch {};
 }
 
 fn handleConnectionInner(
@@ -72,6 +79,7 @@ fn handleConnectionInner(
     logger: *log_mod.Logger,
     io: Io,
     allocator: std.mem.Allocator,
+    sql_db: *?sqlite.Db,
 ) !void {
     // Read request via the underlying net stream directly, bypassing the
     // buffered Reader. This does a single recv() and returns immediately
@@ -125,7 +133,7 @@ fn handleConnectionInner(
     var net_writer = stream.writer(io, &write_buf);
     const w = &net_writer.interface;
 
-    route(w, method, path, body, store, cfg, paths, logger, io, allocator) catch {
+    route(w, method, path, body, store, cfg, paths, logger, io, allocator, sql_db) catch {
         writeResponse(w, 500, "application/json", "{\"error\":\"Internal server error\"}") catch {};
     };
 
@@ -143,15 +151,16 @@ fn route(
     _: *log_mod.Logger,
     io: Io,
     allocator: std.mem.Allocator,
+    sql_db: *?sqlite.Db,
 ) !void {
     if (std.mem.eql(u8, method, "GET")) {
-        if (std.mem.eql(u8, path, "/api/status")) return handleStatus(w, store, cfg, paths);
-        if (std.mem.eql(u8, path, "/api/sessions")) return handleSessions(w, store, null);
-        if (std.mem.eql(u8, path, "/api/tasks")) return handleTasks(w, store);
+        if (std.mem.eql(u8, path, "/api/status")) return handleStatus(w, store, cfg, paths, sql_db);
+        if (std.mem.eql(u8, path, "/api/sessions")) return handleSessions(w, store, null, sql_db);
+        if (std.mem.eql(u8, path, "/api/tasks")) return handleTasks(w, store, sql_db);
         if (std.mem.eql(u8, path, "/api/config")) return handleConfig(w, paths);
         if (std.mem.eql(u8, path, "/api/log")) return handleLog(w, paths, allocator);
-        if (std.mem.eql(u8, path, "/api/workers")) return handleSessions(w, store, .worker);
-        if (std.mem.eql(u8, path, "/api/analytics")) return handleSessions(w, store, null);
+        if (std.mem.eql(u8, path, "/api/workers")) return handleSessions(w, store, .worker, sql_db);
+        if (std.mem.eql(u8, path, "/api/analytics")) return handleSessions(w, store, null, sql_db);
         if (std.mem.eql(u8, path, "/api/branches")) return handleBranches(w, paths, io, allocator);
         if (std.mem.eql(u8, path, "/api/vision")) return handleVisionGet(w, store);
         if (std.mem.startsWith(u8, path, "/api/reports/")) return handleReportGet(w, store, path);
@@ -162,11 +171,11 @@ fn route(
                 const id_str = rest[0 .. rest.len - 5];
                 const id = std.fmt.parseInt(u64, id_str, 10) catch
                     return writeResponse(w, 400, "application/json", "{\"error\":\"Invalid session ID\"}");
-                return handleSessionDiff(w, store, paths, cfg, io, allocator, id);
+                return handleSessionDiff(w, store, paths, cfg, io, allocator, id, sql_db);
             }
             const id = std.fmt.parseInt(u64, rest, 10) catch
                 return writeResponse(w, 400, "application/json", "{\"error\":\"Invalid session ID\"}");
-            return handleSession(w, store, id);
+            return handleSession(w, store, id, sql_db);
         }
 
         return writeResponse(w, 404, "application/json", "{\"error\":\"Not found\"}");
@@ -190,43 +199,73 @@ fn route(
 
 // === Endpoint handlers ===
 
-fn handleStatus(w: *Io.Writer, store: *store_mod.Store, cfg: config_mod.Config, paths: config_mod.ProjectPaths) !void {
-    const txn = try store.beginReadTxn();
-    defer store_mod.Store.abortTxn(txn);
-
+fn handleStatus(w: *Io.Writer, store: *store_mod.Store, cfg: config_mod.Config, paths: config_mod.ProjectPaths, sql_db: *?sqlite.Db) !void {
     const now = fs.timestamp();
     const day_start = now - @mod(now, 86400);
+
+    // Try SQLite first, fall back to LMDB
+    if (sql_db.*) |*db| {
+        const stats = query.getDailyStats(db, day_start) catch query.DailyStats{};
+        try writeResponseHeader(w, 200, "application/json");
+        try w.print("{{\"status\":{{\"project\":", .{});
+        try writeJsonStr(w, cfg.project.name);
+        try w.print(",\"path\":", .{});
+        try writeJsonStr(w, paths.root);
+        try w.print(",\"workers\":{d},\"today\":{{\"total\":{d},\"accepted\":{d},\"rejected\":{d},\"conflicts\":{d},\"build_failures\":{d},\"cost_cents\":{d}}}}},\"sessions\":", .{
+            cfg.workers.count, stats.total, stats.accepted, stats.rejected,
+            stats.conflicts, stats.build_failures, stats.total_cost_cents,
+        });
+        try query.writeSessionsJson(db, w, null, 100);
+        try w.writeAll("}}");
+        return;
+    }
+
+    // LMDB fallback
+    const txn = try store.beginReadTxn();
+    defer store_mod.Store.abortTxn(txn);
     const stats = try store.getDailyStats(txn, day_start);
-
     try writeResponseHeader(w, 200, "application/json");
-
     try w.print("{{\"status\":{{\"project\":", .{});
     try writeJsonStr(w, cfg.project.name);
     try w.print(",\"path\":", .{});
     try writeJsonStr(w, paths.root);
     try w.print(",\"workers\":{d},\"today\":{{\"total\":{d},\"accepted\":{d},\"rejected\":{d},\"conflicts\":{d},\"build_failures\":{d},\"cost_cents\":{d}}}}},\"sessions\":", .{
-        cfg.workers.count,
-        stats.total,
-        stats.accepted,
-        stats.rejected,
-        stats.conflicts,
-        stats.build_failures,
-        stats.total_cost_cents,
+        cfg.workers.count, stats.total, stats.accepted, stats.rejected,
+        stats.conflicts, stats.build_failures, stats.total_cost_cents,
     });
-
     try writeSessionsArray(w, store, txn, null);
-    try w.print("}}", .{});
+    try w.writeAll("}}");
 }
 
-fn handleSessions(w: *Io.Writer, store: *store_mod.Store, type_filter: ?types.SessionType) !void {
+fn handleSessions(w: *Io.Writer, store: *store_mod.Store, type_filter: ?types.SessionType, sql_db: *?sqlite.Db) !void {
+    if (sql_db.*) |*db| {
+        try writeResponseHeader(w, 200, "application/json");
+        try query.writeSessionsJson(db, w, type_filter, 200);
+        return;
+    }
+    // LMDB fallback
     const txn = try store.beginReadTxn();
     defer store_mod.Store.abortTxn(txn);
-
     try writeResponseHeader(w, 200, "application/json");
     try writeSessionsArray(w, store, txn, type_filter);
 }
 
-fn handleSession(w: *Io.Writer, store: *store_mod.Store, id: u64) !void {
+fn handleSession(w: *Io.Writer, store: *store_mod.Store, id: u64, sql_db: *?sqlite.Db) !void {
+    if (sql_db.*) |*db| {
+        // Check existence before committing to response header
+        var exists_stmt = db.prepare("SELECT 1 FROM sessions WHERE id = ?\x00") catch
+            return writeResponse(w, 500, "application/json", "{\"error\":\"Query failed\"}");
+        defer exists_stmt.finalize();
+        sqlite.bindInt(exists_stmt.handle, 1, @intCast(id));
+        const exists = exists_stmt.step() catch false;
+        if (!exists) return writeResponse(w, 404, "application/json", "{\"error\":\"Session not found\"}");
+
+        try writeResponseHeader(w, 200, "application/json");
+        _ = query.writeSessionJson(db, w, id) catch {};
+        return;
+    }
+
+    // LMDB fallback
     const txn = try store.beginReadTxn();
     defer store_mod.Store.abortTxn(txn);
 
@@ -298,44 +337,6 @@ fn handleSession(w: *Io.Writer, store: *store_mod.Store, id: u64) !void {
         try w.print(",\"raw\":", .{});
         try w.writeAll(ev.raw_json);
 
-        // Extract text preview
-        {
-            const text_preview: ?[]const u8 = blk: {
-                if (ev.header.role == .assistant) {
-                    break :blk claude.findJsonStringValue(ev.raw_json, "\"text\"");
-                }
-                if (ev.header.event_type == .tool_result) {
-                    if (claude.findJsonStringValue(ev.raw_json, "\"content\"")) |c_val| {
-                        if (!std.mem.eql(u8, c_val, "tool_result") and !std.mem.eql(u8, c_val, "text")) {
-                            break :blk c_val;
-                        }
-                    }
-                    break :blk claude.findJsonStringValue(ev.raw_json, "\"text\"");
-                }
-                break :blk null;
-            };
-            if (text_preview) |text| {
-                const max_len: usize = 200;
-                const preview = if (text.len > max_len) text[0..max_len] else text;
-                try w.print(",\"message\":\"", .{});
-                for (preview) |ch| {
-                    switch (ch) {
-                        '"' => try w.writeAll("\\\""),
-                        '\\' => try w.writeAll("\\\\"),
-                        '\n' => try w.writeAll(" "),
-                        '\r' => {},
-                        '\t' => try w.writeAll(" "),
-                        else => {
-                            if (ch >= 0x20) {
-                                try w.print("{c}", .{ch});
-                            }
-                        },
-                    }
-                }
-                try w.print("\"", .{});
-            }
-        }
-
         try w.print("}}", .{});
     }
 
@@ -350,17 +351,24 @@ fn handleSessionDiff(
     io: Io,
     allocator: std.mem.Allocator,
     id: u64,
+    sql_db: *?sqlite.Db,
 ) !void {
-    const txn = try store.beginReadTxn();
-    const session = (try store.getSession(txn, id)) orelse {
-        store_mod.Store.abortTxn(txn);
-        return writeResponse(w, 404, "application/json", "{\"error\":\"Session not found\"}");
-    };
     var branch_buf: [256]u8 = undefined;
-    const branch_len = @min(session.branch.len, branch_buf.len);
-    @memcpy(branch_buf[0..branch_len], session.branch[0..branch_len]);
-    const branch = branch_buf[0..branch_len];
-    store_mod.Store.abortTxn(txn);
+    var branch: []const u8 = "";
+
+    if (sql_db.*) |*db| {
+        branch = query.getSessionBranch(db, id, &branch_buf) catch "";
+    } else {
+        const txn = try store.beginReadTxn();
+        const session = (try store.getSession(txn, id)) orelse {
+            store_mod.Store.abortTxn(txn);
+            return writeResponse(w, 404, "application/json", "{\"error\":\"Session not found\"}");
+        };
+        const len = @min(session.branch.len, branch_buf.len);
+        @memcpy(branch_buf[0..len], session.branch[0..len]);
+        branch = branch_buf[0..len];
+        store_mod.Store.abortTxn(txn);
+    }
 
     if (branch.len == 0) {
         return writeResponse(w, 200, "application/json", "{\"diff\":\"\",\"files_changed\":0}");
@@ -384,7 +392,13 @@ fn handleSessionDiff(
     try w.print(",\"files_changed\":{d}}}", .{files_changed});
 }
 
-fn handleTasks(w: *Io.Writer, store: *store_mod.Store) !void {
+fn handleTasks(w: *Io.Writer, store: *store_mod.Store, sql_db: *?sqlite.Db) !void {
+    if (sql_db.*) |*db| {
+        try writeResponseHeader(w, 200, "application/json");
+        try query.writeTasksJson(db, w);
+        return;
+    }
+    // LMDB fallback
     const txn = try store.beginReadTxn();
     defer store_mod.Store.abortTxn(txn);
 

@@ -20,6 +20,8 @@ const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 const ctx_mod = @import("context.zig");
 const roles_default = @import("roles_default.zig");
+const sqlite = @import("db/sqlite.zig");
+const db_query = @import("db/query.zig");
 
 pub const version = "0.1.0";
 
@@ -665,19 +667,35 @@ fn cmdStatus(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
     const cfg = project[0];
     const paths = project[1];
 
-    const db_path = paths.db_dir;
-    var store = store_mod.Store.open(db_path) catch {
-        try stdout.print("No database found. Run `bees run worker` first.\n", .{});
-        return;
-    };
-    defer store.close();
-
-    const txn = try store.beginReadTxn();
-    defer store_mod.Store.abortTxn(txn);
-
     const now: u64 = fs.timestamp();
     const day_start = now - @mod(now, 86400);
-    const stats = try store.getDailyStats(txn, day_start);
+
+    // Try SQLite first
+    const sqlite_path = try std.fs.path.join(arena, &.{ paths.db_dir, "data.sqlite" });
+    var sql_db = sqlite.Db.openReadOnly(sqlite_path) catch null;
+    defer if (sql_db) |*db| db.close();
+
+    var stats = db_query.DailyStats{};
+    if (sql_db) |*db| {
+        stats = db_query.getDailyStats(db, day_start) catch db_query.DailyStats{};
+    } else {
+        var store = store_mod.Store.open(paths.db_dir) catch {
+            try stdout.print("No database found. Run `bees run worker` first.\n", .{});
+            return;
+        };
+        defer store.close();
+        const txn = try store.beginReadTxn();
+        defer store_mod.Store.abortTxn(txn);
+        const lmdb_stats = try store.getDailyStats(txn, day_start);
+        stats = .{
+            .total = lmdb_stats.total,
+            .accepted = lmdb_stats.accepted,
+            .rejected = lmdb_stats.rejected,
+            .conflicts = lmdb_stats.conflicts,
+            .build_failures = lmdb_stats.build_failures,
+            .total_cost_cents = lmdb_stats.total_cost_cents,
+        };
+    }
 
     if (json) {
         try stdout.print("{{\"project\":", .{});
@@ -1053,9 +1071,6 @@ fn cmdTasksSync(arena: std.mem.Allocator, stdout: *Io.Writer, file: ?[]const u8)
     const tasks_path = file orelse paths.tasks_file;
     try tasks_mod.syncFromFile(&store, tasks_path, arena);
 
-    // Backfill session meta for dashboard direct reads
-    store.backfillSessionMeta() catch {};
-
     // Clean up any stale running sessions
     const cleaned = store.cleanupStaleSessions();
     if (cleaned > 0) {
@@ -1069,8 +1084,21 @@ fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?type
     const project = try loadProject(arena);
     const paths = project[1];
 
-    const db_path = paths.db_dir;
-    var store = store_mod.Store.open(db_path) catch {
+    // Try SQLite first for JSON output
+    if (json) {
+        const sqlite_path = try std.fs.path.join(arena, &.{ paths.db_dir, "data.sqlite" });
+        var sql_db = sqlite.Db.openReadOnly(sqlite_path) catch null;
+        defer if (sql_db) |*db| db.close();
+
+        if (sql_db) |*db| {
+            try db_query.writeSessionsJson(db, stdout, session_type, 50);
+            try stdout.print("\n", .{});
+            return;
+        }
+    }
+
+    // LMDB fallback (or text mode which needs custom formatting)
+    var store = store_mod.Store.open(paths.db_dir) catch {
         try stdout.print("No database found\n", .{});
         return;
     };
@@ -1357,4 +1385,9 @@ comptime {
     _ = @import("api.zig");
     _ = qa_mod;
     _ = @import("dlq.zig");
+    _ = @import("db/schema.zig");
+    _ = @import("db/sqlite.zig");
+    _ = @import("db/sync.zig");
+    _ = @import("db/duckdb.zig");
+    _ = @import("db/query.zig");
 }

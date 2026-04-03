@@ -191,7 +191,7 @@ pub fn run(
             prepareForStrategist(cfg, paths, logger, io, allocator);
 
             // Precompute shared context values
-            const worker_summary = ctx.buildWorkerSummary(store, allocator);
+            const worker_summary = ctx.buildWorkerSummary(store, null, allocator);
             defer if (worker_summary) |ws| allocator.free(ws);
             const extras = ctx.Extras{ .changed_files = changed_files, .worker_summary = worker_summary };
 

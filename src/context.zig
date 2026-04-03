@@ -19,6 +19,8 @@ const store_mod = @import("store.zig");
 const config_mod = @import("config.zig");
 const types = @import("types.zig");
 const fs = @import("fs.zig");
+const sqlite = @import("db/sqlite.zig");
+const db_query = @import("db/query.zig");
 
 pub const Source = enum {
     user_profiles,
@@ -41,7 +43,7 @@ pub const Extras = struct {
 };
 
 /// Build a context string from the requested sources.
-/// Opens one LMDB read transaction for all DB-backed sources.
+/// Uses SQLite if available, falls back to LMDB read transaction.
 pub fn build(
     store: *store_mod.Store,
     paths: config_mod.ProjectPaths,
@@ -90,7 +92,13 @@ pub fn build(
 
 /// Build a summary of recent worker sessions for downstream agents.
 /// Returns lines like: "- Task: 'Fix auth bug' — 2 commits, merged ($0.45)"
-pub fn buildWorkerSummary(store: *store_mod.Store, allocator: std.mem.Allocator) ?[]const u8 {
+pub fn buildWorkerSummary(store: *store_mod.Store, sql_db: ?*sqlite.Db, allocator: std.mem.Allocator) ?[]const u8 {
+    // Try SQLite first
+    if (sql_db) |db| {
+        if (db_query.buildWorkerSummary(db, allocator)) |summary| return summary;
+    }
+
+    // LMDB fallback
     const txn = store.beginReadTxn() catch return null;
     defer store_mod.Store.abortTxn(txn);
 
@@ -126,7 +134,13 @@ pub fn buildWorkerSummary(store: *store_mod.Store, allocator: std.mem.Allocator)
 }
 
 /// Look up a worker session's task name for review context.
-pub fn getTaskContext(store: *store_mod.Store, worker_session_id: u64, allocator: std.mem.Allocator) ?[]const u8 {
+pub fn getTaskContext(store: *store_mod.Store, sql_db: ?*sqlite.Db, worker_session_id: u64, allocator: std.mem.Allocator) ?[]const u8 {
+    // Try SQLite first
+    if (sql_db) |db| {
+        if (db_query.getTaskContext(db, worker_session_id, allocator)) |ctx| return ctx;
+    }
+
+    // LMDB fallback
     const txn = store.beginReadTxn() catch return null;
     defer store_mod.Store.abortTxn(txn);
     const ws = (store.getSession(txn, worker_session_id) catch return null) orelse return null;

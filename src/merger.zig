@@ -238,7 +238,7 @@ fn reviewAndMerge(
 
     // Look up what task the worker was working on
     const task_context = if (candidate.worker_session_id) |wsid|
-        ctx_mod.getTaskContext(store, wsid, allocator) orelse ""
+        ctx_mod.getTaskContext(store, null, wsid, allocator) orelse ""
     else
         "";
     defer if (task_context.len > 0) allocator.free(task_context);
