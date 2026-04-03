@@ -7,11 +7,13 @@ const merger = @import("merger.zig");
 const sre_mod = @import("sre.zig");
 const strategist_mod = @import("strategist.zig");
 const qa_mod = @import("qa.zig");
+const user_mod = @import("user.zig");
 const tasks_mod = @import("tasks.zig");
 const git = @import("git.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 const types = @import("types.zig");
+const ctx = @import("context.zig");
 const MAX_WORKERS = 32;
 
 const backend = @import("backend.zig");
@@ -21,11 +23,33 @@ const DaemonState = struct {
     done_count: u32 = 0,
     active_count: u32 = 0,
     next_worker_id: u32 = 1,
+    /// Set to 1 by signal handler to request graceful shutdown.
+    shutdown_requested: u32 = 0,
     /// Session IDs that completed with tool errors above threshold.
     /// Workers write here; main loop reads and drains.
     sre_trigger_sessions: [64]u64 = [_]u64{0} ** 64,
     sre_trigger_count: u32 = 0,
 };
+
+/// Global pointer for signal handler (signals can't capture context).
+var g_daemon_state: ?*DaemonState = null;
+
+fn signalHandler(_: std.posix.SIG) callconv(.c) void {
+    if (g_daemon_state) |state| {
+        @atomicStore(u32, &state.shutdown_requested, 1, .release);
+    }
+}
+
+fn installSignalHandlers(state: *DaemonState) void {
+    g_daemon_state = state;
+    const act = std.posix.Sigaction{
+        .handler = .{ .handler = signalHandler },
+        .mask = .{0} ** @typeInfo(std.posix.sigset_t).array.len,
+        .flags = @bitCast(@as(u32, std.c.SA.RESTART)),
+    };
+    std.posix.sigaction(std.c.SIG.TERM, &act, null);
+    std.posix.sigaction(std.c.SIG.INT, &act, null);
+}
 
 /// I/O-cooperative sleep — yields to the event loop so other green threads
 /// (API server, workers, SRE) keep making progress.
@@ -70,6 +94,7 @@ pub fn run(
     });
 
     var state = DaemonState{};
+    installSignalHandlers(&state);
 
     // Mark any stale "running" sessions as "error" from previous daemon crash
     cleanupStaleSessions(store, logger);
@@ -116,8 +141,11 @@ pub fn run(
 
     // Main loop — polls via cooperative sleep
     var was_quiet = false;
-    while (true) {
+    while (@atomicLoad(u32, &state.shutdown_requested, .acquire) == 0) {
         sleep_secs(io, 10);
+
+        // Graceful shutdown: stop spawning, wait for running workers to drain
+        if (@atomicLoad(u32, &state.shutdown_requested, .acquire) != 0) break;
 
         // Quiet hours — let running workers finish but don't start new work
         if (isQuietHour(cfg.daemon)) {
@@ -162,10 +190,25 @@ pub fn run(
             // Build + restart once (serves both QA and strategist)
             prepareForStrategist(cfg, paths, logger, io, allocator);
 
-            // QA runs every merge cycle
+            // Build worker summary once — shared by QA, user agent, and strategist
+            const worker_summary = ctx.buildWorkerSummary(store, allocator);
+            defer if (worker_summary) |ws| allocator.free(ws);
+            const extras = ctx.Extras{ .changed_files = changed_files, .worker_summary = worker_summary };
+
+            // QA: validates features work + evaluates through user lens
             logger.info("[daemon] running QA agent", .{});
-            qa_mod.runQa(cfg, paths, store, logger, io, allocator, changed_files, false) catch |e| {
+            const qa_ctx = ctx.build(store, paths, &.{ .user_profiles, .changed_files, .worker_summary }, extras, allocator);
+            defer if (qa_ctx) |qc| allocator.free(qc);
+            qa_mod.runQa(cfg, paths, store, logger, io, allocator, qa_ctx, false) catch |e| {
                 logger.err("[daemon] QA failed: {}", .{e});
+            };
+
+            // User agent: simulated persona engagement via browser/devtools
+            logger.info("[daemon] running user engagement agent", .{});
+            const user_ctx = ctx.build(store, paths, &.{ .user_profiles, .worker_summary }, extras, allocator);
+            defer if (user_ctx) |uc| allocator.free(uc);
+            user_mod.runUser(cfg, paths, store, logger, io, allocator, user_ctx, false) catch |e| {
+                logger.err("[daemon] user agent failed: {}", .{e});
             };
 
             // Run strategist every N merge cycles
@@ -173,9 +216,11 @@ pub fn run(
             if (cfg.strategist.cycle_interval == 0 or merge_cycle % cfg.strategist.cycle_interval == 0) {
                 logger.info("[daemon] running strategist (cycle {d})", .{merge_cycle});
                 writeTaskTrends(cfg, paths, store, logger, allocator);
-                const ctx = buildStrategistContext(store, allocator);
-                defer if (ctx) |c| allocator.free(c);
-                strategist_mod.runStrategist(cfg, paths, store, logger, io, allocator, false, ctx) catch |e| {
+                const strat_ctx = ctx.build(store, paths, &.{
+                    .user_profiles, .operator_feedback, .report_user, .report_qa, .report_sre, .task_trends,
+                }, .{}, allocator);
+                defer if (strat_ctx) |sc| allocator.free(sc);
+                strategist_mod.runStrategist(cfg, paths, store, logger, io, allocator, false, strat_ctx) catch |e| {
                     logger.err("[daemon] strategist failed: {}", .{e});
                 };
             } else {
@@ -216,6 +261,23 @@ pub fn run(
             }
         }
     }
+
+    // Graceful shutdown: wait for running workers to finish
+    logger.info("[daemon] shutdown requested, waiting for {d} active workers to finish...", .{
+        @atomicLoad(u32, &state.active_count, .acquire),
+    });
+    var shutdown_wait: u32 = 0;
+    const shutdown_timeout: u32 = 300; // 5 minutes max wait
+    while (@atomicLoad(u32, &state.active_count, .acquire) > 0 and shutdown_wait < shutdown_timeout) {
+        sleep_secs(io, 5);
+        shutdown_wait += 5;
+    }
+    if (@atomicLoad(u32, &state.active_count, .acquire) > 0) {
+        logger.warn("[daemon] shutdown timeout, {d} workers still active", .{
+            @atomicLoad(u32, &state.active_count, .acquire),
+        });
+    }
+    logger.info("[daemon] shutdown complete", .{});
 }
 
 /// Spawn a single worker as an async green thread.
@@ -397,38 +459,14 @@ fn runStrategistWithPrep(
     prepareForStrategist(cfg, paths, logger, io, allocator);
     writeTaskTrends(cfg, paths, store, logger, allocator);
 
-    const context = buildStrategistContext(store, allocator);
-    defer if (context) |c| allocator.free(c);
+    const context = ctx.build(store, paths, &.{
+        .user_profiles, .operator_feedback, .report_user, .report_qa, .report_sre, .task_trends,
+    }, .{}, allocator);
+    defer if (context) |cc| allocator.free(cc);
 
     strategist_mod.runStrategist(cfg, paths, store, logger, io, allocator, false, context) catch |e| {
         logger.err("[daemon] strategist failed: {}", .{e});
     };
-}
-
-fn buildStrategistContext(store: *store_mod.Store, allocator: std.mem.Allocator) ?[]const u8 {
-    const txn = store.beginReadTxn() catch return null;
-    defer store_mod.Store.abortTxn(txn);
-
-    const vision = store.getMeta(txn, "report:vision") catch null;
-    const qa_report = store.getMeta(txn, "report:qa") catch null;
-    const trends = store.getMeta(txn, "report:trends") catch null;
-
-    if (vision == null and qa_report == null and trends == null) return null;
-
-    var parts: std.ArrayList(u8) = .empty;
-    if (vision) |v| {
-        parts.appendSlice(allocator, "\n\n## Your Previous VISION\nThis is what you wrote last cycle. Update it at the end of your response.\n\n") catch return null;
-        parts.appendSlice(allocator, v) catch return null;
-    }
-    if (qa_report) |qr| {
-        parts.appendSlice(allocator, "\n\n## Latest QA Report\n") catch return null;
-        parts.appendSlice(allocator, qr) catch return null;
-    }
-    if (trends) |tr| {
-        parts.appendSlice(allocator, "\n\n") catch return null;
-        parts.appendSlice(allocator, tr) catch return null;
-    }
-    return parts.toOwnedSlice(allocator) catch null;
 }
 
 fn writeTaskTrends(

@@ -20,6 +20,12 @@ pub const ClaudeOptions = struct {
     max_turns: u32 = 0,
     stream_output: bool = false,
     db_dir: ?[]const u8 = null,
+    /// Disable session persistence (no ~/.claude/ transcript files).
+    no_session_persistence: bool = true,
+    /// Additional directories for CLAUDE.md discovery and tool access.
+    add_dirs: ?[]const []const u8 = null,
+    /// Fallback model when primary is overloaded (529). E.g., "sonnet" for opus sessions.
+    fallback_model: ?[]const u8 = null,
 };
 
 pub const SessionResult = struct {
@@ -36,6 +42,12 @@ pub const SessionResult = struct {
     cache_creation_tokens: u32 = 0,
     cache_read_tokens: u32 = 0,
     tool_errors: u16 = 0,
+    /// Result subtype: "success", "error_max_turns", "error_max_budget_usd", etc.
+    result_subtype: []const u8 = "",
+    /// API stop reason: "end_turn", "max_tokens"
+    stop_reason: []const u8 = "",
+    /// API-only duration (excludes tool execution wait)
+    duration_api_ms: u32 = 0,
 };
 
 pub fn spawnClaude(allocator: std.mem.Allocator, io: Io, options: ClaudeOptions) !std.process.Child {
@@ -95,24 +107,31 @@ pub fn spawnClaude(allocator: std.mem.Allocator, io: Io, options: ClaudeOptions)
         try args.append(allocator, apf);
     }
 
-    try args.append(allocator, options.prompt);
+    // Disable session persistence — headless workers don't need ~/.claude/ transcripts.
+    // Saves disk I/O and prevents bloat from thousands of sessions.
+    if (options.no_session_persistence) {
+        try args.append(allocator, "--no-session-persistence");
+    }
 
-    // Build filtered environment excluding CLAUDECODE to prevent
-    // "cannot launch inside another Claude Code session" errors
-    var env_map = std.process.Environ.Map.init(allocator);
-    defer env_map.deinit();
-    {
-        var i: usize = 0;
-        while (std.c.environ[i]) |entry| : (i += 1) {
-            const entry_str: [*:0]const u8 = @ptrCast(entry);
-            const entry_slice = std.mem.sliceTo(entry_str, 0);
-            const eq_pos = std.mem.indexOfScalar(u8, entry_slice, '=') orelse continue;
-            const key = entry_slice[0..eq_pos];
-            if (std.mem.eql(u8, key, "CLAUDECODE")) continue;
-            const value = entry_slice[eq_pos + 1 ..];
-            env_map.put(key, value) catch continue;
+    // Fallback model for 529 overload (e.g., opus → sonnet)
+    if (options.fallback_model) |fm| {
+        try args.append(allocator, "--fallback-model");
+        try args.append(allocator, fm);
+    }
+
+    // Additional directories for CLAUDE.md discovery and tool access
+    if (options.add_dirs) |dirs| {
+        for (dirs) |dir| {
+            try args.append(allocator, "--add-dir");
+            try args.append(allocator, dir);
         }
     }
+
+    try args.append(allocator, options.prompt);
+
+    const backend_mod = @import("backend.zig");
+    var env_map = backend_mod.buildFilteredEnvMap(allocator);
+    defer env_map.deinit();
 
     var child = try std.process.spawn(io, .{
         .argv = args.items,
@@ -166,7 +185,9 @@ pub fn parseEventMeta(line: []const u8) types.EventMeta {
             meta.num_turns = @intFromFloat(@min(turns, 255.0));
         }
         if (findJsonStringValue(line, "\"subtype\"")) |subtype| {
-            if (std.mem.eql(u8, subtype, "error")) {
+            // Subtypes: success, error_max_turns, error_max_budget_usd,
+            // error_during_execution, error_max_structured_output_retries
+            if (std.mem.startsWith(u8, subtype, "error")) {
                 meta.is_error = true;
             }
         }
@@ -326,6 +347,12 @@ pub fn runClaudeSession(
             if (line == null) break;
             const line_data = line.?;
             if (line_data.len == 0) continue;
+
+            // Guard: divert non-JSON lines to stderr
+            if (line_data[0] != '{') {
+                std.debug.print("[stdout-guard] {s}\n", .{line_data[0..@min(line_data.len, 200)]});
+                continue;
+            }
 
             // Make a copy since the reader buffer may be reused
             const line_copy = try allocator.dupe(u8, line_data);

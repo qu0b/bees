@@ -182,10 +182,13 @@ fn runWorkerImpl(
 
         const result = backend.runSession(store, io, .{
             .backend = bt,
-            .prompt = if (claude_session_id != null) "Continue your work from where you left off. Complete all remaining tasks." else task.prompt,
+            // On resume: CLI auto-continues interrupted turn via CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1.
+            // Just pass original prompt (used for session metadata); the resume flag handles continuation.
+            .prompt = task.prompt,
             .cwd = worktree_dir,
             .append_prompt_file = prompt_path,
             .model = cfg.workers.model,
+            .fallback_model = cfg.workers.fallback_model,
             .effort = cfg.workers.effort,
             .max_budget_usd = cfg.workers.max_budget_usd,
             .timeout_secs = effective_timeout,
@@ -228,9 +231,14 @@ fn runWorkerImpl(
     // Finish session
     const finish_time: u64 = fs.timestamp();
     const has_tokens = (result.input_tokens > 0 or result.output_tokens > 0);
+    const rs = types.ResultSubtype.fromString(result.result_subtype);
+    const sr = types.StopReason.fromString(result.stop_reason);
+    const has_detail = rs != .unknown or sr != .unknown or result.duration_api_ms > 0;
     const new_header = types.SessionHeader{
         .@"type" = .worker,
-        .status = if (result.is_error and result.exit_code != 124) .err else .done,
+        // Mark as done (not error) for: timeout restarts, max_turns, max_budget
+        .status = if (result.is_error and result.exit_code != 124 and
+            rs != .error_max_turns and rs != .error_max_budget) .err else .done,
         .has_exit_code = true,
         .has_cost = true,
         .model = model,
@@ -238,6 +246,7 @@ fn runWorkerImpl(
         .has_duration = true,
         .has_diff_summary = false,
         .backend = bt,
+        .has_result_detail = has_detail,
         .worker_id = @truncate(worker_id),
         .commit_count = @intCast(@min(commits, 255)),
         .num_turns = result.num_turns,
@@ -250,6 +259,9 @@ fn runWorkerImpl(
         .output_tokens = result.output_tokens,
         .cache_creation_tokens = result.cache_creation_tokens,
         .cache_read_tokens = result.cache_read_tokens,
+        .result_subtype = rs,
+        .stop_reason = sr,
+        .duration_api_ms = result.duration_api_ms,
     };
 
     store.updateSessionStatus(session_id, .running, @truncate(now), new_header) catch |e| {
@@ -285,20 +297,18 @@ fn runWorkerImpl(
         }
     }
 
-    if (result.tool_errors > 0) {
-        logger.info("[worker:{d}] done task=\"{s}\" commits={d} cost=${d:.2} tool_errors={d}", .{
+    {
+        const subtype = if (result.result_subtype.len > 0) result.result_subtype else "unknown";
+        const stop = if (result.stop_reason.len > 0) result.stop_reason else "-";
+        logger.info("[worker:{d}] done task=\"{s}\" commits={d} cost=${d:.2} turns={d} subtype={s} stop={s} tool_errors={d}", .{
             worker_id,
             task.name,
             commits,
             @as(f64, @floatFromInt(result.cost_microdollars)) / 1000000.0,
+            result.num_turns,
+            subtype,
+            stop,
             result.tool_errors,
-        });
-    } else {
-        logger.info("[worker:{d}] done task=\"{s}\" commits={d} cost=${d:.2}", .{
-            worker_id,
-            task.name,
-            commits,
-            @as(f64, @floatFromInt(result.cost_microdollars)) / 1000000.0,
         });
     }
 

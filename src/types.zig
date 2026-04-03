@@ -2,7 +2,7 @@ const std = @import("std");
 
 // === Bit-packed enums ===
 
-pub const SessionType = enum(u3) {
+pub const SessionType = enum(u4) {
     worker = 0,
     merger = 1,
     review = 2,
@@ -11,6 +11,7 @@ pub const SessionType = enum(u3) {
     sre = 5,
     strategist = 6,
     qa = 7,
+    user = 8,
 
     pub fn label(self: SessionType) []const u8 {
         return switch (self) {
@@ -22,6 +23,7 @@ pub const SessionType = enum(u3) {
             .sre => "sre",
             .strategist => "strategist",
             .qa => "qa",
+            .user => "user",
         };
     }
 };
@@ -90,11 +92,16 @@ pub const ToolName = enum(u4) {
     agent = 9,
     ask_user = 10,
     notebook_edit = 11,
+    task = 12, // TaskCreate, TaskUpdate, TaskList, TaskGet, TaskOutput, TaskStop
+    lsp = 13, // LSP tool (diagnostics, definitions, etc.)
     mcp_tool = 14,
     unknown = 15,
 
     pub fn fromJsonString(s: []const u8) ToolName {
+        if (s.len > 4 and std.mem.startsWith(u8, s, "mcp__")) return .mcp_tool;
+        if (s.len >= 4 and std.mem.startsWith(u8, s, "Task")) return .task;
         return switch (s.len) {
+            3 => if (std.mem.eql(u8, s, "LSP")) .lsp else .unknown,
             4 => {
                 if (std.mem.eql(u8, s, "Bash")) return .bash;
                 if (std.mem.eql(u8, s, "Read")) return .read;
@@ -106,13 +113,15 @@ pub const ToolName = enum(u4) {
             5 => {
                 if (std.mem.eql(u8, s, "Write")) return .write;
                 if (std.mem.eql(u8, s, "Agent")) return .agent;
+                if (std.mem.eql(u8, s, "Skill")) return .unknown; // rare, not worth a slot
                 return .unknown;
             },
             7 => if (std.mem.eql(u8, s, "AskUser")) .ask_user else .unknown,
             8 => if (std.mem.eql(u8, s, "WebFetch")) .web_fetch else .unknown,
             9 => if (std.mem.eql(u8, s, "WebSearch")) .web_search else .unknown,
+            10 => if (std.mem.eql(u8, s, "ToolSearch")) .unknown else .unknown, // deferred tools, rare
             12 => if (std.mem.eql(u8, s, "NotebookEdit")) .notebook_edit else .unknown,
-            else => if (s.len > 4 and std.mem.startsWith(u8, s, "mcp__")) .mcp_tool else .unknown,
+            else => .unknown,
         };
     }
 
@@ -130,6 +139,8 @@ pub const ToolName = enum(u4) {
             .agent => "Agent",
             .ask_user => "AskUser",
             .notebook_edit => "NotebookEdit",
+            .task => "Task",
+            .lsp => "LSP",
             .mcp_tool => "MCP",
             .unknown => "?",
         };
@@ -182,6 +193,61 @@ pub const ModelType = enum(u2) {
         if (std.mem.eql(u8, s, "haiku")) return .haiku;
         if (std.mem.eql(u8, s, "sonnet")) return .sonnet;
         return .other;
+    }
+};
+
+/// Result event subtype from Claude CLI stream-json.
+/// 0 = unknown for backward compatibility with old records.
+pub const ResultSubtype = enum(u3) {
+    unknown = 0,
+    success = 1,
+    error_max_turns = 2,
+    error_max_budget = 3,
+    error_execution = 4,
+    error_other = 5,
+
+    pub fn fromString(s: []const u8) ResultSubtype {
+        if (std.mem.eql(u8, s, "success")) return .success;
+        if (std.mem.eql(u8, s, "error_max_turns")) return .error_max_turns;
+        if (std.mem.eql(u8, s, "error_max_budget_usd")) return .error_max_budget;
+        if (std.mem.eql(u8, s, "error_during_execution")) return .error_execution;
+        if (std.mem.startsWith(u8, s, "error")) return .error_other;
+        return .unknown;
+    }
+
+    pub fn label(self: ResultSubtype) []const u8 {
+        return switch (self) {
+            .unknown => "unknown",
+            .success => "success",
+            .error_max_turns => "max_turns",
+            .error_max_budget => "max_budget",
+            .error_execution => "execution_error",
+            .error_other => "other_error",
+        };
+    }
+};
+
+/// API stop reason from Claude CLI result event.
+pub const StopReason = enum(u2) {
+    unknown = 0,
+    end_turn = 1,
+    max_tokens = 2,
+    tool_use = 3,
+
+    pub fn fromString(s: []const u8) StopReason {
+        if (std.mem.eql(u8, s, "end_turn")) return .end_turn;
+        if (std.mem.eql(u8, s, "max_tokens")) return .max_tokens;
+        if (std.mem.eql(u8, s, "tool_use")) return .tool_use;
+        return .unknown;
+    }
+
+    pub fn label(self: StopReason) []const u8 {
+        return switch (self) {
+            .unknown => "",
+            .end_turn => "end_turn",
+            .max_tokens => "max_tokens",
+            .tool_use => "tool_use",
+        };
     }
 };
 
@@ -311,7 +377,7 @@ pub const SessionHeader = packed struct(u384) {
     has_duration: bool,
     has_diff_summary: bool,
     backend: BackendType = .claude,
-    _reserved: u1 = 0,
+    has_result_detail: bool = false,
     worker_id: u16,
     commit_count: u8,
     num_turns: u8,
@@ -324,7 +390,12 @@ pub const SessionHeader = packed struct(u384) {
     output_tokens: u32,
     cache_creation_tokens: u32,
     cache_read_tokens: u32,
-    _pad: u48 = 0,
+    // New fields — use the former 48-bit pad. Old records have zeros here,
+    // which map to unknown/unknown/0 — fully backward compatible.
+    result_subtype: ResultSubtype = .unknown,
+    stop_reason: StopReason = .unknown,
+    duration_api_ms: u32 = 0,
+    _pad: u10 = 0, // Reduced from u11 after SessionType u3→u4
 
     comptime {
         std.debug.assert(@sizeOf(SessionHeader) == 48);
@@ -590,6 +661,9 @@ test "ToolName fromJsonString" {
     try std.testing.expectEqual(ToolName.web_fetch, ToolName.fromJsonString("WebFetch"));
     try std.testing.expectEqual(ToolName.web_search, ToolName.fromJsonString("WebSearch"));
     try std.testing.expectEqual(ToolName.mcp_tool, ToolName.fromJsonString("mcp__slack__post"));
+    try std.testing.expectEqual(ToolName.task, ToolName.fromJsonString("TaskCreate"));
+    try std.testing.expectEqual(ToolName.task, ToolName.fromJsonString("TaskUpdate"));
+    try std.testing.expectEqual(ToolName.lsp, ToolName.fromJsonString("LSP"));
     try std.testing.expectEqual(ToolName.unknown, ToolName.fromJsonString("SomethingElse"));
 }
 

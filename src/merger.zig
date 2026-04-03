@@ -7,6 +7,7 @@ const git = @import("git.zig");
 const backend = @import("backend.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
+const ctx_mod = @import("context.zig");
 
 const WorktreeCandidate = struct {
     branch: []const u8,
@@ -235,11 +236,18 @@ fn reviewAndMerge(
     // Cap diff to avoid blowing the context window
     const diff_preview = if (diff.len > 50000) diff[0..50000] else diff;
 
+    // Look up what task the worker was working on
+    const task_context = if (candidate.worker_session_id) |wsid|
+        ctx_mod.getTaskContext(store, wsid, allocator) orelse ""
+    else
+        "";
+    defer if (task_context.len > 0) allocator.free(task_context);
+
     const review_prompt = std.fmt.allocPrint(allocator,
         \\Review and merge the following diff from branch `{s}`.
         \\
         \\You have full tool access. You can read source files, run the build, and run tests.
-        \\
+        \\{s}
         \\## Your task
         \\1. Review the diff below for correctness, safety, and quality
         \\2. If needed, read the surrounding source code for context
@@ -252,7 +260,7 @@ fn reviewAndMerge(
         \\```diff
         \\{s}
         \\```
-    , .{ candidate.branch, candidate.branch, diff_preview }) catch return;
+    , .{ candidate.branch, task_context, candidate.branch, diff_preview }) catch return;
     defer allocator.free(review_prompt);
 
     logger.info("[merger] reviewing {s}", .{candidate.branch});
@@ -263,6 +271,7 @@ fn reviewAndMerge(
         .cwd = paths.root,
         .append_prompt_file = review_prompt_path,
         .model = cfg.merger.model,
+        .fallback_model = cfg.merger.fallback_model,
         .effort = cfg.merger.effort,
         .max_budget_usd = cfg.merger.max_budget_usd,
         .max_turns = 20,
@@ -423,6 +432,7 @@ fn runBuildStep(
         .cwd = paths.root,
         .append_prompt_file = fix_prompt_path,
         .model = cfg.merger.model,
+        .fallback_model = cfg.merger.fallback_model,
         .effort = cfg.merger.effort,
         .max_budget_usd = cfg.merger.max_budget_usd,
         .db_dir = paths.db_dir,

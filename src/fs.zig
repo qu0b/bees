@@ -93,3 +93,35 @@ pub fn readAll(file: File, buf: []u8) !usize {
     var reader = file.readerStreaming(io, &read_buf);
     return reader.interface.readSliceShort(buf) catch return 0;
 }
+
+/// Read all .txt files from a directory and concatenate with "### filename" headers.
+/// Returns null if directory doesn't exist or contains no .txt files.
+pub fn readDirFiles(allocator: std.mem.Allocator, dir_path: []const u8, max_file_size: usize) ?[]const u8 {
+    var dir = openDir(dir_path) catch return null;
+    defer closeDir(dir);
+
+    var buf: std.ArrayList(u8) = .empty;
+    var iter = dir.iterate();
+    while (iter.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".txt")) continue;
+
+        const file_path = std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch continue;
+        defer allocator.free(file_path);
+
+        const content = readFileAlloc(allocator, file_path, max_file_size) catch continue;
+        defer allocator.free(content);
+        if (content.len == 0) continue;
+
+        // Header: filename without .txt extension
+        const name_end = entry.name.len - 4;
+        buf.appendSlice(allocator, "\n### ") catch continue;
+        buf.appendSlice(allocator, entry.name[0..name_end]) catch continue;
+        buf.appendSlice(allocator, "\n") catch continue;
+        buf.appendSlice(allocator, content) catch continue;
+        if (content[content.len - 1] != '\n') buf.append(allocator, '\n') catch {};
+    }
+
+    if (buf.items.len == 0) return null;
+    return buf.toOwnedSlice(allocator) catch null;
+}

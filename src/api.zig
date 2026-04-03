@@ -259,6 +259,13 @@ fn handleSession(w: *Io.Writer, store: *store_mod.Store, id: u64) !void {
             session.header.cache_read_tokens,
         });
     }
+    if (session.header.has_result_detail) {
+        try w.print(",\"result_subtype\":\"{s}\",\"stop_reason\":\"{s}\",\"duration_api_ms\":{d}", .{
+            session.header.result_subtype.label(),
+            session.header.stop_reason.label(),
+            session.header.duration_api_ms,
+        });
+    }
 
     // Events
     try w.print(",\"events\":[", .{});
@@ -577,6 +584,13 @@ fn writeSessionsArray(w: *Io.Writer, store: *store_mod.Store, txn: anytype, type
                 entry.view.header.output_tokens,
                 entry.view.header.cache_creation_tokens,
                 entry.view.header.cache_read_tokens,
+            });
+        }
+        if (entry.view.header.has_result_detail) {
+            try w.print(",\"result_subtype\":\"{s}\",\"stop_reason\":\"{s}\",\"duration_api_ms\":{d}", .{
+                entry.view.header.result_subtype.label(),
+                entry.view.header.stop_reason.label(),
+                entry.view.header.duration_api_ms,
             });
         }
         try w.print("}}", .{});

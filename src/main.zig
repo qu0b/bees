@@ -12,13 +12,242 @@ const orchestrator = @import("orchestrator.zig");
 const sre_mod = @import("sre.zig");
 const strategist_mod = @import("strategist.zig");
 const qa_mod = @import("qa.zig");
+const user_mod = @import("user.zig");
 const git = @import("git.zig");
 const scheduler = @import("scheduler.zig");
 const tasks_mod = @import("tasks.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
+const ctx_mod = @import("context.zig");
 
 pub const version = "0.1.0";
+
+const default_strategist_prompt =
+    \\You are the Strategist for this project. Your job: decide what the AI worker swarm
+    \\should build next. You make this decision based on concrete context, not abstract vision.
+    \\
+    \\## Your Context
+    \\
+    \\The daemon injects the following at the end of this prompt (if available):
+    \\- **Target User Profiles** — who uses this project, what they need, what success looks like
+    \\- **Operator Feedback** — direct input from the human operator, highest priority
+    \\- **Latest QA Report** — user-experience evaluation from the QA agent
+    \\- **Task Performance Trends** — what tasks are succeeding/failing, accept rates
+    \\
+    \\The user profiles are your north star. Every task you write should close the gap
+    \\between what those users need and what the project currently delivers.
+    \\
+    \\## Your Process
+    \\
+    \\### 1. UNDERSTAND THE USERS
+    \\   Read the target user profiles injected below. For each user:
+    \\   - What are their goals?
+    \\   - What would make them successful?
+    \\   - What frustrates them today?
+    \\
+    \\### 2. READ OPERATOR FEEDBACK
+    \\   The human operator's direct input — highest priority signal. If there are
+    \\   open feedback items, address them in your task decisions. Feedback marked
+    \\   "addressed" can be deprioritized.
+    \\
+    \\### 3. READ THE QA REPORT
+    \\   The QA agent evaluates the project as those users. Their report tells you:
+    \\   - What's working well (protect it)
+    \\   - Where the experience breaks down (fix it or build something better)
+    \\   - What's missing that users need
+    \\
+    \\### 4. CHECK TASK TRENDS
+    \\   - Tasks with high accept rates are working — keep or evolve them
+    \\   - Tasks with many runs but 0 accepted are broken — replace or fundamentally rethink
+    \\   - Look for patterns: are certain types of tasks consistently failing?
+    \\
+    \\### 5. ORIENT
+    \\   - `git log --oneline -10` — what changed recently?
+    \\   - `bees status` — daily stats
+    \\   - `bees tasks` — current task performance
+    \\   - Sample 2-3 areas of the codebase relevant to user needs
+    \\
+    \\### 6. DECIDE WHAT TO BUILD
+    \\   For each target user, ask:
+    \\   - What's the biggest gap between what they need and what exists?
+    \\   - What would deliver the most value for the least effort?
+    \\   - What's currently broken or half-built that blocks their workflow?
+    \\
+    \\   Prioritize ruthlessly. 3 high-impact tasks beat 10 marginal ones.
+    \\
+    \\### 7. WRITE TASKS
+    \\   Update .bees/tasks.json.
+    \\   Format: [{"name": "<50 chars>", "weight": <1-5>, "prompt": "..."}, ...]
+    \\
+    \\   Task mix:
+    \\   - **Foundation** (2-3): Infrastructure that unblocks user-facing work
+    \\   - **Feature** (3-5): Capabilities users will directly benefit from
+    \\   - **Quality** (2-3): Make existing features reliable and edge-case-proof
+    \\   - **Experiment** (1-2): Bold bets on what users might love
+    \\
+    \\   Every task prompt MUST include:
+    \\   1. What to build (specific files, desired behavior)
+    \\   2. Which user this serves and why
+    \\   3. Success criteria — what does "done" look like?
+    \\   4. Edge cases to handle
+    \\   5. How to verify (build/test commands)
+    \\   6. End with "Commit your work"
+    \\
+    \\   Weights: 5=critical user need, 3=important improvement, 1=experiment/polish
+    \\   Keep 10-20 tasks. Remove done/stale ones. Replace failing tasks.
+    \\   After writing tasks.json, read it back to verify valid JSON.
+    \\
+    \\## Principles
+    \\
+    \\- **User value over code polish.** Don't write tasks to refactor code unless it
+    \\  directly blocks something a user needs.
+    \\- **Zero silent failures.** Every task must specify error handling expectations.
+    \\- **Explicit over clever.** Task prompts should be specific enough that a worker
+    \\  makes the right choices without guessing your intent.
+    \\- **Test what matters.** Every task should specify what to verify.
+    \\
+    \\## Rules
+    \\
+    \\- NEVER run pkill, kill, systemctl stop/restart, or any process management
+    \\- NEVER try to read every file — sample and rotate, use subagents for breadth
+    \\- Context (user profiles, QA report, trends) is appended at the end of this prompt
+    \\
+;
+
+const strategy_setup_prompt =
+    \\You are setting up the strategy layer for "bees" — an autonomous multi-agent AI coding
+    \\system. Bees runs Claude Code workers in parallel. A strategist agent periodically
+    \\decides what workers build, based on target user needs and QA feedback.
+    \\
+    \\## Your Task
+    \\
+    \\Read the project's key files (README, package.json, config files, .bees/config.json,
+    \\source code structure) to understand the tech stack, then generate:
+    \\1. User profile files — who uses this project and what they need
+    \\2. A tailored strategist prompt
+    \\
+    \\## Inferring Target Users
+    \\
+    \\Analyze the codebase to identify 1-3 concrete user types. For each:
+    \\- **Role**: Who are they? (e.g., "Hotel manager configuring room rates via dashboard")
+    \\- **Goals**: What are they trying to accomplish with this project?
+    \\- **Needs**: What capabilities must exist for them to succeed?
+    \\- **Frustrations**: What pain points or gaps likely exist today?
+    \\- **Success looks like**: Concrete, testable outcomes
+    \\
+    \\Don't settle for generic descriptions — "A developer" is useless. Infer specific
+    \\users from the codebase: API consumers, dashboard users, ops engineers, etc.
+    \\
+    \\## What to Generate
+    \\
+    \\### 1. User Profiles (one file per user type)
+    \\Write to the users/ directory (path in project context below). Each file is a .txt
+    \\named after the user role (e.g., "developer.txt", "ops-engineer.txt"). Format:
+    \\
+    \\  **Role**: [specific role description]
+    \\  **Goals**: [what they're trying to accomplish]
+    \\  **Needs**:
+    \\  - [specific capability 1]
+    \\  - [specific capability 2]
+    \\  **Frustrations**:
+    \\  - [pain point 1]
+    \\  - [pain point 2]
+    \\  **Success looks like**: [concrete, testable outcomes]
+    \\
+    \\### 2. Strategist Prompt (strategist.txt)
+    \\A system prompt for the strategist agent, tailored to THIS project. Must include:
+    \\
+    \\- Project identity, tech stack, key files
+    \\- Process: read user profiles (injected at end of prompt), read QA report,
+    \\  check task trends, orient via git log + bees status, sample codebase, write tasks
+    \\- Task writing guidelines with this project's build/test commands
+    \\- The principle: every task must serve a target user's needs
+    \\- Task format: [{"name", "weight", "prompt"}] — weights 1-5
+    \\- Task prompts must include: what, which user it serves, success criteria,
+    \\  edge cases, verification, "Commit your work"
+    \\- Rules: no process management (pkill/kill/systemctl), sample+rotate don't read all
+    \\
+    \\If this is a web project: include screenshot instructions (Chrome DevTools MCP),
+    \\URLs to review, viewport sizes (1920x1080 desktop, 390x844 mobile).
+    \\
+    \\Make it SPECIFIC — real paths, real commands, real URLs. Generic prompts are useless.
+    \\
+    \\Do NOT create tasks.json — the strategist generates tasks on its first run.
+    \\
+    \\## Rules
+    \\- Do NOT modify any existing project source code — only files inside .bees/
+    \\- Write valid JSON (no comments, no trailing commas)
+    \\- Be efficient — read only what you need to understand the project
+    \\
+;
+
+const default_user_agent_prompt =
+    \\You are a simulated user agent. You embody the target user personas defined
+    \\below and engage with the application as each persona would.
+    \\
+    \\## Your Process
+    \\
+    \\For each target user persona injected in the user message:
+    \\
+    \\### 1. BECOME THE PERSONA
+    \\   Read their role, goals, needs, and frustrations. Think like them.
+    \\   What would they try to do first? What question would they ask?
+    \\
+    \\### 2. NAVIGATE THE APPLICATION
+    \\   Use Chrome DevTools MCP to interact with the live application:
+    \\   - Open a tab with `new_page` for the main URL
+    \\   - `resize_page` to desktop (1920x1080) and mobile (390x844)
+    \\   - `take_screenshot` format="jpeg" quality=80 at key points
+    \\   - Navigate between pages as the user would
+    \\   - Try to accomplish the persona's goals
+    \\   - When done, `close_page`
+    \\
+    \\### 3. REPORT YOUR EXPERIENCE
+    \\   For each persona, write a narrative:
+    \\   - What you tried to do (the persona's goal)
+    \\   - What worked — where the product served you well
+    \\   - What didn't — where you got stuck, confused, or frustrated
+    \\   - What's missing — capabilities the persona needs that don't exist
+    \\   - Screenshots as evidence
+    \\
+    \\## Output Format
+    \\
+    \\# User Engagement Report
+    \\
+    \\## [Persona Name] — [Role]
+    \\**Goal**: [What they were trying to accomplish]
+    \\**Journey**: [Narrative of navigation and interaction]
+    \\**Verdict**: [Could they accomplish their goal? Yes/Partially/No]
+    \\**Gaps**: [What's missing or broken for this persona]
+    \\
+    \\(Repeat for each persona)
+    \\
+    \\## Priority Improvements
+    \\[Ranked list of changes that would deliver the most value across all personas]
+    \\
+    \\## Rules
+    \\- NEVER run pkill, nohup, npm start, or any server/process management
+    \\- NEVER modify source code — you are a simulated user, read-only
+    \\- Screenshots are ground truth — if it looks broken, it IS broken
+    \\- Do NOT write any files to disk
+    \\
+;
+
+const default_user_profile =
+    \\**Role**: Developer working on this project
+    \\**Goals**: Ship reliable software, understand codebase health, maintain quality
+    \\**Needs**:
+    \\- Code that works correctly and handles edge cases
+    \\- Clear error messages when things fail
+    \\- Tests that catch real bugs
+    \\- Documentation where the intent isn't obvious from the code
+    \\**Frustrations**:
+    \\- Silent failures that waste debugging time
+    \\- Flaky tests that erode trust
+    \\- Code that's hard to change because of hidden coupling
+    \\**Success looks like**: Confident merges, fast feedback loops, code that's easy to reason about
+    \\
+;
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -58,6 +287,7 @@ fn runCommand(cmd: cli.Command, arena: std.mem.Allocator, io: Io, stdout: *Io.Wr
         .run_strategist => try cmdRunStrategist(arena, io, stdout),
         .run_sre => try cmdRunSre(arena, io, stdout),
         .run_qa => try cmdRunQa(arena, io, stdout),
+        .run_user => try cmdRunUser(arena, io, stdout),
         .log => try cmdLog(arena, stdout),
         .config => |opts| try cmdConfig(arena, stdout, opts.json),
         .tasks => |opts| try cmdTasks(arena, stdout, opts.json),
@@ -96,7 +326,7 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: 
     }
 
     // Create directory structure
-    for ([_][]const u8{ "db", "logs", "prompts" }) |d| {
+    for ([_][]const u8{ "db", "logs", "prompts", "prompts/users" }) |d| {
         const path = try std.fs.path.join(arena, &.{ bees_dir, d });
         try fs.makePath(path);
     }
@@ -127,12 +357,25 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: 
         writeDefaultConfig(arena, config_path, project_name, base_branch) catch {};
     }
 
+    // Create empty tasks.json — the strategist populates this on first run
     const tasks_path = try std.fs.path.join(arena, &.{ bees_dir, "tasks.json" });
     if (!fs.access(tasks_path)) {
-        writeDefaultTasks(tasks_path) catch {};
+        if (fs.createFile(tasks_path, .{})) |file| {
+            fs.writeFile(file, "[]\n") catch {};
+            fs.closeFile(file);
+        } else |_| {}
     }
 
     try ensureDefaultPrompts(arena, bees_dir);
+
+    // Interactive strategy conversation — generates a tailored strategist.txt
+    if (!skip_analysis) {
+        const success = runStrategyConversation(arena, io, stdout, cwd, bees_dir);
+        if (!success) {
+            try stdout.print("\nStrategy setup skipped — using default strategist prompt.\n", .{});
+            try stdout.print("You can re-run with `claude` in .bees/ to customize later.\n", .{});
+        }
+    }
 
     // Add .bees/ to .gitignore
     try addToGitignore(arena, cwd);
@@ -210,18 +453,7 @@ fn buildInitPrompt(arena: std.mem.Allocator, cwd: []const u8, name: []const u8, 
         \\  serve (optional, for web services):
         \\    {{"systemd_unit": "<name>", "health_url": "http://localhost:<port>"}}
         \\
-        \\## 2. Tasks: {s}/tasks.json
-        \\
-        \\JSON array of 5-8 task objects:
-        \\  {{"name": "<50 chars>", "weight": <1-5>, "prompt": "..."}}
-        \\
-        \\Each task is a job for an autonomous AI coding agent working alone.
-        \\Weight: 5=critical fix, 3=important, 1=polish.
-        \\Base tasks on REAL issues you find by reading the actual code.
-        \\Each prompt must: reference specific files, describe what to change, and
-        \\end with the build/test command and "Commit your work."
-        \\
-        \\## 3. Prompts: {s}/prompts/
+        \\## 2. Prompts: {s}/prompts/
         \\
         \\Create 5 prompt template files (each is a system prompt for an agent role):
         \\
@@ -234,13 +466,75 @@ fn buildInitPrompt(arena: std.mem.Allocator, cwd: []const u8, name: []const u8, 
         \\  sre.txt — SRE monitor. CRITICAL: Must NEVER kill/restart/stop processes
         \\    (no pkill, kill, systemctl stop/restart). Only inspect and adjust config.
         \\
+        \\Do NOT create tasks.json — the strategist generates tasks on its first run.
+        \\
         \\## Rules
         \\- Write valid JSON (no comments, no trailing commas)
         \\- Use the Write tool to create all files
         \\- Do NOT modify any existing project source code
         \\- Do NOT create files outside {s}
         \\
-    , .{ name, cwd, branch, bees_dir, bees_dir, name, branch, cwd, bees_dir, bees_dir, bees_dir });
+    , .{ name, cwd, branch, bees_dir, bees_dir, name, branch, cwd, bees_dir, bees_dir });
+}
+
+fn runStrategyConversation(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, cwd: []const u8, bees_dir: []const u8) bool {
+    const strategist_path = std.fs.path.join(arena, &.{ bees_dir, "prompts", "strategist.txt" }) catch return false;
+    const users_dir = std.fs.path.join(arena, &.{ bees_dir, "prompts", "users" }) catch return false;
+
+    stdout.print("\nGenerating strategy (user profiles + strategist prompt)...\n\n", .{}) catch {};
+    stdout.flush() catch {};
+
+    // Build prompt with project-specific paths
+    const prompt = std.fmt.allocPrint(arena,
+        \\{s}
+        \\
+        \\## Project Context
+        \\
+        \\Project directory: {s}
+        \\Config directory: {s}
+        \\Strategist prompt: {s}
+        \\User profiles dir: {s}  (one .txt file per user type)
+        \\
+    , .{ strategy_setup_prompt, cwd, bees_dir, strategist_path, users_dir }) catch return false;
+
+    var child = claude.spawnClaude(arena, io, .{
+        .prompt = prompt,
+        .cwd = cwd,
+        .model = "sonnet",
+        .effort = "high",
+        .max_budget_usd = 5.0,
+        .max_turns = 20,
+    }) catch {
+        stdout.print("Failed to start Claude CLI for strategy setup.\n", .{}) catch {};
+        return false;
+    };
+
+    if (child.stdout) |stdout_file| {
+        var read_buf: [256 * 1024]u8 = undefined;
+        var reader = stdout_file.readerStreaming(io, &read_buf);
+
+        while (true) {
+            const line = reader.interface.takeDelimiter('\n') catch |e| switch (e) {
+                error.ReadFailed => break,
+                error.StreamTooLong => {
+                    _ = reader.interface.discardDelimiterInclusive('\n') catch break;
+                    continue;
+                },
+            };
+            if (line == null) break;
+            const line_data = line.?;
+            if (line_data.len == 0) continue;
+
+            const meta = claude.parseEventMeta(line_data);
+            claude.streamEvent(stdout, meta, line_data);
+        }
+    }
+
+    const term = child.wait(io) catch return false;
+    return switch (term) {
+        .exited => |code| code == 0,
+        else => false,
+    };
 }
 
 fn writeDefaultConfig(arena: std.mem.Allocator, config_path: []const u8, project_name: []const u8, base_branch: []const u8) !void {
@@ -268,36 +562,6 @@ fn writeDefaultConfig(arena: std.mem.Allocator, config_path: []const u8, project
     try fs.writeFile(file, content);
 }
 
-fn writeDefaultTasks(path: []const u8) !void {
-    const file = try fs.createFile(path, .{});
-    defer fs.closeFile(file);
-    try fs.writeFile(file,
-        \\[
-        \\  {
-        \\    "name": "Bug hunt",
-        \\    "weight": 3,
-        \\    "prompt": "Search the codebase for bugs, edge cases, and error handling issues. Fix any problems you find. Commit each fix separately with a clear message."
-        \\  },
-        \\  {
-        \\    "name": "Code quality",
-        \\    "weight": 2,
-        \\    "prompt": "Review the codebase for code quality issues: dead code, unclear naming, missing error handling, performance problems. Fix what you find."
-        \\  },
-        \\  {
-        \\    "name": "Test coverage",
-        \\    "weight": 2,
-        \\    "prompt": "Find code paths that lack test coverage. Write focused tests for the most critical untested paths."
-        \\  },
-        \\  {
-        \\    "name": "Documentation",
-        \\    "weight": 1,
-        \\    "prompt": "Find code that is unclear or poorly documented. Add or improve comments and documentation where it would help future developers."
-        \\  }
-        \\]
-        \\
-    );
-}
-
 fn ensureDefaultPrompts(arena: std.mem.Allocator, bees_dir: []const u8) !void {
     const prompts = [_]struct { name: []const u8, content: []const u8 }{
         .{ .name = "worker.txt", .content = "You are an autonomous coding agent working on this project. Your task is described in the prompt. Work independently, make changes, run tests, and commit your work. Each commit should be atomic and have a clear message. Do not ask questions — make your best judgment calls.\n" },
@@ -305,6 +569,8 @@ fn ensureDefaultPrompts(arena: std.mem.Allocator, bees_dir: []const u8) !void {
         .{ .name = "conflict.txt", .content = "There are merge conflicts in this repository. Resolve all conflicts by examining both sides and making the correct choice. After resolving, ensure the code compiles and tests pass.\n" },
         .{ .name = "fix.txt", .content = "The build or tests are failing after a merge. Examine the error output and fix the issue. Ensure the build passes and tests are green before committing.\n" },
         .{ .name = "sre.txt", .content = "You are the SRE agent monitoring the bees autonomous coding system. Use bees CLI commands to check system health. Identify and resolve systemic issues. Be conservative with configuration changes.\n\nCRITICAL: Do NOT kill, restart, or stop any processes (no pkill, kill, systemctl stop/restart). The daemon manages all service lifecycle. Do NOT run build commands. Only inspect and adjust configuration/tasks.\n" },
+        .{ .name = "strategist.txt", .content = default_strategist_prompt },
+        .{ .name = "user-agent.txt", .content = default_user_agent_prompt },
     };
 
     for (prompts) |p| {
@@ -313,6 +579,14 @@ fn ensureDefaultPrompts(arena: std.mem.Allocator, bees_dir: []const u8) !void {
         const file = fs.createFile(path, .{}) catch continue;
         fs.writeFile(file, p.content) catch {};
         fs.closeFile(file);
+    }
+
+    // Default user profile — gets overwritten by strategy conversation
+    const user_path = try std.fs.path.join(arena, &.{ bees_dir, "prompts", "users", "developer.txt" });
+    if (!fs.access(user_path)) {
+        const file = fs.createFile(user_path, .{}) catch return;
+        defer fs.closeFile(file);
+        fs.writeFile(file, default_user_profile) catch {};
     }
 }
 
@@ -522,24 +796,10 @@ fn cmdRunStrategist(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void 
         }
     }
 
-    // Build context from LMDB (QA report + task trends)
-    const context: ?[]const u8 = blk: {
-        const rtxn = store.beginReadTxn() catch break :blk null;
-        defer store_mod.Store.abortTxn(rtxn);
-        const qa = store.getMeta(rtxn, "report:qa") catch null;
-        const trends = store.getMeta(rtxn, "report:trends") catch null;
-        if (qa == null and trends == null) break :blk null;
-        var parts: std.ArrayList(u8) = .empty;
-        if (qa) |q| {
-            parts.appendSlice(arena, "\n\n## Latest QA Report\n") catch break :blk null;
-            parts.appendSlice(arena, q) catch break :blk null;
-        }
-        if (trends) |t| {
-            parts.appendSlice(arena, "\n\n## Task Performance Trends\n") catch break :blk null;
-            parts.appendSlice(arena, t) catch break :blk null;
-        }
-        break :blk parts.toOwnedSlice(arena) catch null;
-    };
+    // Build context from all sources via the context module
+    const context = ctx_mod.build(&store, paths, &.{
+        .user_profiles, .operator_feedback, .report_user, .report_qa, .report_sre, .task_trends,
+    }, .{}, arena);
 
     try stdout.print("Running strategist...\n", .{});
     try stdout.flush();
@@ -631,6 +891,28 @@ fn cmdRunQa(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
 
     try qa_mod.runQa(cfg, paths, &store, &logger, io, arena, null, true);
     try stdout.print("QA run complete\n", .{});
+}
+
+fn cmdRunUser(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
+    const project = try loadProject(arena);
+    const cfg = project[0];
+    const paths = project[1];
+
+    fs.makePath(paths.db_dir) catch {};
+    fs.makePath(paths.logs_dir) catch {};
+
+    var store = try store_mod.Store.open(paths.db_dir);
+    defer store.close();
+
+    const log_path = try std.fs.path.join(arena, &.{ paths.logs_dir, "bees.log" });
+    var logger = log_mod.Logger.init(log_path);
+    defer logger.deinit();
+
+    try stdout.print("Running user engagement agent...\n", .{});
+    try stdout.flush();
+
+    try user_mod.runUser(cfg, paths, &store, &logger, io, arena, null, true);
+    try stdout.print("User engagement complete\n", .{});
 }
 
 fn cmdLog(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
@@ -829,6 +1111,13 @@ fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?type
                     entry.view.header.output_tokens,
                     entry.view.header.cache_creation_tokens,
                     entry.view.header.cache_read_tokens,
+                });
+            }
+            if (entry.view.header.has_result_detail) {
+                try stdout.print(",\"result_subtype\":\"{s}\",\"stop_reason\":\"{s}\",\"duration_api_ms\":{d}", .{
+                    entry.view.header.result_subtype.label(),
+                    entry.view.header.stop_reason.label(),
+                    entry.view.header.duration_api_ms,
                 });
             }
             try stdout.print("}}", .{});

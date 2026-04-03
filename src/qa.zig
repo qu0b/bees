@@ -14,30 +14,22 @@ pub fn runQa(
     logger: *log_mod.Logger,
     io: Io,
     allocator: std.mem.Allocator,
-    changed_files: ?[]const u8,
+    injected_context: ?[]const u8,
     stream_output: bool,
 ) !void {
     logger.info("[qa] starting QA cycle", .{});
 
-    // Load prompt from external template file
+    // Role template goes as append-system-prompt (keeps default Claude Code system prompt)
     const prompt_path = try std.fs.path.join(allocator, &.{ paths.prompts_dir, "qa.txt" });
     defer allocator.free(prompt_path);
-    const base_prompt = fs.readFileAlloc(allocator, prompt_path, 256 * 1024) catch {
-        logger.err("[qa] failed to read prompt template: {s}", .{prompt_path});
-        return;
-    };
-    defer allocator.free(base_prompt);
 
-    // Append changed files context if available
-    const prompt = if (changed_files) |cf|
-        std.fmt.allocPrint(allocator,
-            "{s}\n\n## Changed Files (from this merge cycle)\n```\n{s}\n```\nFocus your testing on pages and endpoints affected by these file changes.",
-            .{ base_prompt, cf },
-        ) catch base_prompt
+    // User prompt: task instruction + context from the context module
+    const static_prompt = "Run your QA review cycle for this project.";
+    const prompt = if (injected_context) |ic|
+        std.fmt.allocPrint(allocator, "{s}{s}", .{ static_prompt, ic }) catch static_prompt
     else
-        base_prompt;
-    // Only free if we allocated a new string
-    defer if (prompt.ptr != base_prompt.ptr) allocator.free(prompt);
+        static_prompt;
+    defer if (prompt.ptr != static_prompt.ptr) allocator.free(prompt);
 
     const now: u64 = fs.timestamp();
     const model = types.ModelType.fromString(cfg.qa.model);
@@ -72,7 +64,9 @@ pub fn runQa(
         .backend = bt,
         .prompt = prompt,
         .cwd = paths.root,
+        .append_prompt_file = prompt_path,
         .model = cfg.qa.model,
+        .fallback_model = cfg.qa.fallback_model,
         .effort = cfg.qa.effort,
         .max_budget_usd = cfg.qa.max_budget_usd,
         .mcp_config = cfg.qa.mcp_config,
@@ -89,6 +83,8 @@ pub fn runQa(
 
     const finish_time: u64 = fs.timestamp();
     const has_tokens = (result.input_tokens > 0 or result.output_tokens > 0);
+    const rs = types.ResultSubtype.fromString(result.result_subtype);
+    const sr = types.StopReason.fromString(result.stop_reason);
     const new_header = types.SessionHeader{
         .@"type" = .qa,
         .status = if (result.is_error) .err else .done,
@@ -99,6 +95,7 @@ pub fn runQa(
         .has_duration = true,
         .has_diff_summary = false,
         .backend = bt,
+        .has_result_detail = rs != .unknown or sr != .unknown,
         .worker_id = 0,
         .commit_count = 0,
         .num_turns = result.num_turns,
@@ -111,6 +108,9 @@ pub fn runQa(
         .output_tokens = result.output_tokens,
         .cache_creation_tokens = result.cache_creation_tokens,
         .cache_read_tokens = result.cache_read_tokens,
+        .result_subtype = rs,
+        .stop_reason = sr,
+        .duration_api_ms = result.duration_api_ms,
     };
 
     store.updateSessionStatus(session_id, .running, @truncate(now), new_header) catch |e| {

@@ -2,6 +2,9 @@ const std = @import("std");
 const types = @import("types.zig");
 const c = @cImport(@cInclude("lmdb.h"));
 
+/// Exported for cross-module use (context.zig) without leaking lmdb.h opaque types.
+pub const ReadTxn = ?*c.MDB_txn;
+
 pub const Store = struct {
     env: ?*c.MDB_env,
     sessions: c.MDB_dbi,
