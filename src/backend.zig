@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const Io = std.Io;
 const types = @import("types.zig");
 const store_mod = @import("store.zig");
@@ -123,6 +124,11 @@ pub const BackendOptions = struct {
     no_session_persistence: bool = true,
     add_dirs: ?[]const []const u8 = null,
     fallback_model: ?[]const u8 = null,
+
+    // -- Per-role security --
+    permission_mode: ?[]const u8 = null,
+    allowed_tools: ?[]const []const u8 = null,
+    disallowed_tools: ?[]const []const u8 = null,
 };
 
 pub const ResultAccumulator = struct {
@@ -173,6 +179,9 @@ fn spawn(backend: types.BackendType, allocator: std.mem.Allocator, io: Io, optio
             .no_session_persistence = options.no_session_persistence,
             .add_dirs = options.add_dirs,
             .fallback_model = options.fallback_model,
+            .permission_mode = options.permission_mode,
+            .allowed_tools = options.allowed_tools,
+            .disallowed_tools = options.disallowed_tools,
         }),
         .codex => backend_codex.spawnCodex(allocator, io, options),
         .opencode => backend_opencode.spawnOpenCode(allocator, io, options),
@@ -191,8 +200,8 @@ fn processEvent(backend: types.BackendType, line: []const u8, acc: *ResultAccumu
 }
 
 /// Claude adapter: wraps existing parseEventMeta + result field extraction into the accumulator pattern.
-/// NOTE: acc.result_text and acc.session_id are set to slices into `line`.
-/// Callers must dupe these before freeing the line buffer.
+/// NOTE: acc.result_text, acc.session_id, acc.result_subtype, and acc.stop_reason
+/// are set to slices into `line`. Callers must dupe these before freeing the line buffer.
 fn claudeProcessEvent(line: []const u8, acc: *ResultAccumulator) types.EventMeta {
     const meta = claude.parseEventMeta(line);
 
@@ -259,6 +268,10 @@ pub fn runSession(
     session_id: u64,
     allocator: std.mem.Allocator,
 ) !SessionResult {
+    assert(session_id > 0);
+    assert(options.prompt.len > 0);
+    assert(options.cwd.len > 0);
+
     var child = try spawn(options.backend, allocator, io, options);
 
     // Set up stdout writer for streaming mode
@@ -354,13 +367,23 @@ pub fn runSession(
             const line_copy = try allocator.dupe(u8, line_data);
             defer allocator.free(line_copy);
 
+            // Save old accumulator string values before processEvent overwrites them.
+            // These may be heap dupes from previous iterations that need freeing.
+            const old_result_text = acc.result_text;
+            const old_session_id = acc.session_id;
+            const old_result_subtype = acc.result_subtype;
+            const old_stop_reason = acc.stop_reason;
+
             const meta = processEvent(options.backend, line_copy, &acc);
 
-            // processEvent stores slices into line_copy for result_text/session_id.
-            // Dupe them now before line_copy is freed at end of iteration.
+            // processEvent stores slices into line_copy for string fields.
+            // Dupe them now before line_copy is freed at end of iteration,
+            // then free any old heap dupes that were replaced.
             {
                 const base = @intFromPtr(line_copy.ptr);
                 const end = base + line_copy.len;
+
+                // Dupe any field that points into line_copy (about to be freed)
                 if (acc.result_text.len > 0) {
                     const p = @intFromPtr(acc.result_text.ptr);
                     if (p >= base and p < end)
@@ -370,6 +393,42 @@ pub fn runSession(
                     const p = @intFromPtr(acc.session_id.ptr);
                     if (p >= base and p < end)
                         acc.session_id = try allocator.dupe(u8, acc.session_id);
+                }
+                if (acc.result_subtype.len > 0) {
+                    const p = @intFromPtr(acc.result_subtype.ptr);
+                    if (p >= base and p < end)
+                        acc.result_subtype = try allocator.dupe(u8, acc.result_subtype);
+                }
+                if (acc.stop_reason.len > 0) {
+                    const p = @intFromPtr(acc.stop_reason.ptr);
+                    if (p >= base and p < end)
+                        acc.stop_reason = try allocator.dupe(u8, acc.stop_reason);
+                }
+
+                // Free old heap dupes that were replaced by processEvent.
+                // An old value is a heap dupe if: len > 0, pointer changed,
+                // and it does NOT point into the current line_copy (which means
+                // it was duped in a previous iteration, not a static literal).
+                // Static defaults ("") have len 0, already filtered out.
+                if (old_result_text.len > 0 and old_result_text.ptr != acc.result_text.ptr) {
+                    const op = @intFromPtr(old_result_text.ptr);
+                    if (op < base or op >= end)
+                        allocator.free(old_result_text);
+                }
+                if (old_session_id.len > 0 and old_session_id.ptr != acc.session_id.ptr) {
+                    const op = @intFromPtr(old_session_id.ptr);
+                    if (op < base or op >= end)
+                        allocator.free(old_session_id);
+                }
+                if (old_result_subtype.len > 0 and old_result_subtype.ptr != acc.result_subtype.ptr) {
+                    const op = @intFromPtr(old_result_subtype.ptr);
+                    if (op < base or op >= end)
+                        allocator.free(old_result_subtype);
+                }
+                if (old_stop_reason.len > 0 and old_stop_reason.ptr != acc.stop_reason.ptr) {
+                    const op = @intFromPtr(old_stop_reason.ptr);
+                    if (op < base or op >= end)
+                        allocator.free(old_stop_reason);
                 }
             }
 

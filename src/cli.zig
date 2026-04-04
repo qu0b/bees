@@ -13,6 +13,7 @@ pub const Command = union(enum) {
     run_sre,
     run_qa,
     run_user,
+    run_researcher,
     log: struct { follow: bool = false },
     config: OutputOptions,
     tasks: OutputOptions,
@@ -81,6 +82,7 @@ pub fn parse(args: []const []const u8) !Command {
         if (std.mem.eql(u8, sub, "sre")) return .run_sre;
         if (std.mem.eql(u8, sub, "qa")) return .run_qa;
         if (std.mem.eql(u8, sub, "user")) return .run_user;
+        if (std.mem.eql(u8, sub, "researcher")) return .run_researcher;
         return error.UnknownRunSubcommand;
     }
 
@@ -117,6 +119,7 @@ fn parseSessionType(s: []const u8) ?types.SessionType {
     if (std.mem.eql(u8, s, "strategist")) return .strategist;
     if (std.mem.eql(u8, s, "qa")) return .qa;
     if (std.mem.eql(u8, s, "user")) return .user;
+    if (std.mem.eql(u8, s, "researcher")) return .researcher;
     return null;
 }
 

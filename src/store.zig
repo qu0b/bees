@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const types = @import("types.zig");
 const c = @cImport(@cInclude("lmdb.h"));
 
@@ -16,6 +17,8 @@ pub const Store = struct {
     meta: c.MDB_dbi,
 
     pub fn open(path: []const u8) !Store {
+        assert(path.len > 0);
+        assert(path.len < 4096);
         var path_buf: [4096]u8 = undefined;
         const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return error.PathTooLong;
 
@@ -122,6 +125,9 @@ pub const Store = struct {
         branch: []const u8,
         worktree: []const u8,
     ) !u64 {
+        assert(self.env != null);
+        assert(header.started_at > 0); // Timestamp must be set.
+
         var txn: ?*c.MDB_txn = null;
         try check(c.mdb_txn_begin(self.env, null, 0, &txn));
         errdefer c.mdb_txn_abort(txn);
@@ -162,6 +168,7 @@ pub const Store = struct {
     }
 
     pub fn getSession(self: *Store, txn: ?*c.MDB_txn, id: u64) !?types.SessionView {
+        assert(id > 0);
         const key = types.SessionKey{ .id = id };
         var key_bytes = key.toBytes();
         var key_val = mkValBytes(&key_bytes);
@@ -171,11 +178,25 @@ pub const Store = struct {
         if (rc == c.MDB_NOTFOUND) return null;
         if (rc != 0) return lmdbError(rc);
 
+        // Pair assertion: validate minimum value size matches header.
+        assert(data_val.mv_size >= @sizeOf(types.SessionHeader));
+
         const ptr: [*]const u8 = @ptrCast(data_val.mv_data);
-        return types.SessionView.fromBytes(ptr[0..data_val.mv_size]);
+        const view = types.SessionView.fromBytes(ptr[0..data_val.mv_size]);
+
+        // Pair assertion: started_at must be set (matches write-side check).
+        assert(view.header.started_at > 0);
+
+        return view;
     }
 
     pub fn updateSessionStatus(self: *Store, id: u64, old_status: types.SessionStatus, old_started_at: u40, new_header: types.SessionHeader) !void {
+        assert(self.env != null);
+        assert(id > 0); // Session IDs start at 1.
+        assert(new_header.started_at > 0);
+        // New status must differ or be a re-write of the same terminal status.
+        assert(old_status == .running or new_header.status != .running);
+
         var txn: ?*c.MDB_txn = null;
         try check(c.mdb_txn_begin(self.env, null, 0, &txn));
         errdefer c.mdb_txn_abort(txn);
@@ -220,6 +241,10 @@ pub const Store = struct {
     // -- Event operations --
 
     pub fn insertEvent(self: *Store, txn: ?*c.MDB_txn, session_id: u64, seq: u32, header: types.EventHeader, raw_json: []const u8) !void {
+        assert(txn != null);
+        assert(session_id > 0);
+        assert(raw_json.len > 0);
+
         const key = types.EventKey{ .session_id = session_id, .seq = seq };
         var key_bytes = key.toBytes();
         var key_val = mkValBytes(&key_bytes);
@@ -307,6 +332,9 @@ pub const Store = struct {
             const data_ptr: [*]const u8 = @ptrCast(data_val.mv_data);
             const data_slice = data_ptr[0..data_val.mv_size];
 
+            // Pair assertion: event value must hold at least the EventHeader.
+            assert(data_val.mv_size >= @sizeOf(types.EventHeader));
+
             // Copy header bytes to avoid alignment issues with LMDB pointers
             var header: types.EventHeader = undefined;
             @memcpy(std.mem.asBytes(&header), data_slice[0..@sizeOf(types.EventHeader)]);
@@ -359,6 +387,11 @@ pub const Store = struct {
     // -- Task operations --
 
     pub fn upsertTask(self: *Store, txn: ?*c.MDB_txn, name: []const u8, header: types.TaskHeader, prompt: []const u8) !void {
+        assert(txn != null);
+        assert(name.len > 0);
+        assert(name.len <= std.math.maxInt(u16)); // Must fit in length-prefixed encoding.
+        assert(prompt.len <= std.math.maxInt(u16));
+
         var key_val = mkValSlice(name);
         const value_size = types.taskValueSize(prompt);
         var data_val: c.MDB_val = .{ .mv_size = value_size, .mv_data = null };
@@ -372,6 +405,8 @@ pub const Store = struct {
     }
 
     pub fn getTask(self: *Store, txn: ?*c.MDB_txn, name: []const u8) !?types.TaskView {
+        assert(name.len > 0);
+
         var key_val = mkValSlice(name);
         var data_val: c.MDB_val = undefined;
 
@@ -379,6 +414,7 @@ pub const Store = struct {
         if (rc == c.MDB_NOTFOUND) return null;
         if (rc != 0) return lmdbError(rc);
 
+        // Pair assertion: value must hold at least the TaskHeader.
         if (data_val.mv_size < @sizeOf(types.TaskHeader)) return null;
 
         const ptr: [*]const u8 = @ptrCast(data_val.mv_data);
@@ -386,6 +422,9 @@ pub const Store = struct {
     }
 
     pub fn incrementTaskStat(self: *Store, txn: ?*c.MDB_txn, name: []const u8, field: enum { total_runs, accepted, rejected, empty }) !void {
+        assert(txn != null);
+        assert(name.len > 0);
+
         var key_val = mkValSlice(name);
         var data_val: c.MDB_val = undefined;
 

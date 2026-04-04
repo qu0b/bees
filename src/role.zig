@@ -8,13 +8,27 @@
 //! Falls back to legacy .bees/prompts/{name}.txt if roles directory doesn't exist.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const fs = @import("fs.zig");
 const config_mod = @import("config.zig");
 const context = @import("context.zig");
+pub const security_profiles = @import("security_profiles.zig");
+
+/// Tool permission configuration for a role.
+/// Specifiers follow Claude Code's permission format:
+///   "Read", "Bash(git *)", "Edit(/src/**)", "mcp__*"
+pub const ToolPermissions = security_profiles.ToolPermissions;
+
+/// Reference to an mc-managed plugin.
+pub const PluginRef = struct {
+    name: []const u8,
+    /// Specific MCP servers to include (empty = all from plugin).
+    servers: []const []const u8 = &.{},
+};
 
 /// Parsed role configuration from config.json
 pub const RoleConfig = struct {
-    name: []const u8,
+    name: []const u8 = "",
     model: []const u8 = "sonnet",
     effort: []const u8 = "high",
     max_budget_usd: f64 = 30.0,
@@ -26,6 +40,23 @@ pub const RoleConfig = struct {
     stores_report: bool = false,
     prompt_path: []const u8 = "",
     backend: []const u8 = "",
+
+    // -- Security & plugin integration --
+
+    /// Explicit tool permissions (highest priority).
+    permissions: ?ToolPermissions = null,
+    /// mc plugin references for MCP servers and skills.
+    plugins: []const PluginRef = &.{},
+    /// Named built-in security profile (e.g., "worker", "qa", "readonly").
+    /// Used when `permissions` is null.
+    security_profile: ?[]const u8 = null,
+
+    /// Resolve effective permissions: explicit > named profile > null.
+    pub fn resolvePermissions(self: *const RoleConfig) ?ToolPermissions {
+        if (self.permissions) |p| return p;
+        if (self.security_profile) |name| return security_profiles.getProfile(name);
+        return null;
+    }
 };
 
 /// All loaded roles, keyed by name
@@ -97,11 +128,23 @@ pub fn loadRoles(paths: config_mod.ProjectPaths, allocator: std.mem.Allocator) !
     return set;
 }
 
+/// Result of resolving a role's source strings into typed Sources + knowledge tags.
+pub const ResolvedSources = struct {
+    sources: []const context.Source,
+    /// Knowledge tags extracted from "knowledge:*" or "knowledge:<tag>" sources.
+    /// null means no knowledge requested. Non-null (even empty) means knowledge is active.
+    knowledge_tags: ?[]const []const u8,
+};
+
 /// Resolve context.Source values from the role's "sources" string array.
-pub fn resolveContextSources(role: RoleConfig, allocator: std.mem.Allocator) []const context.Source {
-    if (role.sources.len == 0) return &.{};
+/// Also extracts knowledge tag filters from "knowledge:*" and "knowledge:<tag>" entries.
+pub fn resolveContextSources(role: RoleConfig, allocator: std.mem.Allocator) ResolvedSources {
+    if (role.sources.len == 0) return .{ .sources = &.{}, .knowledge_tags = null };
 
     var sources: std.ArrayList(context.Source) = .empty;
+    var kb_tags: std.ArrayList([]const u8) = .empty;
+    var has_knowledge = false;
+
     for (role.sources) |s| {
         if (std.mem.eql(u8, s, "user_profiles")) {
             sources.append(allocator, .user_profiles) catch continue;
@@ -119,10 +162,26 @@ pub fn resolveContextSources(role: RoleConfig, allocator: std.mem.Allocator) []c
             sources.append(allocator, .worker_summary) catch continue;
         } else if (std.mem.eql(u8, s, "changed_files")) {
             sources.append(allocator, .changed_files) catch continue;
+        } else if (std.mem.startsWith(u8, s, "knowledge:")) {
+            if (!has_knowledge) {
+                sources.append(allocator, .knowledge_base) catch continue;
+                has_knowledge = true;
+            }
+            const tag = s["knowledge:".len..];
+            if (tag.len > 0) {
+                kb_tags.append(allocator, tag) catch continue;
+            }
         }
         // Unknown sources silently skipped — forward compatible
     }
-    return sources.toOwnedSlice(allocator) catch &.{};
+
+    return .{
+        .sources = sources.toOwnedSlice(allocator) catch &.{},
+        .knowledge_tags = if (has_knowledge)
+            kb_tags.toOwnedSlice(allocator) catch &.{}
+        else
+            null,
+    };
 }
 
 /// Validate all roles and their references. Returns error messages.
@@ -159,6 +218,7 @@ fn parseRoleConfig(allocator: std.mem.Allocator, path: []const u8) ?RoleConfig {
     defer allocator.free(data);
     const parsed = std.json.parseFromSlice(RoleConfig, allocator, data, .{
         .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
     }) catch return null;
     return parsed.value;
 }

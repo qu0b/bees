@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const Io = std.Io;
 const types = @import("types.zig");
 const config_mod = @import("config.zig");
@@ -8,6 +9,11 @@ const backend = @import("backend.zig");
 const tasks_mod = @import("tasks.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
+const role_mod = @import("role.zig");
+const knowledge = @import("knowledge.zig");
+const ctx = @import("context.zig");
+const mc_connector = @import("mc_connector.zig");
+const security_profiles = @import("security_profiles.zig");
 
 pub const WorkerResult = struct {
     session_id: u64 = 0,
@@ -56,6 +62,10 @@ fn runWorkerImpl(
     max_restarts: u32,
     stream_output: bool,
 ) !WorkerResult {
+    assert(worker_id > 0);
+    assert(paths.root.len > 0);
+    assert(cfg.project.name.len > 0);
+
     // Lock check
     var lock_path_buf: [256]u8 = undefined;
     const lock_path = std.fmt.bufPrint(&lock_path_buf, "/tmp/bees-{s}-worker-{d}.lock", .{ cfg.project.name, worker_id }) catch return .{};
@@ -122,7 +132,7 @@ fn runWorkerImpl(
     const bt = backend.resolveBackend(cfg.default_backend, cfg.workers.backend);
     const model = types.ModelType.fromString(cfg.workers.model);
     const header = types.SessionHeader{
-        .@"type" = .worker,
+        .type = .worker,
         .status = .running,
         .has_exit_code = false,
         .has_cost = false,
@@ -154,6 +164,51 @@ fn runWorkerImpl(
     const prompt_path = try std.fs.path.join(allocator, &.{ paths.prompts_dir, "worker.txt" });
     defer allocator.free(prompt_path);
 
+    // Resolve per-role security permissions
+    const role_config = blk: {
+        const role_set = role_mod.loadRoles(paths, allocator) catch break :blk null;
+        break :blk role_set.get("worker");
+    };
+    const perms = if (role_config) |rc| rc.resolvePermissions() else security_profiles.getDefaultForSessionType(.worker);
+
+    // Resolve mc plugin MCP config if role declares plugins
+    var merged_mcp_path: ?[]const u8 = null;
+    if (role_config) |rc| {
+        if (rc.plugins.len > 0) {
+            const mcp_out = std.fmt.allocPrint(allocator, "/tmp/bees-{s}/mcp-worker-{d}.json", .{ cfg.project.name, worker_id }) catch null;
+            if (mcp_out) |p| {
+                if (mc_connector.writeMergedMcpConfig(allocator, paths.root, p, rc.mcp_config, rc.plugins) catch false) {
+                    merged_mcp_path = p;
+                }
+            }
+            // Symlink plugin skills into worktree
+            _ = mc_connector.symlinkPluginSkills(allocator, paths.root, worktree_dir, rc.plugins) catch 0;
+        }
+    }
+    const effective_mcp = merged_mcp_path orelse if (role_config) |rc| rc.mcp_config else null;
+
+    // Build knowledge context for the worker (if role declares knowledge sources)
+    const kb_context: ?[]const u8 = blk: {
+        if (role_config) |rc| {
+            const resolved = role_mod.resolveContextSources(rc, allocator);
+            if (resolved.knowledge_tags) |tags| {
+                const rtxn = store.beginReadTxn() catch break :blk null;
+                defer store_mod.Store.abortTxn(rtxn);
+                const index = knowledge.loadIndex(store, rtxn, allocator) orelse break :blk null;
+                break :blk knowledge.buildContext(paths.knowledge_dir, index, tags, 16384, allocator);
+            }
+        }
+        break :blk null;
+    };
+    defer if (kb_context) |kc| allocator.free(kc);
+
+    // Combine task prompt with knowledge context
+    const effective_prompt = if (kb_context) |kc|
+        std.fmt.allocPrint(allocator, "{s}\n{s}", .{ task.prompt, kc }) catch task.prompt
+    else
+        task.prompt;
+    defer if (effective_prompt.ptr != task.prompt.ptr) allocator.free(effective_prompt);
+
     // Run Claude with restart-on-timeout support
     var claude_session_id: ?[]const u8 = null;
     var last_result: ?backend.SessionResult = null;
@@ -184,7 +239,7 @@ fn runWorkerImpl(
             .backend = bt,
             // On resume: CLI auto-continues interrupted turn via CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1.
             // Just pass original prompt (used for session metadata); the resume flag handles continuation.
-            .prompt = task.prompt,
+            .prompt = effective_prompt,
             .cwd = worktree_dir,
             .append_prompt_file = prompt_path,
             .model = cfg.workers.model,
@@ -195,11 +250,24 @@ fn runWorkerImpl(
             .resume_session_id = claude_session_id,
             .stream_output = stream_output,
             .db_dir = paths.db_dir,
+            .mcp_config = effective_mcp,
+            .permission_mode = if (perms) |p| p.permission_mode else null,
+            .allowed_tools = if (perms) |p| if (p.allowed_tools.len > 0) p.allowed_tools else null else null,
+            .disallowed_tools = if (perms) |p| if (p.disallowed_tools.len > 0) p.disallowed_tools else null else null,
         }, session_id, allocator) catch |e| {
             logger.err("[worker:{d}] session failed: {}", .{ worker_id, e });
             break;
         };
 
+        // Free previous result's heap strings before overwriting
+        if (last_result) |prev| {
+            if (prev.result_text.len > 0) allocator.free(prev.result_text);
+            // Only free previous session ID if the new result provides a replacement;
+            // otherwise the outer claude_session_id still references it for resume.
+            if (prev.claude_session_id.len > 0 and result.claude_session_id.len > 0) {
+                allocator.free(prev.claude_session_id);
+            }
+        }
         last_result = result;
 
         // Capture conversation ID from init event
@@ -235,7 +303,7 @@ fn runWorkerImpl(
     const sr = types.StopReason.fromString(result.stop_reason);
     const has_detail = rs != .unknown or sr != .unknown or result.duration_api_ms > 0;
     const new_header = types.SessionHeader{
-        .@"type" = .worker,
+        .type = .worker,
         // Mark as done (not error) for: timeout restarts, max_turns, max_budget
         .status = if (result.is_error and result.exit_code != 124 and
             rs != .error_max_turns and rs != .error_max_budget) .err else .done,

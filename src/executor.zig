@@ -6,6 +6,7 @@
 //! and are handled directly by the workflow engine.
 
 const std = @import("std");
+const assert = std.debug.assert;
 const Io = std.Io;
 const types = @import("types.zig");
 const config_mod = @import("config.zig");
@@ -13,6 +14,7 @@ const store_mod = @import("store.zig");
 const backend = @import("backend.zig");
 const role_mod = @import("role.zig");
 const context = @import("context.zig");
+const knowledge = @import("knowledge.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 
@@ -32,6 +34,9 @@ pub fn runRole(
     stream_output: bool,
     default_backend: []const u8,
 ) !void {
+    assert(role.name.len > 0);
+    assert(paths.root.len > 0);
+
     const role_name = role.name;
     logger.info("[{s}] starting", .{role_name});
 
@@ -39,10 +44,14 @@ pub fn runRole(
     const model = types.ModelType.fromString(role.model);
     const bt = backend.resolveBackend(default_backend, role.backend);
 
+    // Resolve per-role security permissions
+    const perms = role.resolvePermissions() orelse
+        role_mod.security_profiles.getDefaultForSessionType(session_type);
+
     // Create session
     const now: u64 = fs.timestamp();
     const header = types.SessionHeader{
-        .@"type" = session_type,
+        .type = session_type,
         .status = .running,
         .has_exit_code = false,
         .has_cost = false,
@@ -91,8 +100,16 @@ pub fn runRole(
         .mcp_config = role.mcp_config,
         .stream_output = stream_output,
         .db_dir = paths.db_dir,
+        .permission_mode = if (perms) |p| p.permission_mode else null,
+        .allowed_tools = if (perms) |p| if (p.allowed_tools.len > 0) p.allowed_tools else null else null,
+        .disallowed_tools = if (perms) |p| if (p.disallowed_tools.len > 0) p.disallowed_tools else null else null,
     }, session_id, allocator) catch |e| {
         logger.err("[{s}] session failed: {}", .{ role_name, e });
+        // Mark session as error so it doesn't stay stale as "running".
+        var err_header = header;
+        err_header.status = .err;
+        err_header.finished_at = @truncate(fs.timestamp());
+        store.updateSessionStatus(session_id, .running, @truncate(now), err_header) catch {};
         return;
     };
     defer {
@@ -106,7 +123,7 @@ pub fn runRole(
     const rs = types.ResultSubtype.fromString(result.result_subtype);
     const sr = types.StopReason.fromString(result.stop_reason);
     const new_header = types.SessionHeader{
-        .@"type" = session_type,
+        .type = session_type,
         .status = if (result.is_error) .err else .done,
         .has_exit_code = true,
         .has_cost = true,
@@ -147,6 +164,21 @@ pub fn runRole(
             return;
         };
         store_mod.Store.commitTxn(txn) catch {};
+    }
+
+    // Extract and apply knowledge updates from agent output
+    if (result.result_text.len > 0) {
+        const kb_updates = knowledge.extractUpdates(result.result_text, allocator);
+        if (kb_updates.len > 0) {
+            const kb_dir = std.fs.path.join(allocator, &.{ paths.bees_dir, "knowledge" }) catch "";
+            defer if (kb_dir.len > 0) allocator.free(kb_dir);
+            if (kb_dir.len > 0) {
+                knowledge.applyUpdates(store, kb_dir, kb_updates, role_name, allocator) catch |e| {
+                    logger.warn("[{s}] knowledge update failed: {}", .{ role_name, e });
+                };
+                logger.info("[{s}] applied {d} knowledge updates", .{ role_name, kb_updates.len });
+            }
+        }
     }
 
     logger.info("[{s}] done. cost=${d:.2} turns={d}", .{

@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const Io = std.Io;
 const types = @import("types.zig");
 const config_mod = @import("config.zig");

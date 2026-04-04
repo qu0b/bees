@@ -1,10 +1,11 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const Io = std.Io;
 const config_mod = @import("config.zig");
 const store_mod = @import("store.zig");
 const worker = @import("worker.zig");
 const merger = @import("merger.zig");
-const sre_mod = @import("sre.zig");
+const security_profiles = @import("security_profiles.zig");
 const tasks_mod = @import("tasks.zig");
 const git = @import("git.zig");
 const log_mod = @import("log.zig");
@@ -14,6 +15,8 @@ const ctx = @import("context.zig");
 const role_mod = @import("role.zig");
 const workflow_mod = @import("workflow.zig");
 const executor = @import("executor.zig");
+const sync_mod = @import("db/sync.zig");
+const api = @import("api.zig");
 const MAX_WORKERS = 32;
 
 const backend = @import("backend.zig");
@@ -89,12 +92,20 @@ pub fn run(
     allocator: std.mem.Allocator,
 ) !void {
     logger.info("[daemon] starting — workers={d} threshold={d} timeout={d}min cooldown={d}min", .{
-        cfg.workers.count, cfg.merger.merge_threshold,
+        cfg.workers.count,                 cfg.merger.merge_threshold,
         cfg.daemon.worker_timeout_minutes, cfg.daemon.cooldown_minutes,
     });
 
     var state = DaemonState{};
     installSignalHandlers(&state);
+
+    // Start REST API server as a background green thread
+    if (cfg.api.enabled) {
+        _ = io.async(api.startApiServer, .{
+            store, cfg, paths, logger, io, allocator, cfg.api.port,
+        });
+        logger.info("[daemon] API server started on port {d}", .{cfg.api.port});
+    }
 
     // Mark any stale "running" sessions as "error" from previous daemon crash
     cleanupStaleSessions(store, logger);
@@ -110,7 +121,7 @@ pub fn run(
     // Wait out quiet hours before spending quota on startup strategist
     if (isQuietHour(cfg.daemon)) {
         logger.info("[daemon] quiet hours active (UTC {d}:00-{d}:00, weekdays only={s}), waiting...", .{
-            cfg.daemon.quiet_start_utc.?, cfg.daemon.quiet_end_utc.?,
+            cfg.daemon.quiet_start_utc.?,                        cfg.daemon.quiet_end_utc.?,
             if (cfg.daemon.quiet_weekdays_only) "yes" else "no",
         });
         while (isQuietHour(cfg.daemon)) {
@@ -123,6 +134,9 @@ pub fn run(
     logger.info("[daemon] running startup strategist to refresh tasks", .{});
     runStrategistWithPrep(cfg, paths, store, logger, io, allocator);
     tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
+
+    // Sync LMDB → SQLite so dashboard has data
+    syncToSqlite(paths, store, logger, allocator);
 
     // Load tasks from LMDB (single source of truth)
     var pool = tasks_mod.TaskPool.loadFromStore(store, allocator) catch
@@ -193,7 +207,6 @@ pub fn run(
             // Precompute shared context values
             const worker_summary = ctx.buildWorkerSummary(store, null, allocator);
             defer if (worker_summary) |ws| allocator.free(ws);
-            const extras = ctx.Extras{ .changed_files = changed_files, .worker_summary = worker_summary };
 
             // Load workflow and roles
             const wf = workflow_mod.load(paths, allocator);
@@ -233,10 +246,15 @@ pub fn run(
                 // Resolve role config — try roles dir, fall back to hardcoded defaults
                 const role_cfg = roles.get(step.role) orelse role_mod.RoleConfig{ .name = step.role };
 
-                // Build context from role's declared sources
-                const sources = role_mod.resolveContextSources(role_cfg, allocator);
-                const step_ctx = if (sources.len > 0)
-                    ctx.build(store, paths, sources, extras, allocator)
+                // Build context from role's declared sources (including knowledge tags)
+                const resolved = role_mod.resolveContextSources(role_cfg, allocator);
+                const step_extras = ctx.Extras{
+                    .changed_files = changed_files,
+                    .worker_summary = worker_summary,
+                    .knowledge_tags = resolved.knowledge_tags,
+                };
+                const step_ctx = if (resolved.sources.len > 0)
+                    ctx.build(store, paths, resolved.sources, step_extras, allocator)
                 else
                     null;
                 defer if (step_ctx) |sc| allocator.free(sc);
@@ -249,9 +267,17 @@ pub fn run(
 
                 // Run through generic executor
                 executor.runRole(
-                    role_cfg, session_type, step.role,
-                    paths, store, logger, io, allocator,
-                    step_ctx, false, cfg.default_backend,
+                    role_cfg,
+                    session_type,
+                    step.role,
+                    paths,
+                    store,
+                    logger,
+                    io,
+                    allocator,
+                    step_ctx,
+                    false,
+                    cfg.default_backend,
                 ) catch |e| {
                     logger.err("[daemon] {s} failed: {}", .{ step.role, e });
                 };
@@ -262,6 +288,9 @@ pub fn run(
 
             // Clean up leaked Chrome renderer processes between cycles
             backend.cleanupChrome(io);
+
+            // Sync LMDB → SQLite for dashboard
+            syncToSqlite(paths, store, logger, allocator);
 
             // Cooldown
             const cooldown_secs = @as(u64, cfg.daemon.cooldown_minutes) * 60;
@@ -419,7 +448,42 @@ fn drainSreTriggers(
     }
 
     logger.info("[daemon] running SRE agent for tool error diagnosis", .{});
-    sre_mod.runSre(cfg, paths, store, logger, io, allocator, false, context.items, first_session_id) catch |e| {
+
+    // Format error context for injection into the SRE prompt.
+    const sre_context = std.fmt.allocPrint(
+        allocator,
+        "\n\n## Tool Errors That Triggered This Run\n\nThe following tool errors were observed in session {d}. Diagnose the root cause and fix the configuration, prompts, or tasks to prevent recurrence.\n\n{s}",
+        .{ first_session_id, context.items },
+    ) catch null;
+    defer if (sre_context) |sc| allocator.free(sc);
+
+    const roles = role_mod.loadRoles(paths, allocator) catch role_mod.RoleSet{
+        .roles = std.StringHashMap(role_mod.RoleConfig).init(allocator),
+        .allocator = allocator,
+    };
+    const role_cfg = roles.get("sre") orelse role_mod.RoleConfig{
+        .name = "sre",
+        .model = cfg.sre.model,
+        .fallback_model = cfg.sre.fallback_model,
+        .effort = cfg.sre.effort,
+        .max_budget_usd = cfg.sre.max_budget_usd,
+        .max_turns = cfg.sre.max_turns,
+        .stores_report = true,
+    };
+
+    executor.runRole(
+        role_cfg,
+        .sre,
+        "sre",
+        paths,
+        store,
+        logger,
+        io,
+        allocator,
+        sre_context,
+        false,
+        cfg.default_backend,
+    ) catch |e| {
         logger.err("[sre] fatal: {}", .{e});
     };
 }
@@ -500,19 +564,28 @@ fn runStrategistWithPrep(
         .fallback_model = "sonnet",
         .stores_report = true,
     };
-    const sources = role_mod.resolveContextSources(role_cfg, allocator);
-    const context = if (sources.len > 0)
-        ctx.build(store, paths, sources, .{}, allocator)
+    const resolved = role_mod.resolveContextSources(role_cfg, allocator);
+    const strat_extras = ctx.Extras{ .knowledge_tags = resolved.knowledge_tags };
+    const context = if (resolved.sources.len > 0)
+        ctx.build(store, paths, resolved.sources, strat_extras, allocator)
     else
         ctx.build(store, paths, &.{
-            .user_profiles, .operator_feedback, .report_user, .report_qa, .report_sre, .task_trends,
-        }, .{}, allocator);
+            .user_profiles, .operator_feedback, .report_user, .report_qa, .report_sre, .task_trends, .knowledge_base,
+        }, ctx.Extras{ .knowledge_tags = &.{"*"} }, allocator);
     defer if (context) |cc| allocator.free(cc);
 
     executor.runRole(
-        role_cfg, .strategist, "strategist",
-        paths, store, logger, io, allocator,
-        context, false, cfg.default_backend,
+        role_cfg,
+        .strategist,
+        "strategist",
+        paths,
+        store,
+        logger,
+        io,
+        allocator,
+        context,
+        false,
+        cfg.default_backend,
     ) catch |e| {
         logger.err("[daemon] strategist failed: {}", .{e});
     };
@@ -529,7 +602,32 @@ fn mapRoleToSessionType(name: []const u8) ?types.SessionType {
     if (std.mem.eql(u8, name, "strategist")) return .strategist;
     if (std.mem.eql(u8, name, "qa")) return .qa;
     if (std.mem.eql(u8, name, "user")) return .user;
+    if (std.mem.eql(u8, name, "researcher")) return .researcher;
     return null; // Unknown role — custom roles get .user type by default
+}
+
+fn syncToSqlite(
+    paths: config_mod.ProjectPaths,
+    store: *store_mod.Store,
+    logger: *log_mod.Logger,
+    allocator: std.mem.Allocator,
+) void {
+    const sqlite_path = std.fs.path.join(allocator, &.{ paths.db_dir, "data.sqlite" }) catch return;
+    defer allocator.free(sqlite_path);
+    var sync = sync_mod.SyncEngine.init(sqlite_path) catch |e| {
+        logger.warn("[daemon] SQLite sync init failed: {s}", .{@errorName(e)});
+        return;
+    };
+    defer sync.deinit();
+    const stats = sync.syncAll(store) catch |e| {
+        logger.warn("[daemon] SQLite sync failed: {s}", .{@errorName(e)});
+        return;
+    };
+    if (stats.total() > 0) {
+        logger.info("[daemon] synced to SQLite: {d} sessions, {d} events, {d} tasks", .{
+            stats.sessions_synced, stats.events_synced, stats.tasks_synced,
+        });
+    }
 }
 
 fn writeTaskTrends(

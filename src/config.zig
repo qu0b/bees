@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const fs = @import("fs.zig");
 
 pub const Config = struct {
@@ -141,6 +142,7 @@ pub const ProjectPaths = struct {
     db_dir: []const u8,
     logs_dir: []const u8,
     prompts_dir: []const u8,
+    knowledge_dir: []const u8,
 
     pub fn init(allocator: std.mem.Allocator, project_root: []const u8) !ProjectPaths {
         const bees_dir = try std.fs.path.join(allocator, &.{ project_root, ".bees" });
@@ -152,6 +154,7 @@ pub const ProjectPaths = struct {
             .db_dir = try std.fs.path.join(allocator, &.{ bees_dir, "db" }),
             .logs_dir = try std.fs.path.join(allocator, &.{ bees_dir, "logs" }),
             .prompts_dir = try std.fs.path.join(allocator, &.{ bees_dir, "prompts" }),
+            .knowledge_dir = try std.fs.path.join(allocator, &.{ bees_dir, "knowledge" }),
         };
     }
 };

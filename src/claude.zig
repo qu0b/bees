@@ -1,9 +1,8 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const Io = std.Io;
 const types = @import("types.zig");
 const store_mod = @import("store.zig");
-const dlq_mod = @import("dlq.zig");
-const fs = @import("fs.zig");
 
 pub const ClaudeOptions = struct {
     prompt: []const u8,
@@ -26,6 +25,15 @@ pub const ClaudeOptions = struct {
     add_dirs: ?[]const []const u8 = null,
     /// Fallback model when primary is overloaded (529). E.g., "sonnet" for opus sessions.
     fallback_model: ?[]const u8 = null,
+
+    // -- Per-role security (replaces --dangerously-skip-permissions) --
+
+    /// Permission mode: "dontAsk", "plan", etc. Null = legacy --dangerously-skip-permissions.
+    permission_mode: ?[]const u8 = null,
+    /// Tool specifiers to allow (e.g., "Read", "Bash(git *)").
+    allowed_tools: ?[]const []const u8 = null,
+    /// Tool specifiers to deny (e.g., "WebSearch", "Bash(curl *)").
+    disallowed_tools: ?[]const []const u8 = null,
 };
 
 pub const SessionResult = struct {
@@ -73,7 +81,27 @@ pub fn spawnClaude(allocator: std.mem.Allocator, io: Io, options: ClaudeOptions)
 
     try args.append(allocator, "-p");
     try args.append(allocator, "--verbose");
-    try args.append(allocator, "--dangerously-skip-permissions");
+
+    // Permission model: fine-grained per-role (new) or blanket skip (legacy)
+    if (options.permission_mode) |mode| {
+        try args.append(allocator, "--permission-mode");
+        try args.append(allocator, mode);
+        if (options.allowed_tools) |tools| {
+            for (tools) |spec| {
+                try args.append(allocator, "--allowedTools");
+                try args.append(allocator, spec);
+            }
+        }
+        if (options.disallowed_tools) |tools| {
+            for (tools) |spec| {
+                try args.append(allocator, "--disallowedTools");
+                try args.append(allocator, spec);
+            }
+        }
+    } else {
+        try args.append(allocator, "--dangerously-skip-permissions");
+    }
+
     try args.append(allocator, "--output-format");
     try args.append(allocator, "stream-json");
     try args.append(allocator, "--model");
@@ -234,244 +262,6 @@ pub fn parseEventMeta(line: []const u8) types.EventMeta {
     }
 
     return meta;
-}
-
-pub fn runClaudeSession(
-    store: *store_mod.Store,
-    io: Io,
-    options: ClaudeOptions,
-    session_id: u64,
-    allocator: std.mem.Allocator,
-) !SessionResult {
-    var child = try spawnClaude(allocator, io, options);
-
-    // Set up stdout writer for streaming mode
-    var stream_buf: [8192]u8 = undefined;
-    var stream_writer = Io.File.stdout().writerStreaming(io, &stream_buf);
-    const stream = if (options.stream_output) &stream_writer.interface else null;
-
-    // Dead letter queue for failed LMDB writes
-    var dlq: ?dlq_mod.DeadLetterQueue = if (options.db_dir) |db_dir|
-        dlq_mod.DeadLetterQueue.init(db_dir, allocator) catch null
-    else
-        null;
-
-    // Try draining any previously queued events before starting
-    if (dlq) |*q| {
-        const drained = q.drain(store);
-        if (drained > 0) {
-            std.debug.print("[dlq] replayed {d} dead-lettered events\n", .{drained});
-        }
-    }
-
-    var seq: u32 = 0;
-    var last_meta = types.EventMeta{
-        .event_type = .result,
-        .tool_name = .none,
-        .is_error = false,
-        .role = .none,
-        .duration_secs = 0,
-        .cost_cents = 0,
-        .num_turns = 0,
-    };
-    var result_text: []const u8 = "";
-    var claude_session_id: []const u8 = "";
-    var total_input_tokens: u32 = 0;
-    var total_output_tokens: u32 = 0;
-    var total_cache_creation: u32 = 0;
-    var total_cache_read: u32 = 0;
-    var total_cost_microdollars: u32 = 0;
-    var tool_error_count: u16 = 0;
-    const session_start = fs.timestamp();
-
-    // Store the user prompt as a synthetic event so the dashboard can display it.
-    // Claude CLI -p mode doesn't emit the user prompt in stream-json.
-    {
-        var prompt_json_buf: [8192]u8 = undefined;
-        const prefix = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"";
-        const suffix = if (options.stdin_data != null) " [+ stdin data]\"}]}}}" else "\"}]}}";
-        if (prefix.len < prompt_json_buf.len) {
-            @memcpy(prompt_json_buf[0..prefix.len], prefix);
-            var pos: usize = prefix.len;
-            // Escape prompt text for JSON
-            const prompt_preview = if (options.prompt.len > 3000) options.prompt[0..3000] else options.prompt;
-            for (prompt_preview) |ch| {
-                if (pos + 2 >= prompt_json_buf.len - suffix.len) break;
-                switch (ch) {
-                    '"' => { prompt_json_buf[pos] = '\\'; prompt_json_buf[pos + 1] = '"'; pos += 2; },
-                    '\\' => { prompt_json_buf[pos] = '\\'; prompt_json_buf[pos + 1] = '\\'; pos += 2; },
-                    '\n' => { prompt_json_buf[pos] = '\\'; prompt_json_buf[pos + 1] = 'n'; pos += 2; },
-                    '\r' => { prompt_json_buf[pos] = '\\'; prompt_json_buf[pos + 1] = 'r'; pos += 2; },
-                    '\t' => { prompt_json_buf[pos] = '\\'; prompt_json_buf[pos + 1] = 't'; pos += 2; },
-                    else => {
-                        if (ch >= 0x20) { prompt_json_buf[pos] = ch; pos += 1; }
-                    },
-                }
-            }
-            if (pos + suffix.len <= prompt_json_buf.len) {
-                @memcpy(prompt_json_buf[pos..][0..suffix.len], suffix);
-                pos += suffix.len;
-                const prompt_header = types.EventHeader{
-                    .event_type = .message,
-                    .tool_name = .none,
-                    .role = .user,
-                    .timestamp_offset_ms = 0,
-                };
-                store_event: {
-                    const txn = store.beginWriteTxn() catch break :store_event;
-                    store.insertEvent(txn, session_id, seq, prompt_header, prompt_json_buf[0..pos]) catch {
-                        store_mod.Store.abortTxn(txn);
-                        break :store_event;
-                    };
-                    store_mod.Store.commitTxn(txn) catch break :store_event;
-                }
-                seq += 1;
-            }
-        }
-    }
-
-    // Read stdout line by line using the new Reader API
-    if (child.stdout) |stdout_file| {
-        var read_buf: [256 * 1024]u8 = undefined;
-        var reader = stdout_file.readerStreaming(io, &read_buf);
-
-        while (true) {
-            const line = reader.interface.takeDelimiter('\n') catch |e| switch (e) {
-                error.ReadFailed => break,
-                error.StreamTooLong => {
-                    // Line exceeds buffer capacity — skip the rest and continue
-                    _ = reader.interface.discardDelimiterInclusive('\n') catch break;
-                    continue;
-                },
-            };
-            if (line == null) break;
-            const line_data = line.?;
-            if (line_data.len == 0) continue;
-
-            // Guard: divert non-JSON lines to stderr
-            if (line_data[0] != '{') {
-                std.debug.print("[stdout-guard] {s}\n", .{line_data[0..@min(line_data.len, 200)]});
-                continue;
-            }
-
-            // Make a copy since the reader buffer may be reused
-            const line_copy = try allocator.dupe(u8, line_data);
-            defer allocator.free(line_copy);
-
-            const meta = parseEventMeta(line_copy);
-
-            const now: u64 = fs.timestamp();
-            const offset_ms: u16 = @truncate((now -| session_start) *| 1000);
-
-            const header = types.EventHeader{
-                .event_type = meta.event_type,
-                .tool_name = meta.tool_name,
-                .role = meta.role,
-                .timestamp_offset_ms = offset_ms,
-            };
-
-            // Write event to LMDB (non-fatal — failed writes go to dead letter queue)
-            store_event: {
-                const txn = store.beginWriteTxn() catch |e| {
-                    std.debug.print("[lmdb] write txn failed: {}\n", .{e});
-                    if (dlq) |*q| q.enqueue(session_id, seq, header, line_copy);
-                    break :store_event;
-                };
-                store.insertEvent(txn, session_id, seq, header, line_copy) catch |e| {
-                    store_mod.Store.abortTxn(txn);
-                    std.debug.print("[lmdb] insertEvent failed: {}\n", .{e});
-                    if (dlq) |*q| q.enqueue(session_id, seq, header, line_copy);
-                    break :store_event;
-                };
-                store_mod.Store.commitTxn(txn) catch |e| {
-                    std.debug.print("[lmdb] commit failed: {}\n", .{e});
-                    if (dlq) |*q| q.enqueue(session_id, seq, header, line_copy);
-                    break :store_event;
-                };
-            }
-
-            if (meta.event_type == .tool_result and meta.is_error) {
-                tool_error_count +|= 1;
-            }
-
-            if (meta.event_type == .init_event) {
-                if (findJsonStringValue(line_copy, "\"session_id\"")) |sid| {
-                    claude_session_id = try allocator.dupe(u8, sid);
-                }
-            }
-
-            // Stream human-readable output to stdout for interactive runs
-            if (stream) |s| {
-                streamEvent(s, meta, line_copy);
-            }
-
-            // Parse session totals from the result event — it contains cumulative
-            // token usage and cost for the entire session (no dedup needed).
-            if (meta.event_type == .result) {
-                last_meta = meta;
-                if (findJsonStringValue(line_copy, "\"result\"")) |rt| {
-                    result_text = try allocator.dupe(u8, rt);
-                }
-                if (findJsonNumberValue(line_copy, "\"total_cost_usd\"")) |cost| {
-                    total_cost_microdollars = @intFromFloat(@min(@max(cost * 1000000.0, 0.0), @as(f64, @floatFromInt(@as(u32, std.math.maxInt(u32))))));
-                }
-                if (findJsonNumberValue(line_copy, "\"input_tokens\"")) |v| {
-                    total_input_tokens = @intFromFloat(@max(v, 0.0));
-                }
-                if (findJsonNumberValue(line_copy, "\"output_tokens\"")) |v| {
-                    total_output_tokens = @intFromFloat(@max(v, 0.0));
-                }
-                if (findJsonNumberValue(line_copy, "\"cache_creation_input_tokens\"")) |v| {
-                    total_cache_creation = @intFromFloat(@max(v, 0.0));
-                }
-                if (findJsonNumberValue(line_copy, "\"cache_read_input_tokens\"")) |v| {
-                    total_cache_read = @intFromFloat(@max(v, 0.0));
-                }
-            }
-            seq += 1;
-        }
-    }
-
-    // Wait for process
-    const term = child.wait(io) catch {
-        return .{
-            .event_count = seq,
-            .duration_secs = last_meta.duration_secs,
-            .num_turns = last_meta.num_turns,
-            .is_error = true,
-            .exit_code = -1,
-            .result_text = result_text,
-            .claude_session_id = claude_session_id,
-            .cost_microdollars = total_cost_microdollars,
-            .input_tokens = total_input_tokens,
-            .output_tokens = total_output_tokens,
-            .cache_creation_tokens = total_cache_creation,
-            .cache_read_tokens = total_cache_read,
-            .tool_errors = tool_error_count,
-        };
-    };
-
-    const exit_code: i16 = switch (term) {
-        .exited => |code| @as(i16, @intCast(code)),
-        .signal => |sig| -@as(i16, @intCast(@intFromEnum(sig))),
-        else => -1,
-    };
-
-    return .{
-        .event_count = seq,
-        .duration_secs = last_meta.duration_secs,
-        .num_turns = last_meta.num_turns,
-        .is_error = last_meta.is_error or exit_code != 0,
-        .exit_code = exit_code,
-        .result_text = result_text,
-        .claude_session_id = claude_session_id,
-        .cost_microdollars = total_cost_microdollars,
-        .input_tokens = total_input_tokens,
-        .output_tokens = total_output_tokens,
-        .cache_creation_tokens = total_cache_creation,
-        .cache_read_tokens = total_cache_read,
-        .tool_errors = tool_error_count,
-    };
 }
 
 pub fn findJsonStringValue(json: []const u8, key: []const u8) ?[]const u8 {

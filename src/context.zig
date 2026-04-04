@@ -15,12 +15,14 @@
 //!   - task_context:      What task a worker was assigned (for review agent)
 
 const std = @import("std");
+const assert = std.debug.assert;
 const store_mod = @import("store.zig");
 const config_mod = @import("config.zig");
 const types = @import("types.zig");
 const fs = @import("fs.zig");
 const sqlite = @import("db/sqlite.zig");
 const db_query = @import("db/query.zig");
+const knowledge = @import("knowledge.zig");
 
 pub const Source = enum {
     user_profiles,
@@ -32,6 +34,7 @@ pub const Source = enum {
     worker_summary,
     changed_files,
     task_context,
+    knowledge_base,
 };
 
 /// Pre-computed context values that don't come from LMDB or the filesystem.
@@ -40,6 +43,10 @@ pub const Extras = struct {
     changed_files: ?[]const u8 = null,
     worker_summary: ?[]const u8 = null,
     task_context: ?[]const u8 = null,
+    /// Knowledge base tag filter. null = no knowledge. &.{} or ["*"] = all tags.
+    knowledge_tags: ?[]const []const u8 = null,
+    /// Max bytes of knowledge to inject into context (default 16KB).
+    knowledge_budget: u32 = 16384,
 };
 
 /// Build a context string from the requested sources.
@@ -83,6 +90,11 @@ pub fn build(
                     parts.appendSlice(allocator, tc) catch {};
                 }
             },
+            .knowledge_base => {
+                if (extras.knowledge_tags) |tags| {
+                    appendKnowledge(&parts, store, txn, paths, tags, extras.knowledge_budget, allocator);
+                }
+            },
         }
     }
 
@@ -112,7 +124,7 @@ pub fn buildWorkerSummary(store: *store_mod.Store, sql_db: ?*sqlite.Db, allocato
 
     while (count < 20) {
         const entry = iter.next() orelse break;
-        if (entry.view.header.@"type" != .worker) continue;
+        if (entry.view.header.type != .worker) continue;
         if (@as(u64, entry.view.header.started_at) < cutoff) continue;
 
         buf.appendSlice(allocator, "- Task: '") catch continue;
@@ -175,6 +187,22 @@ fn appendFeedback(parts: *std.ArrayList(u8), paths: config_mod.ProjectPaths, all
         parts.appendSlice(allocator, "\n\n## Operator Feedback\nDirect input from the human operator. Address open items in your task decisions.\n\n") catch {};
         parts.appendSlice(allocator, fb) catch {};
     }
+}
+
+fn appendKnowledge(
+    parts: *std.ArrayList(u8),
+    store: *store_mod.Store,
+    txn: store_mod.ReadTxn,
+    paths: config_mod.ProjectPaths,
+    tags: []const []const u8,
+    budget: u32,
+    allocator: std.mem.Allocator,
+) void {
+    const index = knowledge.loadIndex(store, txn, allocator) orelse return;
+    const kb_dir = std.fs.path.join(allocator, &.{ paths.bees_dir, "knowledge" }) catch return;
+    defer allocator.free(kb_dir);
+    const ctx = knowledge.buildContext(kb_dir, index, tags, budget, allocator) orelse return;
+    parts.appendSlice(allocator, ctx) catch {};
 }
 
 fn appendMeta(

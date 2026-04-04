@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const Io = std.Io;
 const types = @import("types.zig");
 const config_mod = @import("config.zig");
@@ -24,6 +25,10 @@ pub fn runMerger(
     io: Io,
     allocator: std.mem.Allocator,
 ) !void {
+    assert(cfg.project.name.len > 0);
+    assert(paths.root.len > 0);
+    assert(cfg.project.base_branch.len > 0);
+
     logger.info("[merger] starting scan", .{});
 
     // Ensure clean working tree before merging. QA, strategist, and build

@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 
 // === Bit-packed enums ===
 
@@ -12,6 +13,7 @@ pub const SessionType = enum(u4) {
     strategist = 6,
     qa = 7,
     user = 8,
+    researcher = 9,
 
     pub fn label(self: SessionType) []const u8 {
         return switch (self) {
@@ -24,6 +26,7 @@ pub const SessionType = enum(u4) {
             .strategist => "strategist",
             .qa => "qa",
             .user => "user",
+            .researcher => "researcher",
         };
     }
 };
@@ -368,7 +371,7 @@ pub const TimeIndexKey = struct {
 // === Value headers (bit-packed) ===
 
 pub const SessionHeader = packed struct(u384) {
-    @"type": SessionType,
+    type: SessionType,
     status: SessionStatus,
     has_exit_code: bool,
     has_cost: bool,
@@ -398,7 +401,11 @@ pub const SessionHeader = packed struct(u384) {
     _pad: u10 = 0, // Reduced from u11 after SessionType u3→u4
 
     comptime {
-        std.debug.assert(@sizeOf(SessionHeader) == 48);
+        assert(@sizeOf(SessionHeader) == 48);
+        assert(@bitSizeOf(SessionHeader) == 384);
+        // Ensure started_at and finished_at can hold timestamps until year ~10889.
+        assert(@bitSizeOf(@TypeOf(@as(SessionHeader, undefined).started_at)) == 40);
+        assert(@bitSizeOf(@TypeOf(@as(SessionHeader, undefined).finished_at)) == 40);
     }
 };
 
@@ -410,7 +417,8 @@ pub const EventHeader = packed struct(u32) {
     timestamp_offset_ms: u16,
 
     comptime {
-        std.debug.assert(@sizeOf(EventHeader) == 4);
+        assert(@sizeOf(EventHeader) == 4);
+        assert(@bitSizeOf(EventHeader) == 32);
     }
 };
 
@@ -421,7 +429,8 @@ pub const ReviewHeader = packed struct(u64) {
     reviewed_at: u32,
 
     comptime {
-        std.debug.assert(@sizeOf(ReviewHeader) == 8);
+        assert(@sizeOf(ReviewHeader) == 8);
+        assert(@bitSizeOf(ReviewHeader) == 64);
     }
 };
 
@@ -466,7 +475,8 @@ pub const TaskHeader = packed struct(u128) {
     _reserved: u12 = 0,
 
     comptime {
-        std.debug.assert(@sizeOf(TaskHeader) == 16);
+        assert(@sizeOf(TaskHeader) == 16);
+        assert(@bitSizeOf(TaskHeader) == 128);
     }
 };
 
@@ -499,9 +509,29 @@ pub const EventMeta = packed struct(u64) {
     _pad: u8 = 0,
 
     comptime {
-        std.debug.assert(@sizeOf(EventMeta) == 8);
+        assert(@sizeOf(EventMeta) == 8);
+        assert(@bitSizeOf(EventMeta) == 64);
     }
 };
+
+// === Cross-struct invariants ===
+
+comptime {
+    // LMDB key sizes: SessionKey serializes to 8 bytes, EventKey to 12, index keys to 9.
+    assert(@sizeOf(SessionKey) == 8); // u64 big-endian, no padding.
+    assert(@sizeOf(StatusIndexKey) == 9);
+    assert(@sizeOf(TimeIndexKey) == 9);
+    // EventKey serialized form (toBytes) is 12 bytes: 8 (session_id) + 4 (seq).
+    // The struct itself is larger due to alignment, but the wire format is 12.
+    assert(@typeInfo(@TypeOf(@as(EventKey, undefined).toBytes())).array.len == 12);
+    // SessionType must have enough bits for all 9 variants (worker=0..user=8).
+    assert(@bitSizeOf(SessionType) >= 4);
+    // Enum bit widths must fit in their packed struct containers.
+    assert(@bitSizeOf(EventType) <= @bitSizeOf(u3));
+    assert(@bitSizeOf(ToolName) <= @bitSizeOf(u4));
+    assert(@bitSizeOf(Role) <= @bitSizeOf(u2));
+    assert(@bitSizeOf(Verdict) <= @bitSizeOf(u1));
+}
 
 // === Sub-database names ===
 

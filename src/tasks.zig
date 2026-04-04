@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const fs = @import("fs.zig");
 const types = @import("types.zig");
 const store_mod = @import("store.zig");
@@ -129,7 +130,10 @@ pub const TaskPool = struct {
 
         const counter = @atomicRmw(u64, &select_counter, .Add, 1, .monotonic);
         const idx = counter % self.tasks.len;
-        return &self.tasks[@intCast(idx)];
+        const task = &self.tasks[@intCast(idx)];
+        assert(task.name.len > 0);
+        assert(task.prompt.len > 0);
+        return task;
     }
 };
 
@@ -149,6 +153,8 @@ pub fn syncFromJson(
     origin: types.TaskOrigin,
     allocator: std.mem.Allocator,
 ) !void {
+    assert(json_data.len > 0);
+
     const JsonTask = struct {
         name: []const u8,
         weight: u32,

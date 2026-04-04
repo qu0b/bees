@@ -9,10 +9,8 @@ const merger = @import("merger.zig");
 const claude = @import("claude.zig");
 const backend = @import("backend.zig");
 const orchestrator = @import("orchestrator.zig");
-const sre_mod = @import("sre.zig");
-const strategist_mod = @import("strategist.zig");
-const qa_mod = @import("qa.zig");
-const user_mod = @import("user.zig");
+const executor = @import("executor.zig");
+const role_mod = @import("role.zig");
 const git = @import("git.zig");
 const scheduler = @import("scheduler.zig");
 const tasks_mod = @import("tasks.zig");
@@ -20,6 +18,7 @@ const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 const ctx_mod = @import("context.zig");
 const roles_default = @import("roles_default.zig");
+const knowledge = @import("knowledge.zig");
 const sqlite = @import("db/sqlite.zig");
 const db_query = @import("db/query.zig");
 
@@ -291,6 +290,7 @@ fn runCommand(cmd: cli.Command, arena: std.mem.Allocator, io: Io, stdout: *Io.Wr
         .run_sre => try cmdRunSre(arena, io, stdout),
         .run_qa => try cmdRunQa(arena, io, stdout),
         .run_user => try cmdRunUser(arena, io, stdout),
+        .run_researcher => try cmdRunResearcher(arena, io, stdout),
         .log => try cmdLog(arena, stdout),
         .config => |opts| try cmdConfig(arena, stdout, opts.json),
         .tasks => |opts| try cmdTasks(arena, stdout, opts.json),
@@ -329,7 +329,19 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: 
     }
 
     // Create directory structure
-    for ([_][]const u8{ "db", "logs", "prompts", "prompts/users" }) |d| {
+    for ([_][]const u8{
+        "db",
+        "logs",
+        "prompts",
+        "prompts/users",
+        "knowledge",
+        "knowledge/architecture",
+        "knowledge/components",
+        "knowledge/contracts",
+        "knowledge/decisions",
+        "knowledge/failed",
+        "knowledge/operations",
+    }) |d| {
         const path = try std.fs.path.join(arena, &.{ bees_dir, d });
         try fs.makePath(path);
     }
@@ -369,12 +381,34 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: 
         } else |_| {}
     }
 
-    try ensureDefaultPrompts(arena, bees_dir);
-
-    // Generate roles + workflow structure
+    // Generate roles + workflow structure (creates roles/*/config.json + prompt.md)
     roles_default.generateDefaults(bees_dir, arena);
 
-    // Interactive strategy conversation — generates a tailored strategist.txt
+    // Write knowledge base schema document
+    {
+        const schema_path = try std.fs.path.join(arena, &.{ bees_dir, "knowledge", "_schema.md" });
+        if (!fs.access(schema_path)) {
+            if (fs.createFile(schema_path, .{})) |f| {
+                fs.writeFile(f, knowledge.schema_document) catch {};
+                fs.closeFile(f);
+            } else |_| {}
+        }
+    }
+
+    // Ensure prompts/users/ directory exists for user profiles
+    {
+        const users_dir = try std.fs.path.join(arena, &.{ bees_dir, "prompts", "users" });
+        fs.makePath(users_dir) catch {};
+        const user_path = try std.fs.path.join(arena, &.{ users_dir, "developer.txt" });
+        if (!fs.access(user_path)) {
+            if (fs.createFile(user_path, .{})) |f| {
+                fs.writeFile(f, default_user_profile) catch {};
+                fs.closeFile(f);
+            } else |_| {}
+        }
+    }
+
+    // Interactive strategy conversation — generates tailored roles/strategist/prompt.md
     if (!skip_analysis) {
         const success = runStrategyConversation(arena, io, stdout, cwd, bees_dir);
         if (!success) {
@@ -473,17 +507,15 @@ fn buildInitPrompt(arena: std.mem.Allocator, cwd: []const u8, name: []const u8, 
         \\  serve (optional, for web services):
         \\    {{"systemd_unit": "<name>", "health_url": "http://localhost:<port>"}}
         \\
-        \\## 2. Prompts: {s}/prompts/
+        \\## 2. Role prompts: {s}/roles/*/prompt.md
         \\
-        \\Create 5 prompt template files (each is a system prompt for an agent role):
+        \\Update the prompt.md file in each role directory with project-specific detail:
         \\
-        \\  worker.txt — Autonomous coding agent. Mention this project's tech stack,
-        \\    build/test commands, and coding conventions. 5-10 lines.
-        \\  review.txt — Code reviewer. Receives git diff via stdin. Respond ACCEPT
+        \\  roles/worker/prompt.md — Autonomous coding agent. Mention this project's tech stack,
+        \\    build/test commands, and coding conventions. 10-20 lines.
+        \\  roles/review/prompt.md — Code reviewer. Receives git diff. Respond ACCEPT
         \\    or REJECT with reasoning. Only reject clearly wrong/harmful changes.
-        \\  conflict.txt — Merge conflict resolver. Resolve conflicts, verify build passes.
-        \\  fix.txt — Build/test failure fixer. Fix the issue, verify build is green.
-        \\  sre.txt — SRE monitor. CRITICAL: Must NEVER kill/restart/stop processes
+        \\  roles/sre/prompt.md — SRE monitor. CRITICAL: Must NEVER kill/restart/stop processes
         \\    (no pkill, kill, systemctl stop/restart). Only inspect and adjust config.
         \\
         \\Do NOT create tasks.json — the strategist generates tasks on its first run.
@@ -505,7 +537,7 @@ fn buildInitPrompt(arena: std.mem.Allocator, cwd: []const u8, name: []const u8, 
 }
 
 fn runStrategyConversation(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, cwd: []const u8, bees_dir: []const u8) bool {
-    const strategist_path = std.fs.path.join(arena, &.{ bees_dir, "prompts", "strategist.txt" }) catch return false;
+    const strategist_path = std.fs.path.join(arena, &.{ bees_dir, "roles", "strategist", "prompt.md" }) catch return false;
     const users_dir = std.fs.path.join(arena, &.{ bees_dir, "prompts", "users" }) catch return false;
 
     stdout.print("\nGenerating strategy (user profiles + strategist prompt)...\n\n", .{}) catch {};
@@ -587,34 +619,6 @@ fn writeDefaultConfig(arena: std.mem.Allocator, config_path: []const u8, project
     const file = try fs.createFile(config_path, .{});
     defer fs.closeFile(file);
     try fs.writeFile(file, content);
-}
-
-fn ensureDefaultPrompts(arena: std.mem.Allocator, bees_dir: []const u8) !void {
-    const prompts = [_]struct { name: []const u8, content: []const u8 }{
-        .{ .name = "worker.txt", .content = "You are an autonomous coding agent working on this project. Your task is described in the prompt. Work independently, make changes, run tests, and commit your work. Each commit should be atomic and have a clear message. Do not ask questions — make your best judgment calls.\n" },
-        .{ .name = "review.txt", .content = "You are a code reviewer. You will receive a git diff via stdin. Review the changes for correctness, safety, and code quality. Respond with either ACCEPT or REJECT followed by your reasoning. Be concise. Only reject changes that are clearly wrong or harmful.\n" },
-        .{ .name = "conflict.txt", .content = "There are merge conflicts in this repository. Resolve all conflicts by examining both sides and making the correct choice. After resolving, ensure the code compiles and tests pass.\n" },
-        .{ .name = "fix.txt", .content = "The build or tests are failing after a merge. Examine the error output and fix the issue. Ensure the build passes and tests are green before committing.\n" },
-        .{ .name = "sre.txt", .content = "You are the SRE agent monitoring the bees autonomous coding system. Use bees CLI commands to check system health. Identify and resolve systemic issues. Be conservative with configuration changes.\n\nCRITICAL: Do NOT kill, restart, or stop any processes (no pkill, kill, systemctl stop/restart). The daemon manages all service lifecycle. Do NOT run build commands. Only inspect and adjust configuration/tasks.\n" },
-        .{ .name = "strategist.txt", .content = default_strategist_prompt },
-        .{ .name = "user-agent.txt", .content = default_user_agent_prompt },
-    };
-
-    for (prompts) |p| {
-        const path = try std.fs.path.join(arena, &.{ bees_dir, "prompts", p.name });
-        if (fs.access(path)) continue; // Don't overwrite Claude-generated prompts
-        const file = fs.createFile(path, .{}) catch continue;
-        fs.writeFile(file, p.content) catch {};
-        fs.closeFile(file);
-    }
-
-    // Default user profile — gets overwritten by strategy conversation
-    const user_path = try std.fs.path.join(arena, &.{ bees_dir, "prompts", "users", "developer.txt" });
-    if (!fs.access(user_path)) {
-        const file = fs.createFile(user_path, .{}) catch return;
-        defer fs.closeFile(file);
-        fs.writeFile(file, default_user_profile) catch {};
-    }
 }
 
 fn addToGitignore(arena: std.mem.Allocator, cwd: []const u8) !void {
@@ -740,7 +744,12 @@ fn cmdStatus(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
         try writeJsonStr(stdout, paths.root);
         try stdout.print(",\"workers\":{d},\"today\":{{\"total\":{d},\"accepted\":{d},\"rejected\":{d},\"conflicts\":{d},\"build_failures\":{d},\"cost_cents\":{d}}}}}\n", .{
             cfg.workers.count,
-            stats.total, stats.accepted, stats.rejected, stats.conflicts, stats.build_failures, stats.total_cost_cents,
+            stats.total,
+            stats.accepted,
+            stats.rejected,
+            stats.conflicts,
+            stats.build_failures,
+            stats.total_cost_cents,
         });
     } else {
         try stdout.print("  Project:   {s} ({s})\n", .{ cfg.project.name, paths.root });
@@ -862,7 +871,34 @@ fn cmdRunStrategist(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void 
     try stdout.print("Running strategist...\n", .{});
     try stdout.flush();
 
-    try strategist_mod.runStrategist(cfg, paths, &store, &logger, io, arena, true, context);
+    // Resolve role config from .bees/roles/strategist/ or fall back to defaults.
+    const roles = role_mod.loadRoles(paths, arena) catch role_mod.RoleSet{
+        .roles = std.StringHashMap(role_mod.RoleConfig).init(arena),
+        .allocator = arena,
+    };
+    const role_cfg = roles.get("strategist") orelse role_mod.RoleConfig{
+        .name = "strategist",
+        .model = cfg.strategist.model,
+        .fallback_model = cfg.strategist.fallback_model,
+        .effort = cfg.strategist.effort,
+        .max_budget_usd = cfg.strategist.max_budget_usd,
+        .mcp_config = cfg.strategist.mcp_config,
+        .stores_report = true,
+    };
+
+    try executor.runRole(
+        role_cfg,
+        .strategist,
+        "strategist",
+        paths,
+        &store,
+        &logger,
+        io,
+        arena,
+        context,
+        true,
+        cfg.default_backend,
+    );
     try stdout.print("Strategist run complete\n", .{});
 }
 
@@ -885,7 +921,33 @@ fn cmdRunSre(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     try stdout.print("Running SRE agent...\n", .{});
     try stdout.flush();
 
-    try sre_mod.runSre(cfg, paths, &store, &logger, io, arena, true, null, 0);
+    const roles = role_mod.loadRoles(paths, arena) catch role_mod.RoleSet{
+        .roles = std.StringHashMap(role_mod.RoleConfig).init(arena),
+        .allocator = arena,
+    };
+    const role_cfg = roles.get("sre") orelse role_mod.RoleConfig{
+        .name = "sre",
+        .model = cfg.sre.model,
+        .fallback_model = cfg.sre.fallback_model,
+        .effort = cfg.sre.effort,
+        .max_budget_usd = cfg.sre.max_budget_usd,
+        .max_turns = cfg.sre.max_turns,
+        .stores_report = true,
+    };
+
+    try executor.runRole(
+        role_cfg,
+        .sre,
+        "sre",
+        paths,
+        &store,
+        &logger,
+        io,
+        arena,
+        null,
+        true,
+        cfg.default_backend,
+    );
     try stdout.print("SRE run complete\n", .{});
 }
 
@@ -947,8 +1009,90 @@ fn cmdRunQa(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     try stdout.print("Running QA agent...\n", .{});
     try stdout.flush();
 
-    try qa_mod.runQa(cfg, paths, &store, &logger, io, arena, null, true);
+    const roles = role_mod.loadRoles(paths, arena) catch role_mod.RoleSet{
+        .roles = std.StringHashMap(role_mod.RoleConfig).init(arena),
+        .allocator = arena,
+    };
+    const role_cfg = roles.get("qa") orelse role_mod.RoleConfig{
+        .name = "qa",
+        .model = cfg.qa.model,
+        .fallback_model = cfg.qa.fallback_model,
+        .effort = cfg.qa.effort,
+        .max_budget_usd = cfg.qa.max_budget_usd,
+        .mcp_config = cfg.qa.mcp_config,
+        .stores_report = true,
+    };
+
+    try executor.runRole(
+        role_cfg,
+        .qa,
+        "qa",
+        paths,
+        &store,
+        &logger,
+        io,
+        arena,
+        null,
+        true,
+        cfg.default_backend,
+    );
     try stdout.print("QA run complete\n", .{});
+}
+
+fn cmdRunResearcher(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
+    const project = try loadProject(arena);
+    const cfg = project[0];
+    const paths = project[1];
+
+    fs.makePath(paths.db_dir) catch {};
+    fs.makePath(paths.logs_dir) catch {};
+
+    const db_path = paths.db_dir;
+    var store = try store_mod.Store.open(db_path);
+    defer store.close();
+
+    const log_path = try std.fs.path.join(arena, &.{ paths.logs_dir, "bees.log" });
+    var logger = log_mod.Logger.init(log_path);
+    defer logger.deinit();
+
+    try stdout.print("Running researcher agent...\n", .{});
+    try stdout.flush();
+
+    const roles = role_mod.loadRoles(paths, arena) catch role_mod.RoleSet{
+        .roles = std.StringHashMap(role_mod.RoleConfig).init(arena),
+        .allocator = arena,
+    };
+    const role_cfg = roles.get("researcher") orelse role_mod.RoleConfig{
+        .name = "researcher",
+        .model = "opus",
+        .fallback_model = "sonnet",
+        .stores_report = true,
+    };
+
+    // Build context with knowledge for the researcher
+    const resolved = role_mod.resolveContextSources(role_cfg, arena);
+    const step_ctx = if (resolved.sources.len > 0)
+        ctx_mod.build(&store, paths, resolved.sources, ctx_mod.Extras{
+            .knowledge_tags = resolved.knowledge_tags,
+        }, arena)
+    else
+        null;
+    defer if (step_ctx) |sc| arena.free(sc);
+
+    try executor.runRole(
+        role_cfg,
+        .researcher,
+        "researcher",
+        paths,
+        &store,
+        &logger,
+        io,
+        arena,
+        step_ctx,
+        true,
+        cfg.default_backend,
+    );
+    try stdout.print("Researcher run complete\n", .{});
 }
 
 fn cmdRunUser(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
@@ -969,7 +1113,33 @@ fn cmdRunUser(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     try stdout.print("Running user engagement agent...\n", .{});
     try stdout.flush();
 
-    try user_mod.runUser(cfg, paths, &store, &logger, io, arena, null, true);
+    const roles = role_mod.loadRoles(paths, arena) catch role_mod.RoleSet{
+        .roles = std.StringHashMap(role_mod.RoleConfig).init(arena),
+        .allocator = arena,
+    };
+    const role_cfg = roles.get("user") orelse role_mod.RoleConfig{
+        .name = "user",
+        .model = cfg.user.model,
+        .fallback_model = cfg.user.fallback_model,
+        .effort = cfg.user.effort,
+        .max_budget_usd = cfg.user.max_budget_usd,
+        .mcp_config = cfg.user.mcp_config,
+        .stores_report = true,
+    };
+
+    try executor.runRole(
+        role_cfg,
+        .user,
+        "user",
+        paths,
+        &store,
+        &logger,
+        io,
+        arena,
+        null,
+        true,
+        cfg.default_backend,
+    );
     try stdout.print("User engagement complete\n", .{});
 }
 
@@ -1157,14 +1327,14 @@ fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?type
     while (printed < 50) {
         const entry = iter.next() orelse break;
         if (session_type) |st| {
-            if (entry.view.header.@"type" != st) continue;
+            if (entry.view.header.type != st) continue;
         }
 
         if (json) {
             if (!first_json) try stdout.print(",", .{});
             first_json = false;
             try stdout.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"task\":", .{
-                entry.id, entry.view.header.@"type".label(), entry.view.header.status.label(),
+                entry.id,                       entry.view.header.type.label(),                        entry.view.header.status.label(),
                 entry.view.header.commit_count, @as(u64, entry.view.header.cost_microdollars) / 10000,
             });
             try writeJsonStr(stdout, entry.view.task);
@@ -1191,7 +1361,7 @@ fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?type
             try stdout.print("}}", .{});
         } else {
             try stdout.print("  {d:<6} {s:<10} {s:<10} {d:<8} ${d:<9.2} {s:<30}\n", .{
-                entry.id, entry.view.header.@"type".label(), entry.view.header.status.label(),
+                entry.id,                       entry.view.header.type.label(),                                           entry.view.header.status.label(),
                 entry.view.header.commit_count, @as(f64, @floatFromInt(entry.view.header.cost_microdollars)) / 1000000.0, entry.view.task,
             });
         }
@@ -1222,16 +1392,16 @@ fn cmdSession(arena: std.mem.Allocator, stdout: *Io.Writer, id: u64, json: bool)
 
     if (json) {
         try stdout.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"cost_microdollars\":{d},\"task\":", .{
-            id, session.header.@"type".label(), session.header.status.label(),
-            session.header.commit_count, @as(u64, session.header.cost_microdollars) / 10000,
-            session.header.cost_microdollars,
+            id,                          session.header.type.label(),                        session.header.status.label(),
+            session.header.commit_count, @as(u64, session.header.cost_microdollars) / 10000, session.header.cost_microdollars,
         });
         try writeJsonStr(stdout, session.task);
         try stdout.print(",\"branch\":", .{});
         try writeJsonStr(stdout, session.branch);
         try stdout.print(",\"turns\":{d},\"duration_ms\":{d},\"started_at\":{d}", .{
             session.header.num_turns,
-            session.header.duration_ms, @as(u64, session.header.started_at),
+            session.header.duration_ms,
+            @as(u64, session.header.started_at),
         });
         if (session.header.has_tokens) {
             try stdout.print(",\"input_tokens\":{d},\"output_tokens\":{d},\"cache_creation_tokens\":{d},\"cache_read_tokens\":{d}", .{
@@ -1243,10 +1413,10 @@ fn cmdSession(arena: std.mem.Allocator, stdout: *Io.Writer, id: u64, json: bool)
         }
         try stdout.print(",\"events\":[", .{});
     } else {
-        try stdout.print("Session #{d} | {s} | {s}\n", .{ id, session.header.@"type".label(), session.branch });
+        try stdout.print("Session #{d} | {s} | {s}\n", .{ id, session.header.type.label(), session.branch });
         try stdout.print("Status: {s} | Cost: ${d:.2} | Commits: {d} | Turns: {d}\n", .{
             session.header.status.label(), @as(f64, @floatFromInt(session.header.cost_microdollars)) / 1000000.0,
-            session.header.commit_count, session.header.num_turns,
+            session.header.commit_count,   session.header.num_turns,
         });
         if (session.task.len > 0) try stdout.print("Task: {s}\n\nEvents:\n", .{session.task});
     }
@@ -1321,9 +1491,7 @@ fn cmdSession(arena: std.mem.Allocator, stdout: *Io.Writer, id: u64, json: bool)
             }
             try stdout.print("}}", .{});
         } else {
-            if (ev.header.event_type == .tool_use) try stdout.print("  [{d}] {s}\n", .{ ev.seq, ev.header.tool_name.label() })
-            else if (ev.header.event_type == .message) try stdout.print("  [{d}] {s} message\n", .{ ev.seq, ev.header.role.label() })
-            else if (ev.header.event_type == .result) try stdout.print("  [{d}] result\n", .{ev.seq});
+            if (ev.header.event_type == .tool_use) try stdout.print("  [{d}] {s}\n", .{ ev.seq, ev.header.tool_name.label() }) else if (ev.header.event_type == .message) try stdout.print("  [{d}] {s} message\n", .{ ev.seq, ev.header.role.label() }) else if (ev.header.event_type == .result) try stdout.print("  [{d}] result\n", .{ev.seq});
         }
     }
 
@@ -1353,6 +1521,7 @@ fn printUsage(stdout: *Io.Writer) !void {
         \\  run strategist           Run strategist (one-shot)
         \\  run sre                  Run SRE agent (one-shot)
         \\  run qa                   Run QA agent (one-shot)
+        \\  run researcher           Run researcher agent (one-shot)
         \\  log [--follow]           Show log
         \\  config [--json]          Show config
         \\  tasks [--json]           List tasks (from LMDB if available)
@@ -1416,10 +1585,11 @@ comptime {
     _ = log_mod;
     _ = fs;
     _ = orchestrator;
-    _ = sre_mod;
-    _ = @import("strategist.zig");
+    _ = executor;
+    _ = role_mod;
     _ = @import("api.zig");
-    _ = qa_mod;
+    _ = @import("security_profiles.zig");
+    _ = @import("mc_connector.zig");
     _ = @import("dlq.zig");
     _ = @import("db/schema.zig");
     _ = @import("db/sqlite.zig");
