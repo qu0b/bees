@@ -160,11 +160,9 @@ fn runWorkerImpl(
         return .{};
     };
 
-    // Build prompt with task
-    const prompt_path = try std.fs.path.join(allocator, &.{ paths.prompts_dir, "worker.txt" });
-    defer allocator.free(prompt_path);
-
-    // Resolve per-role security permissions
+    // Resolve per-role security permissions and prompt path via the roles system.
+    // Previously hardcoded to paths.prompts_dir/worker.txt which doesn't exist —
+    // the actual prompt lives at .bees/roles/worker/prompt.md.
     const role_config = blk: {
         const role_set = role_mod.loadRoles(paths, allocator) catch break :blk null;
         break :blk role_set.get("worker");
@@ -241,7 +239,7 @@ fn runWorkerImpl(
             // Just pass original prompt (used for session metadata); the resume flag handles continuation.
             .prompt = effective_prompt,
             .cwd = worktree_dir,
-            .append_prompt_file = prompt_path,
+            .append_prompt_file = if (role_config) |rc| if (rc.prompt_path.len > 0) rc.prompt_path else null else null,
             .model = cfg.workers.model,
             .fallback_model = cfg.workers.fallback_model,
             .effort = cfg.workers.effort,
