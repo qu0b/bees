@@ -18,7 +18,7 @@ pub const Command = union(enum) {
     config: OutputOptions,
     tasks: OutputOptions,
     tasks_sync: struct { file: ?[]const u8 = null },
-    sessions: struct { session_type: ?types.SessionType = null, json: bool = false },
+    sessions: struct { session_type: ?types.SessionType = null, json: bool = false, limit: u32 = 50 },
     session: struct { id: u64, json: bool = false },
     version,
     help,
@@ -62,7 +62,9 @@ pub fn parse(args: []const []const u8) !Command {
         const json = hasFlag(args[2..], "--json");
         const type_str = getFlagValue(args[2..], "--type");
         const session_type: ?types.SessionType = if (type_str) |ts| parseSessionType(ts) else null;
-        return .{ .sessions = .{ .session_type = session_type, .json = json } };
+        const limit_str = getFlagValue(args[2..], "--limit");
+        const limit: u32 = if (limit_str) |s| std.fmt.parseInt(u32, s, 10) catch 50 else 50;
+        return .{ .sessions = .{ .session_type = session_type, .json = json, .limit = limit } };
     }
     if (std.mem.eql(u8, cmd, "session")) {
         if (args.len < 3) return error.MissingSessionId;

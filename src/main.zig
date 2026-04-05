@@ -295,7 +295,7 @@ fn runCommand(cmd: cli.Command, arena: std.mem.Allocator, io: Io, stdout: *Io.Wr
         .config => |opts| try cmdConfig(arena, stdout, opts.json),
         .tasks => |opts| try cmdTasks(arena, stdout, opts.json),
         .tasks_sync => |opts| try cmdTasksSync(arena, stdout, opts.file),
-        .sessions => |opts| try cmdSessions(arena, stdout, opts.session_type, opts.json),
+        .sessions => |opts| try cmdSessions(arena, stdout, opts.session_type, opts.json, opts.limit),
         .session => |opts| try cmdSession(arena, stdout, opts.id, opts.json),
     }
 }
@@ -1344,7 +1344,7 @@ fn cmdTasksSync(arena: std.mem.Allocator, stdout: *Io.Writer, file: ?[]const u8)
     try stdout.print("Tasks synced to LMDB from {s}\n", .{tasks_path});
 }
 
-fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?types.SessionType, json: bool) !void {
+fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?types.SessionType, json: bool, limit: u32) !void {
     const project = try loadProject(arena);
     const paths = project[1];
 
@@ -1355,7 +1355,7 @@ fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?type
         defer if (sql_db) |*db| db.close();
 
         if (sql_db) |*db| {
-            try db_query.writeSessionsJson(db, stdout, session_type, 50);
+            try db_query.writeSessionsJson(db, stdout, session_type, limit);
             try stdout.print("\n", .{});
             return;
         }
@@ -1382,7 +1382,7 @@ fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?type
     defer iter.close();
     var printed: u32 = 0;
     var first_json = true;
-    while (printed < 50) {
+    while (printed < limit) {
         const entry = iter.next() orelse break;
         if (session_type) |st| {
             if (entry.view.header.type != st) continue;
@@ -1584,7 +1584,7 @@ fn printUsage(stdout: *Io.Writer) !void {
         \\  config [--json]          Show config
         \\  tasks [--json]           List tasks (from LMDB if available)
         \\  tasks sync [file]       Sync tasks.json into LMDB
-        \\  sessions [--type X] [--json]  List sessions
+        \\  sessions [--type X] [--limit N] [--json]  List sessions
         \\  session <id> [--json]    Show session detail (--json includes raw event data)
         \\  version                  Print version
         \\
