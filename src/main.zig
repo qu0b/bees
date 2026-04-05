@@ -791,6 +791,7 @@ fn cmdStatus(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
             .rejected = lmdb_stats.rejected,
             .conflicts = lmdb_stats.conflicts,
             .build_failures = lmdb_stats.build_failures,
+            .errors = lmdb_stats.errors,
             .total_cost_cents = lmdb_stats.total_cost_cents,
         };
     }
@@ -800,11 +801,12 @@ fn cmdStatus(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
         try writeJsonStr(stdout, cfg.project.name);
         try stdout.print(",\"path\":", .{});
         try writeJsonStr(stdout, paths.root);
-        try stdout.print(",\"workers\":{d},\"today\":{{\"total\":{d},\"accepted\":{d},\"rejected\":{d},\"conflicts\":{d},\"build_failures\":{d},\"cost_cents\":{d}}}}}\n", .{
+        try stdout.print(",\"workers\":{d},\"today\":{{\"total\":{d},\"accepted\":{d},\"rejected\":{d},\"errors\":{d},\"conflicts\":{d},\"build_failures\":{d},\"cost_cents\":{d}}}}}\n", .{
             cfg.workers.count,
             stats.total,
             stats.accepted,
             stats.rejected,
+            stats.errors,
             stats.conflicts,
             stats.build_failures,
             stats.total_cost_cents,
@@ -812,7 +814,7 @@ fn cmdStatus(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
     } else {
         try stdout.print("  Project:   {s} ({s})\n", .{ cfg.project.name, paths.root });
         try stdout.print("  Workers:   {d} configured\n", .{cfg.workers.count});
-        try stdout.print("  Today:     {d} accepted, {d} rejected, {d} conflicts, {d} build failures\n", .{ stats.accepted, stats.rejected, stats.conflicts, stats.build_failures });
+        try stdout.print("  Today:     {d} accepted, {d} rejected, {d} errors, {d} conflicts, {d} build failures\n", .{ stats.accepted, stats.rejected, stats.errors, stats.conflicts, stats.build_failures });
         try stdout.print("  Cost:      ${d:.2} today\n", .{@as(f64, @floatFromInt(stats.total_cost_cents)) / 100.0});
     }
 }
