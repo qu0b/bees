@@ -32,6 +32,7 @@ pub fn getProfile(name: []const u8) ?ToolPermissions {
     if (std.mem.eql(u8, name, "user")) return user_agent;
     if (std.mem.eql(u8, name, "researcher")) return researcher;
     if (std.mem.eql(u8, name, "review")) return readonly;
+    if (std.mem.eql(u8, name, "founder")) return founder_profile;
     if (std.mem.eql(u8, name, "readonly")) return readonly;
     return null;
 }
@@ -46,6 +47,7 @@ pub fn getDefaultForSessionType(session_type: types.SessionType) ?ToolPermission
         .strategist => strategist,
         .user => user_agent,
         .researcher => researcher,
+        .founder => founder_profile,
         .review => readonly,
         else => null,
     };
@@ -299,6 +301,43 @@ const researcher = ToolPermissions{
         "Bash(rm *)",
         "Bash(kill *)",
         "Bash(systemctl *)",
+    },
+};
+
+// ── Founder ────────────────────────────────────────────────────────────
+// Executive authority: read everything, write configs/roles/workflows,
+// web search for market awareness. Can restructure the org.
+// Cannot modify source code, commit, or manage processes.
+const founder_profile = ToolPermissions{
+    .permission_mode = "dontAsk",
+    .allowed_tools = &.{
+        "Read",
+        "Glob",
+        "Grep",
+        "Edit",
+        "Write",
+        "Bash(git log *)",
+        "Bash(git diff *)",
+        "Bash(git show *)",
+        "Bash(git status *)",
+        "Bash(cat *)",
+        "Bash(ls *)",
+        "Bash(mkdir *)",
+        "Bash(bees *)",
+        "Bash(wc *)",
+        "WebSearch",
+        "WebFetch",
+        "mcp__*",
+    },
+    .disallowed_tools = &.{
+        "Bash(git commit *)",
+        "Bash(git push *)",
+        "Bash(git merge *)",
+        "Bash(sudo *)",
+        "Bash(kill *)",
+        "Bash(pkill *)",
+        "Bash(systemctl *)",
+        "Bash(rm -rf *)",
     },
 };
 

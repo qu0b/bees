@@ -35,6 +35,8 @@ const DaemonState = struct {
     /// Workers write here; main loop reads and drains.
     sre_trigger_sessions: [64]u64 = [_]u64{0} ** 64,
     sre_trigger_count: u32 = 0,
+    /// PID of the daemon-owned headless Chrome instance (0 = not running).
+    chrome_pid: std.posix.pid_t = 0,
 };
 
 /// Global pointer for signal handler (signals can't capture context).
@@ -94,13 +96,22 @@ pub fn run(
     io: Io,
     allocator: std.mem.Allocator,
 ) !DaemonAction {
-    logger.info("[daemon] starting — workers={d} threshold={d} timeout={d}min cooldown={d}min", .{
+    logger.info("[daemon] starting — workers={d} threshold={d} timeout={d}min cooldown={d}s", .{
         cfg.workers.count,                 cfg.merger.merge_threshold,
-        cfg.daemon.worker_timeout_minutes, cfg.daemon.cooldown_minutes,
+        cfg.daemon.worker_timeout_minutes, cfg.daemon.cooldown_secs,
     });
 
     var state = DaemonState{};
     installSignalHandlers(&state);
+
+    // Spawn daemon-owned headless Chrome for MCP-enabled roles (QA, user agent).
+    // Kills any orphaned Chrome from previous runs, then starts a fresh instance.
+    if (backend.spawnChrome(io)) |pid| {
+        state.chrome_pid = pid;
+        logger.info("[daemon] Chrome started (pid={d})", .{pid});
+    } else {
+        logger.warn("[daemon] Chrome failed to start — MCP-enabled roles will not have browser access", .{});
+    }
 
     // Start REST API server as a background green thread
     if (cfg.api.enabled) {
@@ -328,9 +339,8 @@ pub fn run(
             syncToSqlite(paths, store, logger, allocator);
 
             // Cooldown
-            const cooldown_secs = @as(u64, cfg.daemon.cooldown_minutes) * 60;
-            logger.info("[daemon] cooling down for {d} minutes", .{cfg.daemon.cooldown_minutes});
-            sleep_secs(io, cooldown_secs);
+            logger.info("[daemon] cooling down for {d}s", .{cfg.daemon.cooldown_secs});
+            sleep_secs(io, @as(u64, cfg.daemon.cooldown_secs));
 
             // Sync tasks.json into LMDB and reload from store
             tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
@@ -350,6 +360,12 @@ pub fn run(
                         sleep_secs(io, 5);
                         wait += 5;
                     }
+                }
+
+                // Kill Chrome before re-exec — new daemon instance will spawn fresh
+                if (state.chrome_pid != 0) {
+                    logger.info("[daemon] stopping Chrome before reload (pid={d})", .{state.chrome_pid});
+                    backend.killChrome(state.chrome_pid, io);
                 }
                 return .reload;
             }
@@ -392,6 +408,12 @@ pub fn run(
             @atomicLoad(u32, &state.active_count, .acquire),
         });
     }
+    // Kill daemon-owned Chrome
+    if (state.chrome_pid != 0) {
+        logger.info("[daemon] stopping Chrome (pid={d})", .{state.chrome_pid});
+        backend.killChrome(state.chrome_pid, io);
+    }
+
     logger.info("[daemon] shutdown complete", .{});
     return .shutdown;
 }

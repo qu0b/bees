@@ -21,8 +21,21 @@ pub const Command = union(enum) {
     sessions: struct { session_type: ?types.SessionType = null, json: bool = false, limit: u32 = 50 },
     session: struct { id: u64, json: bool = false },
     knowledge,
+    funding: struct { action: FundingAction = .list },
+    wallet: struct { action: WalletAction = .list },
     version,
     help,
+};
+
+pub const FundingAction = union(enum) {
+    list,
+    approve: []const u8,
+    deny: []const u8,
+};
+
+pub const WalletAction = union(enum) {
+    list,
+    init_role: []const u8,
 };
 
 pub const OutputOptions = struct {
@@ -94,6 +107,28 @@ pub fn parse(args: []const []const u8) !Command {
 
     if (std.mem.eql(u8, cmd, "knowledge")) return .knowledge;
 
+    if (std.mem.eql(u8, cmd, "wallet")) {
+        if (args.len >= 3 and std.mem.eql(u8, args[2], "init")) {
+            if (args.len < 4) return error.MissingRoleName;
+            return .{ .wallet = .{ .action = .{ .init_role = args[3] } } };
+        }
+        return .{ .wallet = .{ .action = .list } };
+    }
+
+    if (std.mem.eql(u8, cmd, "funding")) {
+        if (args.len < 3) return .{ .funding = .{ .action = .list } };
+        const sub = args[2];
+        if (std.mem.eql(u8, sub, "approve")) {
+            if (args.len < 4) return error.MissingFundingId;
+            return .{ .funding = .{ .action = .{ .approve = args[3] } } };
+        }
+        if (std.mem.eql(u8, sub, "deny")) {
+            if (args.len < 4) return error.MissingFundingId;
+            return .{ .funding = .{ .action = .{ .deny = args[3] } } };
+        }
+        return .{ .funding = .{ .action = .list } };
+    }
+
     return error.UnknownCommand;
 }
 
@@ -125,6 +160,7 @@ fn parseSessionType(s: []const u8) ?types.SessionType {
     if (std.mem.eql(u8, s, "qa")) return .qa;
     if (std.mem.eql(u8, s, "user")) return .user;
     if (std.mem.eql(u8, s, "researcher")) return .researcher;
+    if (std.mem.eql(u8, s, "founder")) return .founder;
     return null;
 }
 

@@ -91,7 +91,7 @@ pub const Config = struct {
     };
 
     pub const Daemon = struct {
-        cooldown_minutes: u32 = 5,
+        cooldown_secs: u32 = 300,
         // External `timeout` wrapper breaks Claude in io_uring async context.
         // Set to 0 (disabled) by default until a Zig-native timeout is implemented.
         worker_timeout_minutes: u32 = 0,
@@ -148,6 +148,7 @@ pub const ProjectPaths = struct {
     logs_dir: []const u8,
     prompts_dir: []const u8,
     knowledge_dir: []const u8,
+    funding_dir: []const u8,
 
     pub fn init(allocator: std.mem.Allocator, project_root: []const u8) !ProjectPaths {
         const bees_dir = try std.fs.path.join(allocator, &.{ project_root, ".bees" });
@@ -160,6 +161,7 @@ pub const ProjectPaths = struct {
             .logs_dir = try std.fs.path.join(allocator, &.{ bees_dir, "logs" }),
             .prompts_dir = try std.fs.path.join(allocator, &.{ bees_dir, "prompts" }),
             .knowledge_dir = try std.fs.path.join(allocator, &.{ bees_dir, "knowledge" }),
+            .funding_dir = try std.fs.path.join(allocator, &.{ bees_dir, "funding" }),
         };
     }
 };

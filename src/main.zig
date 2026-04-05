@@ -21,6 +21,7 @@ const roles_default = @import("roles_default.zig");
 const knowledge = @import("knowledge.zig");
 const sqlite = @import("db/sqlite.zig");
 const db_query = @import("db/query.zig");
+const funding = @import("funding.zig");
 
 pub const version = "0.1.0";
 
@@ -298,6 +299,8 @@ fn runCommand(cmd: cli.Command, arena: std.mem.Allocator, io: Io, stdout: *Io.Wr
         .sessions => |opts| try cmdSessions(arena, stdout, opts.session_type, opts.json, opts.limit),
         .session => |opts| try cmdSession(arena, stdout, opts.id, opts.json),
         .knowledge => try cmdKnowledge(arena, stdout),
+        .funding => |opts| try cmdFunding(arena, io, stdout, opts.action),
+        .wallet => |opts| try cmdWallet(arena, io, stdout, opts.action),
     }
 }
 
@@ -342,6 +345,7 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: 
         "knowledge/decisions",
         "knowledge/failed",
         "knowledge/operations",
+        "funding",
     }) |d| {
         const path = try std.fs.path.join(arena, &.{ bees_dir, d });
         try fs.makePath(path);
@@ -1384,6 +1388,262 @@ fn cmdKnowledge(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
     try stdout.print("\n{d} knowledge entries\n", .{index.len});
 }
 
+fn cmdFunding(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, action: cli.FundingAction) !void {
+    const project = try loadProject(arena);
+    const paths = project[1];
+
+    // Ensure funding directory exists
+    fs.makePath(paths.funding_dir) catch {};
+
+    switch (action) {
+        .list => {
+            var dir = fs.openDir(paths.funding_dir) catch {
+                try stdout.print("No funding requests.\n", .{});
+                return;
+            };
+            defer fs.closeDir(dir);
+
+            var count: u32 = 0;
+            var iter = dir.iterate();
+            while (iter.next(fs.io) catch null) |entry| {
+                if (entry.kind != .file) continue;
+                if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+
+                const path = std.fs.path.join(arena, &.{ paths.funding_dir, entry.name }) catch continue;
+                const data = fs.readFileAlloc(arena, path, 64 * 1024) catch continue;
+
+                // Extract fields from JSON
+                const title = findJsonStr(data, "title") orelse "(no title)";
+                const status = findJsonStr(data, "status") orelse "pending";
+                const cost = findJsonStr(data, "cost_impact") orelse "";
+                const id = if (std.mem.endsWith(u8, entry.name, ".json"))
+                    entry.name[0 .. entry.name.len - 5]
+                else
+                    entry.name;
+
+                const marker: []const u8 = if (std.mem.eql(u8, status, "pending"))
+                    "[PENDING]"
+                else if (std.mem.eql(u8, status, "approved"))
+                    "[APPROVED]"
+                else if (std.mem.eql(u8, status, "denied"))
+                    "[DENIED]"
+                else if (std.mem.eql(u8, status, "applied"))
+                    "[APPLIED]"
+                else
+                    "[?]";
+
+                try stdout.print("  {s:<10} {s:<14} {s}", .{ marker, id, title });
+                if (cost.len > 0) {
+                    try stdout.print("  ({s})", .{cost});
+                }
+                try stdout.print("\n", .{});
+                count += 1;
+            }
+
+            if (count == 0) {
+                try stdout.print("No funding requests.\n", .{});
+            } else {
+                try stdout.print("\n{d} request(s). Use `bees funding approve <id>` or `bees funding deny <id>`.\n", .{count});
+            }
+        },
+        .approve => |id| try approveFunding(arena, io, stdout, paths, id),
+        .deny => |id| try updateFundingStatus(arena, stdout, paths.funding_dir, id, "denied"),
+    }
+}
+
+/// Approve a funding request: update status, then execute on-chain transfer.
+fn approveFunding(
+    arena: std.mem.Allocator,
+    io: Io,
+    stdout: *Io.Writer,
+    paths: config_mod.ProjectPaths,
+    id: []const u8,
+) !void {
+    const filename = try std.fmt.allocPrint(arena, "{s}.json", .{id});
+    const path = try std.fs.path.join(arena, &.{ paths.funding_dir, filename });
+
+    const data = fs.readFileAlloc(arena, path, 64 * 1024) catch {
+        try stdout.print("Funding request '{s}' not found.\n", .{id});
+        return;
+    };
+
+    const title = findJsonStr(data, "title") orelse id;
+    const amount = findJsonStr(data, "amount_usdc");
+    const token = findJsonStr(data, "token") orelse funding.DEFAULT_TOKEN;
+
+    // Resolve recipient: explicit in request, or derive from role's wallet
+    const roles_dir = try std.fs.path.join(arena, &.{ paths.bees_dir, "roles" });
+    const recipient = findJsonStr(data, "recipient_wallet") orelse
+        findJsonStr(data, "founder_wallet") orelse
+        funding.getAddress(io, arena, roles_dir, findJsonStr(data, "recipient_role") orelse "founder");
+
+    // Update status to approved
+    try updateFundingStatus(arena, stdout, paths.funding_dir, id, "approved");
+
+    // Execute on-chain transfer if amount and recipient are specified
+    if (amount) |amt| {
+        if (recipient) |to| {
+            try stdout.print("Transferring {s} USDC.e to {s}...\n", .{ amt, to });
+
+            // Investor wallet (default tempo login) sends to recipient — no private_key override
+            const tx_hash = funding.transfer(io, arena, amt, token, to, null) catch |e| {
+                try stdout.print("Transfer failed: {s}\n", .{@errorName(e)});
+                return;
+            };
+
+            if (tx_hash) |hash| {
+                defer arena.free(hash);
+                try stdout.print("Transfer complete: {s}\n", .{hash});
+                try stdout.print("  https://explore.tempo.xyz/tx/{s}\n", .{hash});
+            } else {
+                try stdout.print("Transfer failed — check `tempo wallet whoami` for balance and connectivity.\n", .{});
+            }
+        } else {
+            try stdout.print("Approved: {s}\n", .{title});
+            try stdout.print("  Note: no recipient wallet found — create one with `bees wallet init <role>`.\n", .{});
+        }
+    } else {
+        try stdout.print("  Note: no 'amount_usdc' field — no on-chain transfer. Founder will apply on next run.\n", .{});
+    }
+}
+
+/// Update the status field in a funding request JSON file.
+fn cmdWallet(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, action: cli.WalletAction) !void {
+    const project = try loadProject(arena);
+    const paths = project[1];
+    const roles_dir = try std.fs.path.join(arena, &.{ paths.bees_dir, "roles" });
+
+    switch (action) {
+        .list => {
+            var dir = fs.openDir(roles_dir) catch {
+                try stdout.print("No roles directory found.\n", .{});
+                return;
+            };
+            defer fs.closeDir(dir);
+
+            try stdout.print("  {s:<16} {s:<44} {s}\n", .{ "Role", "Address", "Wallet" });
+            try stdout.print("  {s:-<16} {s:-<44} {s:-<20}\n", .{ "", "", "" });
+
+            var count: u32 = 0;
+            var iter = dir.iterate();
+            while (iter.next(fs.io) catch null) |entry| {
+                if (entry.kind != .directory) continue;
+
+                // Check if this role has a wallet.key
+                const key_path = std.fs.path.join(arena, &.{ roles_dir, entry.name, "wallet.key" }) catch continue;
+                if (!fs.access(key_path)) {
+                    arena.free(key_path);
+                    continue;
+                }
+                arena.free(key_path);
+
+                const address = funding.getAddress(io, arena, roles_dir, entry.name) orelse "(deriving failed)";
+                try stdout.print("  {s:<16} {s:<44} wallet.key\n", .{ entry.name, address });
+                count += 1;
+            }
+
+            if (count == 0) {
+                try stdout.print("  (no role wallets found)\n", .{});
+            }
+            try stdout.print("\n{d} wallet(s). Use `bees wallet init <role>` to create one.\n", .{count});
+        },
+        .init_role => |role| {
+            const key = funding.ensureWallet(arena, roles_dir, role) catch |e| {
+                try stdout.print("Failed to create wallet for '{s}': {s}\n", .{ role, @errorName(e) });
+                return;
+            };
+            _ = key;
+            const address = funding.getAddress(io, arena, roles_dir, role) orelse "(could not derive address)";
+            try stdout.print("Wallet for '{s}': {s}\n", .{ role, address });
+        },
+    }
+}
+
+fn updateFundingStatus(
+    arena: std.mem.Allocator,
+    stdout: *Io.Writer,
+    funding_dir: []const u8,
+    id: []const u8,
+    new_status: []const u8,
+) !void {
+    const filename = try std.fmt.allocPrint(arena, "{s}.json", .{id});
+    const path = try std.fs.path.join(arena, &.{ funding_dir, filename });
+
+    const data = fs.readFileAlloc(arena, path, 64 * 1024) catch {
+        try stdout.print("Funding request '{s}' not found.\n", .{id});
+        return;
+    };
+
+    // Replace "status": "<old>" with "status": "<new>".
+    // Find the "status" key, skip past the colon, then find the quoted value.
+    const status_key = "\"status\"";
+    const key_pos = std.mem.indexOf(u8, data, status_key) orelse {
+        try stdout.print("Malformed request — no status field.\n", .{});
+        return;
+    };
+
+    // Skip past "status" key and find the colon
+    const after_key = data[key_pos + status_key.len ..];
+    const colon_pos = std.mem.indexOfScalar(u8, after_key, ':') orelse return;
+    const after_colon = after_key[colon_pos + 1 ..];
+
+    // Find opening quote of value
+    const open_quote = std.mem.indexOfScalar(u8, after_colon, '"') orelse return;
+    const value_start = after_colon[open_quote + 1 ..];
+
+    // Find closing quote of value
+    const close_quote = std.mem.indexOfScalar(u8, value_start, '"') orelse return;
+
+    // Calculate absolute positions in original data
+    const abs_value_start = key_pos + status_key.len + colon_pos + 1 + open_quote + 1;
+    const abs_value_end = abs_value_start + close_quote;
+
+    const new_data = try std.fmt.allocPrint(arena, "{s}{s}{s}", .{
+        data[0..abs_value_start],
+        new_status,
+        data[abs_value_end..],
+    });
+
+    const f = try fs.createFile(path, .{});
+    try fs.writeFile(f, new_data);
+    fs.closeFile(f);
+
+    const title = findJsonStr(data, "title") orelse id;
+    try stdout.print("{s}: {s}\n", .{
+        if (std.mem.eql(u8, new_status, "approved")) "Approved" else "Denied",
+        title,
+    });
+}
+
+/// Simple JSON string value extractor (no allocations, returns slice into data).
+fn findJsonStr(data: []const u8, key: []const u8) ?[]const u8 {
+    // Search for "key": "value" or "key" : "value"
+    var pos: usize = 0;
+    while (pos < data.len) {
+        const key_start = std.mem.indexOf(u8, data[pos..], "\"") orelse return null;
+        const abs_key_start = pos + key_start + 1;
+        if (abs_key_start + key.len >= data.len) return null;
+
+        if (std.mem.eql(u8, data[abs_key_start..][0..key.len], key)) {
+            const after = data[abs_key_start + key.len ..];
+            if (after.len > 0 and after[0] == '"') {
+                // Found the key, now skip to colon and value
+                const colon = std.mem.indexOfScalar(u8, after[1..], ':') orelse {
+                    pos = abs_key_start + key.len;
+                    continue;
+                };
+                const after_colon = after[1 + colon + 1 ..];
+                const val_quote = std.mem.indexOfScalar(u8, after_colon, '"') orelse return null;
+                const val_start = after_colon[val_quote + 1 ..];
+                const val_end = std.mem.indexOfScalar(u8, val_start, '"') orelse return null;
+                return val_start[0..val_end];
+            }
+        }
+        pos = abs_key_start + 1;
+    }
+    return null;
+}
+
 fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?types.SessionType, json: bool, limit: u32) !void {
     const project = try loadProject(arena);
     const paths = project[1];
@@ -1627,6 +1887,11 @@ fn printUsage(stdout: *Io.Writer) !void {
         \\  sessions [--type X] [--limit N] [--json]  List sessions
         \\  session <id> [--json]    Show session detail (--json includes raw event data)
         \\  knowledge                List knowledge base entries
+        \\  funding                  List funding requests from Founder-CEO
+        \\  funding approve <id>     Approve a funding request
+        \\  funding deny <id>        Deny a funding request
+        \\  wallet                   List role wallets (Tempo addresses)
+        \\  wallet init <role>       Create a wallet for a role
         \\  version                  Print version
         \\
     , .{version});
@@ -1658,6 +1923,8 @@ fn printError(stdout: *Io.Writer, e: anyerror) !void {
         error.InvalidSessionId => "Invalid session ID. Must be a number.",
         error.MissingRunSubcommand => "Missing subcommand. Usage: bees run worker|merger|strategist|sre|qa",
         error.UnknownRunSubcommand => "Unknown subcommand. Usage: bees run worker|merger|strategist|sre|qa",
+        error.MissingFundingId => "Missing request ID. Usage: bees funding approve|deny <id>",
+        error.MissingRoleName => "Missing role name. Usage: bees wallet init <role>",
         error.UnknownCommand => "Unknown command. Run `bees help` for usage.",
         error.InvalidWorkerId => "Invalid worker ID. Must be a number.",
         error.NotABeesProject => "Not a bees project. Run `bees init` first.",

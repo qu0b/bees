@@ -15,6 +15,7 @@ const backend = @import("backend.zig");
 const role_mod = @import("role.zig");
 const context = @import("context.zig");
 const knowledge = @import("knowledge.zig");
+const funding = @import("funding.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 
@@ -86,6 +87,19 @@ pub fn runRole(
         static_prompt_buf;
     defer if (prompt.ptr != static_prompt_buf.ptr) allocator.free(prompt);
 
+    // Load role's Tempo wallet key (if it has one) for paid API access
+    const roles_dir = std.fs.path.join(allocator, &.{ paths.bees_dir, "roles" }) catch null;
+    defer if (roles_dir) |rd| allocator.free(rd);
+
+    var tempo_env: [1][2][]const u8 = undefined;
+    const extra_env: ?[]const [2][]const u8 = if (roles_dir) |rd| blk: {
+        if (funding.loadKey(allocator, rd, role_name)) |key| {
+            tempo_env[0] = .{ "TEMPO_PRIVATE_KEY", key };
+            break :blk &tempo_env;
+        }
+        break :blk null;
+    } else null;
+
     // Run Claude session
     const result = backend.runSession(store, io, .{
         .backend = bt,
@@ -103,6 +117,7 @@ pub fn runRole(
         .permission_mode = if (perms) |p| p.permission_mode else null,
         .allowed_tools = if (perms) |p| if (p.allowed_tools.len > 0) p.allowed_tools else null else null,
         .disallowed_tools = if (perms) |p| if (p.disallowed_tools.len > 0) p.disallowed_tools else null else null,
+        .extra_env = extra_env,
     }, session_id, allocator) catch |e| {
         logger.err("[{s}] session failed: {}", .{ role_name, e });
         // Mark session as error so it doesn't stay stale as "running".

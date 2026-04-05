@@ -120,6 +120,9 @@ pub const BackendOptions = struct {
     permission_mode: ?[]const u8 = null,
     allowed_tools: ?[]const []const u8 = null,
     disallowed_tools: ?[]const []const u8 = null,
+
+    // -- Extra environment variables injected into the child process --
+    extra_env: ?[]const [2][]const u8 = null,
 };
 
 pub const ResultAccumulator = struct {
@@ -173,6 +176,7 @@ fn spawn(backend: types.BackendType, allocator: std.mem.Allocator, io: Io, optio
             .permission_mode = options.permission_mode,
             .allowed_tools = options.allowed_tools,
             .disallowed_tools = options.disallowed_tools,
+            .extra_env = options.extra_env,
         }),
         .codex => backend_codex.spawnCodex(allocator, io, options),
         .opencode => backend_opencode.spawnOpenCode(allocator, io, options),
@@ -515,9 +519,95 @@ pub fn runSession(
     };
 }
 
+// ── Chrome lifecycle ────────────────────────────────────────────────────
+// The daemon owns a single headless Chrome instance shared by all roles.
+// Roles create/close their own tabs via MCP; the daemon manages the process.
+
+const CHROME_PORT: u16 = 9222;
+const CHROME_DATA_DIR = "/home/ubuntu/.cache/chrome-headless-bees";
+
+/// Spawn a headless Chrome instance for MCP-enabled roles.
+/// Returns the child PID, or null if Chrome could not be started.
+/// Kills any orphaned Chrome on the same port before spawning.
+pub fn spawnChrome(io: Io) ?std.posix.pid_t {
+    // Kill any orphaned Chrome from a previous daemon run
+    killOrphanedChrome(io);
+
+    const argv = [_][]const u8{
+        "/opt/google/chrome/chrome",
+        "--headless=new",
+        "--no-first-run",
+        "--disable-gpu",
+        "--disable-dev-shm-usage",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-background-timer-throttling",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--renderer-process-limit=4",
+        "--remote-debugging-port=9222",
+        "--user-data-dir=" ++ CHROME_DATA_DIR,
+        "--noerrdialogs",
+        "--ozone-platform=headless",
+        "--ozone-override-screen-size=800,600",
+        "--use-angle=swiftshader-webgl",
+        "about:blank",
+    };
+
+    var child = std.process.spawn(io, .{
+        .argv = &argv,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return null;
+
+    // Give Chrome time to bind the debug port
+    io.sleep(Io.Duration.fromSeconds(2), .awake) catch {};
+
+    return child.id;
+}
+
+/// Gracefully kill Chrome by PID: SIGTERM → 5s wait → SIGKILL.
+pub fn killChrome(pid: std.posix.pid_t, io: Io) void {
+    // Send SIGTERM for graceful shutdown
+    std.posix.kill(pid, std.c.SIG.TERM) catch return;
+
+    // Wait up to 5 seconds for exit
+    var waited: u32 = 0;
+    while (waited < 5) : (waited += 1) {
+        io.sleep(Io.Duration.fromSeconds(1), .awake) catch {};
+        // Check if process still exists (signal 0 = probe)
+        std.posix.kill(pid, @enumFromInt(0)) catch return; // Process gone
+    }
+
+    // Force kill if still alive
+    std.posix.kill(pid, std.c.SIG.KILL) catch {};
+}
+
+/// Kill any Chrome processes listening on the debug port.
+/// Called on startup to clean up orphans from a previous crashed daemon.
+fn killOrphanedChrome(io: Io) void {
+    // Check if anything is listening on the debug port
+    const addr = Io.net.IpAddress.parse("127.0.0.1", CHROME_PORT) catch return;
+    var stream = Io.net.IpAddress.connect(addr, io, .{ .mode = .stream }) catch return;
+    stream.close(io);
+
+    // Something is listening — find and kill Chrome processes with our data dir.
+    // Use pkill matching the user-data-dir to avoid killing unrelated Chrome.
+    const kill_argv = [_][]const u8{ "pkill", "-f", "chrome-headless-bees" };
+    var child = std.process.spawn(io, .{
+        .argv = &kill_argv,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return;
+    _ = child.wait(io) catch {};
+
+    // Wait for processes to die
+    io.sleep(Io.Duration.fromSeconds(2), .awake) catch {};
+}
+
 /// Close all Chrome DevTools tabs except about:blank and force GC on renderers.
 /// Public so the orchestrator can call it between cycles for periodic cleanup.
-/// Called after MCP-enabled sessions to prevent tab/process accumulation.
+/// Each role creates its own tabs; this closes any that leaked.
 /// Entirely non-fatal — if Chrome isn't running or anything fails, silently returns.
 pub fn cleanupChrome(io: Io) void {
     cleanupChromeTabs(io);

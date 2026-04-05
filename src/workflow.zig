@@ -8,7 +8,7 @@
 //! {
 //!   "name": "default",
 //!   "steps": [
-//!     { "role": "worker", "parallel": 3 },
+//!     { "role": "worker", "parallel": 5 },
 //!     { "role": "merger", "trigger": "workers_done" },
 //!     { "group": "validation", "steps": [
 //!       { "role": "qa" },
@@ -18,7 +18,7 @@
 //!     { "role": "strategist", "every": 3 }
 //!   ],
 //!   "cycle": {
-//!     "cooldown_minutes": 5,
+//!     "cooldown_secs": 300,
 //!     "merge_threshold": 3,
 //!     "worker_timeout_minutes": 60
 //!   }
@@ -58,7 +58,7 @@ pub const Step = struct {
 };
 
 pub const CycleConfig = struct {
-    cooldown_minutes: u32 = 5,
+    cooldown_secs: u32 = 300,
     merge_threshold: u32 = 3,
     worker_timeout_minutes: u32 = 60,
     restart_timeout_minutes: u32 = 20,

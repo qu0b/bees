@@ -34,6 +34,9 @@ pub const ClaudeOptions = struct {
     allowed_tools: ?[]const []const u8 = null,
     /// Tool specifiers to deny (e.g., "WebSearch", "Bash(curl *)").
     disallowed_tools: ?[]const []const u8 = null,
+
+    /// Extra environment variables injected into the child process.
+    extra_env: ?[]const [2][]const u8 = null,
 };
 
 pub const SessionResult = struct {
@@ -152,6 +155,13 @@ pub fn spawnClaude(allocator: std.mem.Allocator, io: Io, options: ClaudeOptions)
     const backend_mod = @import("backend.zig");
     var env_map = backend_mod.buildFilteredEnvMap(allocator);
     defer env_map.deinit();
+
+    // Inject per-role extra env vars (e.g. TEMPO_PRIVATE_KEY for funded roles)
+    if (options.extra_env) |extras| {
+        for (extras) |pair| {
+            env_map.put(pair[0], pair[1]) catch {};
+        }
+    }
 
     var child = try std.process.spawn(io, .{
         .argv = args.items,
