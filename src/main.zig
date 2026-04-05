@@ -435,7 +435,19 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: 
     try addToGitignore(arena, cwd);
 
     try stdout.print("\nInitialized bees project at {s}\n", .{bees_dir});
-    try stdout.print("Review .bees/config.json and .bees/tasks.json, then run `bees start`.\n", .{});
+    try stdout.print(
+        \\\n=== Next steps ===
+        \\  1. Review config:     bees config
+        \\  2. Review tasks:      bees tasks
+        \\  3. Test one worker:   bees run worker
+        \\  4. Start the daemon:  bees start
+        \\
+        \\If workers fail with 0 turns:
+        \\  - Check Claude CLI:   claude --version
+        \\  - Check daemon log:   bees log
+        \\  - Check status:       bees status
+        \\
+    , .{});
 }
 
 fn runInitSession(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, cwd: []const u8, prompt: []const u8) bool {
