@@ -34,7 +34,7 @@ pub fn spawnOpenCode(allocator: std.mem.Allocator, io: Io, options: backend.Back
         .cwd = .{ .path = options.cwd },
         .environ_map = &env_map,
         .stdout = .pipe,
-        .stderr = .ignore,
+        .stderr = .inherit,
         .stdin = if (options.stdin_data != null) .pipe else .ignore,
     });
 
