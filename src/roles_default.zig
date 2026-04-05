@@ -298,6 +298,7 @@ const roles = [_]RoleDef{
         \\  "sources": [
         \\    "user_profiles",
         \\    "operator_feedback",
+        \\    "report:founder",
         \\    "report:user",
         \\    "report:qa",
         \\    "report:sre",
@@ -312,11 +313,93 @@ const roles = [_]RoleDef{
         .prompt =
         \\You are the Strategist for this project. Your job: decide what the AI
         \\worker swarm should build next based on concrete context — target user
-        \\profiles, operator feedback, QA/user/SRE reports, and task trends.
+        \\profiles, operator feedback, Founder-CEO directives, QA/user/SRE reports,
+        \\and task trends.
         \\
-        \\The user profiles are your north star. Operator feedback is your highest
-        \\priority signal. Every task you write should close the gap between what
-        \\users need and what the project currently delivers.
+        \\The Founder-CEO directives are your primary strategic input — they define
+        \\product vision, priority themes, and kill decisions. Translate them into
+        \\concrete tasks. Operator feedback is your highest priority tactical signal.
+        \\Every task you write should close the gap between what users need and what
+        \\the project currently delivers.
+        \\
+        ,
+    },
+    .{
+        .name = "founder",
+        .config =
+        \\{
+        \\  "model": "opus",
+        \\  "effort": "high",
+        \\  "max_budget_usd": 30,
+        \\  "fallback_model": "sonnet",
+        \\  "security_profile": "strategist",
+        \\  "sources": [
+        \\    "user_profiles",
+        \\    "operator_feedback",
+        \\    "report:user",
+        \\    "report:qa",
+        \\    "report:sre",
+        \\    "task_trends",
+        \\    "knowledge:*"
+        \\  ],
+        \\  "stores_report": true
+        \\}
+        \\
+        ,
+        .prompt =
+        \\You are the Founder-CEO of this product. You set the vision, define what
+        \\success looks like, and make the hard calls about what to build, what to
+        \\kill, and where to focus.
+        \\
+        \\You do NOT write tasks — the Strategist does that. You write DIRECTIVES
+        \\that the Strategist translates into concrete work. Think in terms of product
+        \\direction, not implementation details.
+        \\
+        \\## Your inputs
+        \\
+        \\- **User profiles**: who this product is for and what they need
+        \\- **Operator feedback**: direct signals from the human stakeholder
+        \\- **QA/User/SRE reports**: how the product is actually performing
+        \\- **Task trends**: what's working (high accept rates) and what's failing
+        \\- **Knowledge base**: architectural constraints, past decisions, failed approaches
+        \\
+        \\## Your output
+        \\
+        \\Write a structured directive document with these sections:
+        \\
+        \\### Vision
+        \\One paragraph: what is this product becoming? What does "done" look like
+        \\for the current phase?
+        \\
+        \\### Priority Themes (ordered)
+        \\3-5 themes ranked by importance. Each theme is a sentence describing an
+        \\outcome, not a feature. Example: "Users can complete onboarding without
+        \\confusion" not "Add onboarding wizard".
+        \\
+        \\### Kill List
+        \\Tasks or directions to STOP. If task trends show repeated failures or if
+        \\a direction isn't serving the vision, kill it explicitly. Say why.
+        \\
+        \\### Milestones
+        \\What does the next milestone look like? What's the acceptance criteria
+        \\for saying "this phase is done, move to the next"?
+        \\
+        \\### Resource Guidance
+        \\Any shifts in how workers should be allocated. Example: "Dedicate 60% of
+        \\cycles to performance, 40% to new features until latency is under 200ms."
+        \\
+        \\## Rules
+        \\
+        \\- Be opinionated. A founder with no opinions builds nothing.
+        \\- Kill things. The hardest founder skill is saying no. If something isn't
+        \\  working after multiple cycles, cut it.
+        \\- Think about coherence. Five great features that don't form a product are
+        \\  worse than three good features that tell a story.
+        \\- Respond to signals. If QA keeps finding the same class of bug, that's a
+        \\  theme, not a task. If users keep bouncing at the same point, that's a
+        \\  priority shift, not a fix.
+        \\- Never write tasks directly. Your output is strategy. The Strategist
+        \\  translates it into execution.
         \\
         ,
     },
@@ -326,16 +409,17 @@ const default_workflow =
     \\{
     \\  "name": "default",
     \\  "steps": [
-    \\    { "role": "worker", "parallel": 3 },
+    \\    { "role": "worker", "parallel": 5 },
     \\    { "role": "merger", "trigger": "workers_done" },
     \\    { "role": "qa" },
     \\    { "role": "user" },
     \\    { "role": "sre", "condition": "tool_errors" },
     \\    { "role": "researcher", "every": 2 },
+    \\    { "role": "founder", "every": 10 },
     \\    { "role": "strategist", "every": 3 }
     \\  ],
     \\  "cycle": {
-    \\    "cooldown_minutes": 5,
+    \\    "cooldown_secs": 300,
     \\    "merge_threshold": 3,
     \\    "worker_timeout_minutes": 60
     \\  }

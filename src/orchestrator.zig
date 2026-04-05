@@ -657,6 +657,7 @@ fn mapRoleToSessionType(name: []const u8) ?types.SessionType {
     if (std.mem.eql(u8, name, "qa")) return .qa;
     if (std.mem.eql(u8, name, "user")) return .user;
     if (std.mem.eql(u8, name, "researcher")) return .researcher;
+    if (std.mem.eql(u8, name, "founder")) return .founder;
     return null; // Unknown role — custom roles get .user type by default
 }
 

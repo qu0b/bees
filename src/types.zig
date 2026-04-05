@@ -14,6 +14,7 @@ pub const SessionType = enum(u4) {
     qa = 7,
     user = 8,
     researcher = 9,
+    founder = 10,
 
     pub fn label(self: SessionType) []const u8 {
         return switch (self) {
@@ -27,6 +28,7 @@ pub const SessionType = enum(u4) {
             .qa => "qa",
             .user => "user",
             .researcher => "researcher",
+            .founder => "founder",
         };
     }
 };

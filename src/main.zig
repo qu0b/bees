@@ -514,9 +514,9 @@ fn buildInitPrompt(arena: std.mem.Allocator, cwd: []const u8, name: []const u8, 
         \\    Build commands must use absolute paths: "cd {s} && <build-cmd>"
         \\    test_command: fast check (type-check/unit tests, not E2E). Null if none.
         \\    setup_command: install deps, non-interactive (--yes flags). Null if none.
-        \\  workers: {{"count": 3}} — number of parallel coding agents
+        \\  workers: {{"count": 5}} — number of parallel coding agents
         \\  merger: {{"merge_threshold": 3}} — merge after N workers complete
-        \\  daemon: {{"cooldown_minutes": 5, "worker_timeout_minutes": 60}}
+        \\  daemon: {{"cooldown_secs": 300, "worker_timeout_minutes": 60}}
         \\  serve (optional, for web services):
         \\    {{"systemd_unit": "<name>", "health_url": "http://localhost:<port>"}}
         \\
@@ -530,6 +530,9 @@ fn buildInitPrompt(arena: std.mem.Allocator, cwd: []const u8, name: []const u8, 
         \\    or REJECT with reasoning. Only reject clearly wrong/harmful changes.
         \\  roles/sre/prompt.md — SRE monitor. CRITICAL: Must NEVER kill/restart/stop processes
         \\    (no pkill, kill, systemctl stop/restart). Only inspect and adjust config.
+        \\  roles/founder/prompt.md — Founder-CEO. Sets product vision, priority themes,
+        \\    kill decisions, and milestones. Mention what this product should become and
+        \\    who it serves. Does NOT write tasks — outputs directives for the strategist.
         \\
         \\Do NOT create tasks.json — the strategist generates tasks on its first run.
         \\
@@ -623,7 +626,7 @@ fn writeDefaultConfig(arena: std.mem.Allocator, config_path: []const u8, project
         \\    "merge_threshold": 3
         \\  }},
         \\  "daemon": {{
-        \\    "cooldown_minutes": 5,
+        \\    "cooldown_secs": 300,
         \\    "worker_timeout_minutes": 60
         \\  }}
         \\}}
@@ -1355,31 +1358,30 @@ fn cmdKnowledge(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
     const project = try loadProject(arena);
     const paths = project[1];
 
-    var dir = std.fs.openDirAbsolute(paths.knowledge_dir, .{ .iterate = true }) catch |e| {
-        try stdout.print("No knowledge base found: {s}\n", .{@errorName(e)});
+    var store = store_mod.Store.open(paths.db_dir) catch {
+        try stdout.print("No database found\n", .{});
         return;
     };
-    defer dir.close();
+    defer store.close();
 
-    var count: u32 = 0;
-    var walker = try dir.walk(arena);
-    defer walker.deinit();
+    const txn = try store.beginReadTxn();
+    defer store_mod.Store.abortTxn(txn);
 
-    while (try walker.next()) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.basename, ".md")) continue;
-        if (std.mem.eql(u8, entry.basename, "_schema.md")) continue;
-        if (std.mem.eql(u8, entry.basename, "_log.md")) continue;
-
-        try stdout.print("  {s}\n", .{entry.path});
-        count += 1;
-    }
-
-    if (count == 0) {
+    const index = knowledge.loadIndex(&store, txn, arena) orelse {
         try stdout.print("Knowledge base is empty.\n", .{});
-    } else {
-        try stdout.print("\n{d} knowledge entries\n", .{count});
+        return;
+    };
+
+    try stdout.print("  {s:<40} {s:<20} {s}\n", .{ "Path", "Tags", "Summary" });
+    try stdout.print("  {s:-<40} {s:-<20} {s:-<40}\n", .{ "", "", "" });
+
+    for (index) |page| {
+        const tags_str = try std.mem.join(arena, ",", page.tags);
+        const summary = if (page.summary.len > 60) page.summary[0..60] else page.summary;
+        try stdout.print("  {s:<40} {s:<20} {s}\n", .{ page.path, tags_str, summary });
     }
+
+    try stdout.print("\n{d} knowledge entries\n", .{index.len});
 }
 
 fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?types.SessionType, json: bool, limit: u32) !void {

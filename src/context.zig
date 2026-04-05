@@ -30,6 +30,7 @@ pub const Source = enum {
     report_qa,
     report_sre,
     report_user,
+    report_founder,
     task_trends,
     worker_summary,
     changed_files,
@@ -71,6 +72,7 @@ pub fn build(
             .report_qa => appendMeta(&parts, store, txn, "report:qa", "Latest QA Report", allocator),
             .report_sre => appendMeta(&parts, store, txn, "report:sre", "Latest SRE Report", allocator),
             .report_user => appendMeta(&parts, store, txn, "report:user", "User Engagement Report\nSimulated user personas navigated the product and reported their experience:", allocator),
+            .report_founder => appendMeta(&parts, store, txn, "report:founder", "Founder-CEO Directives\nProduct vision, priority themes, and strategic decisions from the Founder-CEO:", allocator),
             .task_trends => appendMeta(&parts, store, txn, "report:trends", "Task Performance Trends", allocator),
             .worker_summary => {
                 if (extras.worker_summary) |ws| {

@@ -156,6 +156,8 @@ pub fn resolveContextSources(role: RoleConfig, allocator: std.mem.Allocator) Res
             sources.append(allocator, .report_sre) catch continue;
         } else if (std.mem.eql(u8, s, "report:user")) {
             sources.append(allocator, .report_user) catch continue;
+        } else if (std.mem.eql(u8, s, "report:founder")) {
+            sources.append(allocator, .report_founder) catch continue;
         } else if (std.mem.eql(u8, s, "task_trends")) {
             sources.append(allocator, .task_trends) catch continue;
         } else if (std.mem.eql(u8, s, "worker_summary")) {

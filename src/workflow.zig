@@ -107,11 +107,12 @@ pub fn defaultWorkflow() Workflow {
 }
 
 const default_steps = [_]Step{
-    .{ .role = "worker", .parallel = 3 },
+    .{ .role = "worker", .parallel = 5 },
     .{ .role = "merger", .trigger = "workers_done" },
     .{ .role = "qa" },
     .{ .role = "user" },
     .{ .role = "sre", .condition = "tool_errors" },
+    .{ .role = "founder", .every = 10 },
     .{ .role = "strategist", .every = 3 },
 };
 
