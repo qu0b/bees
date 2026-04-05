@@ -3,7 +3,6 @@
 /// All functions take a sqlite.Db (read-only connection) and write results
 /// directly as JSON to an Io.Writer or return simple values. No allocations
 /// needed for most queries — data flows straight from SQLite rows to output.
-
 const std = @import("std");
 const Io = std.Io;
 const sqlite = @import("sqlite.zig");
@@ -170,7 +169,7 @@ pub fn writeTasksJson(db: *sqlite.Db, w: *Io.Writer) !void {
         try writeJsonStr(w, stmt.columnText(2));
         try w.print(",\"total_runs\":{d},\"accepted\":{d},\"rejected\":{d},\"empty\":{d},\"status\":\"{s}\",\"origin\":\"{s}\"}}", .{
             stmt.columnInt(3), stmt.columnInt(4), stmt.columnInt(5), stmt.columnInt(6),
-            status.label(), origin.label(),
+            status.label(),    origin.label(),
         });
     }
     try w.writeAll("]");
@@ -199,7 +198,7 @@ pub fn getDailyStats(db: *sqlite.Db, day_start_ts: u64) !DailyStats {
         \\  SUM(CASE WHEN status = 5 THEN 1 ELSE 0 END),
         \\  COALESCE(SUM(cost_microdollars / 10000), 0)
         \\FROM sessions WHERE started_at >= ?
-        ++ "\x00",
+    ++ "\x00",
     );
     defer stmt.finalize();
     sqlite.bindInt(stmt.handle, 1, @intCast(day_start_ts));

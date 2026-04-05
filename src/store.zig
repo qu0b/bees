@@ -159,7 +159,7 @@ pub const Store = struct {
         try check(c.mdb_put(txn, self.sessions_by_status, &status_key_val, &empty_val, 0));
 
         // Write time index
-        var time_key = types.TimeIndexKey.init(@as(u64, header.started_at), id, header.@"type");
+        var time_key = types.TimeIndexKey.init(@as(u64, header.started_at), id, header.type);
         var time_key_val = mkValSlice(time_key.toBytes());
         try check(c.mdb_put(txn, self.sessions_by_time, &time_key_val, &empty_val, 0));
 
@@ -731,7 +731,7 @@ fn openDbi(txn: ?*c.MDB_txn, name: [*:0]const u8) !c.MDB_dbi {
 fn mkVal(s: anytype) c.MDB_val {
     return .{
         .mv_size = s.len,
-        .mv_data = @constCast(@ptrCast(s.ptr)),
+        .mv_data = @ptrCast(@constCast(s.ptr)),
     };
 }
 
@@ -745,7 +745,7 @@ fn mkValBytes(bytes: anytype) c.MDB_val {
 fn mkValSlice(s: anytype) c.MDB_val {
     return .{
         .mv_size = s.len,
-        .mv_data = @constCast(@ptrCast(s.ptr)),
+        .mv_data = @ptrCast(@constCast(s.ptr)),
     };
 }
 
@@ -837,7 +837,7 @@ test "store create and get session" {
     defer store.close();
 
     const header = types.SessionHeader{
-        .@"type" = .worker,
+        .type = .worker,
         .status = .running,
         .has_exit_code = false,
         .has_cost = false,
@@ -868,7 +868,7 @@ test "store create and get session" {
     const session = (try store.getSession(txn, id)).?;
     try std.testing.expectEqualStrings("Bug hunt", session.task);
     try std.testing.expectEqualStrings("bee/test/worker-1", session.branch);
-    try std.testing.expectEqual(types.SessionType.worker, session.header.@"type");
+    try std.testing.expectEqual(types.SessionType.worker, session.header.type);
     try std.testing.expectEqual(types.SessionStatus.running, session.header.status);
 }
 
