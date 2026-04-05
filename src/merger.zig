@@ -209,7 +209,7 @@ fn reviewAndMerge(
     const now: u64 = fs.timestamp();
     const review_bt = backend.resolveBackend(cfg.default_backend, cfg.merger.backend);
     const header = types.SessionHeader{
-        .@"type" = .review,
+        .type = .review,
         .status = .running,
         .has_exit_code = false,
         .has_cost = false,
@@ -335,7 +335,6 @@ fn incrementWorkerTaskStat(store: *store_mod.Store, worker_session_id: u64, fiel
     store_mod.Store.commitTxn(write_txn) catch {};
 }
 
-
 fn runPipeline(
     cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
@@ -400,7 +399,7 @@ fn runBuildStep(
     const fix_model = types.ModelType.fromString(cfg.merger.model);
     const now: u64 = fs.timestamp();
     const header = types.SessionHeader{
-        .@"type" = .fix,
+        .type = .fix,
         .status = .running,
         .has_exit_code = false,
         .has_cost = false,
