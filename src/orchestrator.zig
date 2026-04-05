@@ -158,6 +158,7 @@ pub fn run(
 
     // Main loop — polls via cooperative sleep
     var was_quiet = false;
+    var consecutive_empty_merges: u32 = 0;
     while (@atomicLoad(u32, &state.shutdown_requested, .acquire) == 0) {
         sleep_secs(io, 10);
 
@@ -203,6 +204,15 @@ pub fn run(
                 break :blk git.getChangedFiles(allocator, io, paths.root, pmh, post_head) catch null;
             } else null;
             defer if (changed_files) |cf| allocator.free(cf);
+
+            if (changed_files == null) {
+                consecutive_empty_merges += 1;
+                if (consecutive_empty_merges >= 3) {
+                    logger.err("[daemon] circuit breaker: {d} consecutive cycles with 0 accepted merges", .{consecutive_empty_merges});
+                }
+            } else {
+                consecutive_empty_merges = 0;
+            }
 
             // Self-hosted reload: detect if source .zig files changed
             const source_changed = cfg.daemon.self_hosted and
