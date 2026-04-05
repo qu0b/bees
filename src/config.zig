@@ -92,7 +92,9 @@ pub const Config = struct {
 
     pub const Daemon = struct {
         cooldown_minutes: u32 = 5,
-        worker_timeout_minutes: u32 = 60,
+        // External `timeout` wrapper breaks Claude in io_uring async context.
+        // Set to 0 (disabled) by default until a Zig-native timeout is implemented.
+        worker_timeout_minutes: u32 = 0,
         restart_timeout_minutes: u32 = 20,
         max_restarts: u32 = 2,
         /// UTC hour (0-23) when quiet period starts. Null = disabled.
