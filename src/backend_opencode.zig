@@ -13,9 +13,6 @@ pub fn spawnOpenCode(allocator: std.mem.Allocator, io: Io, options: backend.Back
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(allocator);
 
-    var timeout_buf: [32]u8 = undefined;
-    try backend.appendTimeoutArgs(&args, allocator, &timeout_buf, options.timeout_secs);
-
     try args.append(allocator, "opencode");
     try args.append(allocator, "run");
     try args.append(allocator, "--format");

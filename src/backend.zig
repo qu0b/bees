@@ -56,15 +56,6 @@ pub fn buildFilteredEnvMap(allocator: std.mem.Allocator) std.process.Environ.Map
     return env_map;
 }
 
-/// Prepend timeout args to an arg list if timeout_secs > 0.
-pub fn appendTimeoutArgs(args: *std.ArrayList([]const u8), allocator: std.mem.Allocator, timeout_buf: *[32]u8, timeout_secs: u32) !void {
-    if (timeout_secs > 0) {
-        try args.append(allocator, "timeout");
-        try args.append(allocator, "--kill-after=10");
-        const timeout_str = std.fmt.bufPrint(timeout_buf, "{d}", .{timeout_secs}) catch "3600";
-        try args.append(allocator, timeout_str);
-    }
-}
 
 /// Write stdin data to child process and close stdin pipe.
 pub fn writeStdinAndClose(child: *std.process.Child, io: Io, data: ?[]const u8) void {

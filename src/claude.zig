@@ -62,14 +62,6 @@ pub fn spawnClaude(allocator: std.mem.Allocator, io: Io, options: ClaudeOptions)
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(allocator);
 
-    if (options.timeout_secs > 0) {
-        try args.append(allocator, "timeout");
-        try args.append(allocator, "--kill-after=10");
-        var timeout_buf: [32]u8 = undefined;
-        const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{options.timeout_secs}) catch "3600";
-        try args.append(allocator, timeout_str);
-    }
-
     try args.append(allocator, "claude");
 
     // --mcp-config must come before -p because -p makes all

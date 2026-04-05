@@ -235,7 +235,7 @@ fn reviewAndMerge(
     const session_id = store.createSession(header, "", candidate.branch, "") catch return;
     candidate.session_id = session_id;
 
-    const review_prompt_path = std.fs.path.join(allocator, &.{ paths.prompts_dir, "review.txt" }) catch return;
+    const review_prompt_path = std.fs.path.join(allocator, &.{ paths.bees_dir, "roles", "review", "prompt.md" }) catch return;
     defer allocator.free(review_prompt_path);
 
     // Cap diff to avoid blowing the context window

@@ -9,9 +9,6 @@ pub fn spawnCodex(allocator: std.mem.Allocator, io: Io, options: backend.Backend
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(allocator);
 
-    var timeout_buf: [32]u8 = undefined;
-    try backend.appendTimeoutArgs(&args, allocator, &timeout_buf, options.timeout_secs);
-
     try args.append(allocator, "codex");
     try args.append(allocator, "exec");
     try args.append(allocator, "--json");

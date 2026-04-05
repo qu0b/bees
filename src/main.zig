@@ -770,15 +770,21 @@ fn cmdStatus(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
     var stats = db_query.DailyStats{};
     if (sql_db) |*db| {
         stats = db_query.getDailyStats(db, day_start) catch db_query.DailyStats{};
-    } else {
+    }
+
+    // Fall through to LMDB when SQLite is missing OR returned all zeros
+    if (stats.total == 0) lmdb_fallback: {
         var store = store_mod.Store.open(paths.db_dir) catch {
-            try stdout.print("No database found. Run `bees run worker` first.\n", .{});
-            return;
+            if (sql_db == null) {
+                try stdout.print("No database found. Run `bees run worker` first.\n", .{});
+                return;
+            }
+            break :lmdb_fallback;
         };
         defer store.close();
-        const txn = try store.beginReadTxn();
+        const txn = store.beginReadTxn() catch break :lmdb_fallback;
         defer store_mod.Store.abortTxn(txn);
-        const lmdb_stats = try store.getDailyStats(txn, day_start);
+        const lmdb_stats = store.getDailyStats(txn, day_start) catch break :lmdb_fallback;
         stats = .{
             .total = lmdb_stats.total,
             .accepted = lmdb_stats.accepted,
