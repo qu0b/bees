@@ -785,15 +785,7 @@ fn cmdStatus(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
         const txn = store.beginReadTxn() catch break :lmdb_fallback;
         defer store_mod.Store.abortTxn(txn);
         const lmdb_stats = store.getDailyStats(txn, day_start) catch break :lmdb_fallback;
-        stats = .{
-            .total = lmdb_stats.total,
-            .accepted = lmdb_stats.accepted,
-            .rejected = lmdb_stats.rejected,
-            .conflicts = lmdb_stats.conflicts,
-            .build_failures = lmdb_stats.build_failures,
-            .errors = lmdb_stats.errors,
-            .total_cost_cents = lmdb_stats.total_cost_cents,
-        };
+        stats = lmdb_stats;
     }
 
     if (json) {

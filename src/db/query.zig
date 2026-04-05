@@ -179,15 +179,7 @@ pub fn writeTasksJson(db: *sqlite.Db, w: *Io.Writer) !void {
 // Daily stats (replaces store.getDailyStats)
 // ============================================================================
 
-pub const DailyStats = struct {
-    total: u32 = 0,
-    accepted: u32 = 0,
-    rejected: u32 = 0,
-    conflicts: u32 = 0,
-    build_failures: u32 = 0,
-    errors: u32 = 0,
-    total_cost_cents: u64 = 0,
-};
+pub const DailyStats = @import("../store.zig").Store.DailyStats;
 
 pub fn getDailyStats(db: *sqlite.Db, day_start_ts: u64) !DailyStats {
     var stmt = try db.prepare(
