@@ -584,9 +584,17 @@ fn regenerateHumanIndex(
 pub const schema_document =
     \\# Knowledge Base Schema
     \\
-    \\This directory is the swarm's institutional memory. Agents read pages before
-    \\acting and write findings after. Knowledge compounds over time — each cycle
-    \\builds on what previous cycles learned.
+    \\This directory is the swarm's institutional memory — durable facts whose
+    \\value does not decline over time. Not changelogs, not status updates, not
+    \\summaries of what happened. Git history has that.
+    \\
+    \\**The test**: if this information is equally valuable to an agent reading
+    \\it 3 months from now as it is today, it belongs here. If not, it doesn't.
+    \\
+    \\Good: "LMDB chosen over SQLite because zero-copy mmap reads avoid
+    \\allocation under concurrent green threads. Benchmarked in commit abc1234."
+    \\
+    \\Bad: "Worker 3 refactored the auth module on March 15th."
     \\
     \\## Categories
     \\
@@ -629,9 +637,12 @@ pub const schema_document =
     \\
     \\## Conventions
     \\
+    \\- **Durable facts only.** Every page must pass the 3-month test. No ephemeral
+    \\  status, no recent-activity summaries, no descriptions that restate the code.
+    \\- **WHY over WHAT.** The code says what. Knowledge says why it's this way,
+    \\  what was tried before, and what breaks if you change it.
     \\- **One concept per page.** 500-3000 bytes typical. Split large topics.
     \\- **Factual, not speculative.** Record what IS, not what might be.
-    \\- **Say why, not just what.** "We use LMDB because zero-copy mmap reads" > "We use LMDB."
     \\- **Cross-reference freely.** Mention related pages: "See also: architecture/auth-flow.md"
     \\- **Failed approaches are valuable.** Record what was tried, why it failed, and what replaced it.
     \\- **Tags match directories.** Use the category name plus specific topics.
