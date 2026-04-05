@@ -699,7 +699,59 @@ fn cmdDaemon(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     // Use c_allocator for the daemon loop so free() actually returns memory
     // to the OS. The process arena never reclaims pages, causing unbounded
     // growth in a long-running daemon (every worker/merger/QA session leaks).
-    try orchestrator.run(cfg, paths, &store, &logger, io, std.heap.c_allocator);
+    const action = try orchestrator.run(cfg, paths, &store, &logger, io, std.heap.c_allocator);
+
+    if (action == .reload) {
+        // Self-hosted hot reload: replace the running binary and re-exec
+        const new_bin = try std.fs.path.join(arena, &.{ paths.root, "zig-out", "bin", "bees" });
+
+        // Resolve current executable path
+        var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const exe_path = try fs.readLinkAbsolute("/proc/self/exe", &exe_buf);
+        const exe_path_z = try arena.dupeZ(u8, exe_path);
+
+        // Backup current binary before replacing
+        const backup_dir = try std.fs.path.join(arena, &.{ paths.bees_dir, "bin" });
+        fs.makePath(backup_dir) catch {};
+        const backup_path = try std.fs.path.join(arena, &.{ backup_dir, "bees.prev" });
+        copyFile(exe_path, backup_path) catch |e| {
+            logger.warn("[daemon] backup copy failed (continuing): {}", .{e});
+        };
+
+        // Install new binary over the current one (atomic rename, fallback to copy)
+        installBinary(new_bin, exe_path) catch |e| {
+            logger.err("[daemon] failed to install new binary: {}", .{e});
+            return;
+        };
+
+        logger.info("[daemon] re-exec'ing with new binary", .{});
+
+        // Close LMDB cleanly before replacing the process
+        store.close();
+
+        // Replace the process image — does not return on success
+        const err = std.process.replace(io, .{ .argv = &.{ exe_path_z, "daemon" } });
+        logger.err("[daemon] execve failed: {s}", .{@errorName(err)});
+    }
+}
+
+/// Copy a file from src to dst using shell cp (works across filesystems).
+fn copyFile(src: []const u8, dst: []const u8) !void {
+    const result = git.run(std.heap.c_allocator, fs.io, &.{ "cp", "-f", src, dst }, "/") catch return error.FileNotFound;
+    defer std.heap.c_allocator.free(result.stdout);
+    defer std.heap.c_allocator.free(result.stderr);
+
+    if (result.exit_code != 0) return error.AccessDenied;
+}
+
+/// Install new_bin at dest_path. Tries atomic rename first, falls back to copy.
+fn installBinary(new_bin: []const u8, dest_path: []const u8) !void {
+    // rename is atomic but only works on the same filesystem
+    Io.Dir.renameAbsolute(new_bin, dest_path, fs.io) catch {
+        // Different filesystem — fall back to copy (not atomic, but functional)
+        try copyFile(new_bin, dest_path);
+        return;
+    };
 }
 
 fn cmdStatus(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {

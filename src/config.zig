@@ -103,6 +103,9 @@ pub const Config = struct {
         quiet_end_utc: ?u8 = null,
         /// If true (default), quiet hours only apply Mon-Fri.
         quiet_weekdays_only: bool = true,
+        /// When true, daemon re-execs itself after merging source code changes.
+        /// Only useful when bees is building itself.
+        self_hosted: bool = false,
     };
 
     pub const Git = struct {

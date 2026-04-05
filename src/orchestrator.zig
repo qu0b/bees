@@ -21,6 +21,9 @@ const MAX_WORKERS = 32;
 
 const backend = @import("backend.zig");
 
+/// Returned by `run` to tell the caller how the daemon loop ended.
+pub const DaemonAction = enum { shutdown, reload };
+
 /// Shared daemon state — accessed via atomics for cross-green-thread safety.
 const DaemonState = struct {
     done_count: u32 = 0,
@@ -90,7 +93,7 @@ pub fn run(
     logger: *log_mod.Logger,
     io: Io,
     allocator: std.mem.Allocator,
-) !void {
+) !DaemonAction {
     logger.info("[daemon] starting — workers={d} threshold={d} timeout={d}min cooldown={d}min", .{
         cfg.workers.count,                 cfg.merger.merge_threshold,
         cfg.daemon.worker_timeout_minutes, cfg.daemon.cooldown_minutes,
@@ -110,8 +113,8 @@ pub fn run(
     // Mark any stale "running" sessions as "error" from previous daemon crash
     cleanupStaleSessions(store, logger);
 
-    // Track merge cycles for strategist scheduling
-    var merge_cycle: u32 = 0;
+    // Track merge cycles for strategist scheduling (survives reload via LMDB)
+    var merge_cycle: u32 = loadMergeCycle(store);
 
     // Bootstrap: sync tasks.json into LMDB
     tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch |e| {
@@ -200,6 +203,10 @@ pub fn run(
                 break :blk git.getChangedFiles(allocator, io, paths.root, pmh, post_head) catch null;
             } else null;
             defer if (changed_files) |cf| allocator.free(cf);
+
+            // Self-hosted reload: detect if source .zig files changed
+            const source_changed = cfg.daemon.self_hosted and
+                sourceFilesChanged(changed_files);
 
             // Build + restart once (serves QA, user agent, and strategist)
             prepareForStrategist(cfg, paths, logger, io, allocator);
@@ -301,6 +308,24 @@ pub fn run(
             tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
             reloadPool(&pool, store, paths.tasks_file, allocator);
 
+            // Self-hosted hot reload: persist state and return to caller for execve
+            if (source_changed) {
+                logger.info("[daemon] source code changed, initiating hot reload", .{});
+                persistMergeCycle(store, merge_cycle, logger);
+
+                // Drain active workers before replacing the binary
+                const active = @atomicLoad(u32, &state.active_count, .acquire);
+                if (active > 0) {
+                    logger.info("[daemon] waiting for {d} active workers to finish before reload...", .{active});
+                    var wait: u32 = 0;
+                    while (@atomicLoad(u32, &state.active_count, .acquire) > 0 and wait < 300) {
+                        sleep_secs(io, 5);
+                        wait += 5;
+                    }
+                }
+                return .reload;
+            }
+
             if (!pool.hasActiveTasks()) {
                 logger.info("[daemon] all tasks exhausted, running strategist", .{});
                 runStrategistWithPrep(cfg, paths, store, logger, io, allocator);
@@ -340,6 +365,7 @@ pub fn run(
         });
     }
     logger.info("[daemon] shutdown complete", .{});
+    return .shutdown;
 }
 
 /// Spawn a single worker as an async green thread.
@@ -694,6 +720,39 @@ fn writeTaskTrends(
     };
     store_mod.Store.commitTxn(write_txn) catch return;
     logger.info("[daemon] wrote task trends to LMDB ({d} bytes)", .{pos});
+}
+
+/// Returns true if any .zig source files changed in the merge diff.
+fn sourceFilesChanged(changed_files: ?[]const u8) bool {
+    const files = changed_files orelse return false;
+    var iter = std.mem.splitScalar(u8, files, '\n');
+    while (iter.next()) |line| {
+        if (std.mem.endsWith(u8, line, ".zig")) return true;
+    }
+    return false;
+}
+
+/// Load the persisted merge cycle counter (survives hot reload via LMDB).
+fn loadMergeCycle(store: *store_mod.Store) u32 {
+    const txn = store.beginReadTxn() catch return 0;
+    defer store_mod.Store.abortTxn(txn);
+
+    const val = (store.getMeta(txn, "daemon:merge_cycle") catch null) orelse return 0;
+    return std.fmt.parseInt(u32, val, 10) catch 0;
+}
+
+/// Persist the merge cycle counter to LMDB so it survives hot reload.
+fn persistMergeCycle(store: *store_mod.Store, cycle: u32, logger: *log_mod.Logger) void {
+    var buf: [16]u8 = undefined;
+    const val = std.fmt.bufPrint(&buf, "{d}", .{cycle}) catch return;
+
+    const txn = store.beginWriteTxn() catch return;
+    store.putMeta(txn, "daemon:merge_cycle", val) catch {
+        store_mod.Store.abortTxn(txn);
+        return;
+    };
+    store_mod.Store.commitTxn(txn) catch return;
+    logger.info("[daemon] persisted merge_cycle={d} for reload", .{cycle});
 }
 
 /// Reload the task pool, freeing the old one only on success.
