@@ -679,6 +679,7 @@ pub const Store = struct {
         rejected: u32 = 0,
         conflicts: u32 = 0,
         build_failures: u32 = 0,
+        errors: u32 = 0,
         total_cost_cents: u64 = 0,
     };
 
@@ -708,6 +709,7 @@ pub const Store = struct {
                     .rejected => stats.rejected += 1,
                     .conflict_status => stats.conflicts += 1,
                     .build_failed => stats.build_failures += 1,
+                    .err => stats.errors += 1,
                     else => {},
                 }
                 stats.total_cost_cents += @as(u64, session.header.cost_microdollars) / 10000;

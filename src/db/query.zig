@@ -185,6 +185,7 @@ pub const DailyStats = struct {
     rejected: u32 = 0,
     conflicts: u32 = 0,
     build_failures: u32 = 0,
+    errors: u32 = 0,
     total_cost_cents: u64 = 0,
 };
 
@@ -196,6 +197,7 @@ pub fn getDailyStats(db: *sqlite.Db, day_start_ts: u64) !DailyStats {
         \\  SUM(CASE WHEN status = 3 THEN 1 ELSE 0 END),
         \\  SUM(CASE WHEN status = 4 THEN 1 ELSE 0 END),
         \\  SUM(CASE WHEN status = 5 THEN 1 ELSE 0 END),
+        \\  SUM(CASE WHEN status = 6 THEN 1 ELSE 0 END),
         \\  COALESCE(SUM(cost_microdollars / 10000), 0)
         \\FROM sessions WHERE started_at >= ?
     ++ "\x00",
@@ -211,7 +213,8 @@ pub fn getDailyStats(db: *sqlite.Db, day_start_ts: u64) !DailyStats {
         .rejected = @intCast(stmt.columnInt(2)),
         .conflicts = @intCast(stmt.columnInt(3)),
         .build_failures = @intCast(stmt.columnInt(4)),
-        .total_cost_cents = @intCast(stmt.columnInt(5)),
+        .errors = @intCast(stmt.columnInt(5)),
+        .total_cost_cents = @intCast(stmt.columnInt(6)),
     };
 }
 
