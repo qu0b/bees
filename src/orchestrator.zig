@@ -138,6 +138,24 @@ pub fn run(
     runStrategistWithPrep(cfg, paths, store, logger, io, allocator);
     tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
 
+    // Preflight: verify Claude CLI is reachable before spawning workers.
+    preflight: {
+        const pf_argv = [_][]const u8{ "claude", "--version" };
+        var pf_child = std.process.spawn(io, .{
+            .argv = &pf_argv,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        }) catch |e| {
+            logger.err("[daemon] preflight FAILED: claude CLI not found ({s}). Install it or check PATH.", .{@errorName(e)});
+            break :preflight;
+        };
+        _ = pf_child.wait(io) catch |e| {
+            logger.err("[daemon] preflight FAILED: claude CLI error ({s})", .{@errorName(e)});
+            break :preflight;
+        };
+        logger.info("[daemon] preflight passed: claude CLI is reachable", .{});
+    }
+
     // Sync LMDB → SQLite so dashboard has data
     syncToSqlite(paths, store, logger, allocator);
 
