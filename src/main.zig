@@ -297,6 +297,7 @@ fn runCommand(cmd: cli.Command, arena: std.mem.Allocator, io: Io, stdout: *Io.Wr
         .tasks_sync => |opts| try cmdTasksSync(arena, stdout, opts.file),
         .sessions => |opts| try cmdSessions(arena, stdout, opts.session_type, opts.json, opts.limit),
         .session => |opts| try cmdSession(arena, stdout, opts.id, opts.json),
+        .knowledge => try cmdKnowledge(arena, stdout),
     }
 }
 
@@ -1350,6 +1351,37 @@ fn cmdTasksSync(arena: std.mem.Allocator, stdout: *Io.Writer, file: ?[]const u8)
     try stdout.print("Tasks synced to LMDB from {s}\n", .{tasks_path});
 }
 
+fn cmdKnowledge(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
+    const project = try loadProject(arena);
+    const paths = project[1];
+
+    var dir = std.fs.openDirAbsolute(paths.knowledge_dir, .{ .iterate = true }) catch |e| {
+        try stdout.print("No knowledge base found: {s}\n", .{@errorName(e)});
+        return;
+    };
+    defer dir.close();
+
+    var count: u32 = 0;
+    var walker = try dir.walk(arena);
+    defer walker.deinit();
+
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".md")) continue;
+        if (std.mem.eql(u8, entry.basename, "_schema.md")) continue;
+        if (std.mem.eql(u8, entry.basename, "_log.md")) continue;
+
+        try stdout.print("  {s}\n", .{entry.path});
+        count += 1;
+    }
+
+    if (count == 0) {
+        try stdout.print("Knowledge base is empty.\n", .{});
+    } else {
+        try stdout.print("\n{d} knowledge entries\n", .{count});
+    }
+}
+
 fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?types.SessionType, json: bool, limit: u32) !void {
     const project = try loadProject(arena);
     const paths = project[1];
@@ -1592,6 +1624,7 @@ fn printUsage(stdout: *Io.Writer) !void {
         \\  tasks sync [file]       Sync tasks.json into LMDB
         \\  sessions [--type X] [--limit N] [--json]  List sessions
         \\  session <id> [--json]    Show session detail (--json includes raw event data)
+        \\  knowledge                List knowledge base entries
         \\  version                  Print version
         \\
     , .{version});

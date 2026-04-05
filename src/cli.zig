@@ -20,6 +20,7 @@ pub const Command = union(enum) {
     tasks_sync: struct { file: ?[]const u8 = null },
     sessions: struct { session_type: ?types.SessionType = null, json: bool = false, limit: u32 = 50 },
     session: struct { id: u64, json: bool = false },
+    knowledge,
     version,
     help,
 };
@@ -90,6 +91,8 @@ pub fn parse(args: []const []const u8) !Command {
 
     // Bare "strategist" as alias for "run strategist"
     if (std.mem.eql(u8, cmd, "strategist")) return .run_strategist;
+
+    if (std.mem.eql(u8, cmd, "knowledge")) return .knowledge;
 
     return error.UnknownCommand;
 }
