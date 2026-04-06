@@ -149,6 +149,8 @@ pub fn run(
     runStrategistWithPrep(cfg, paths, store, logger, io, allocator);
     tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
 
+    var preflight_ok = false;
+
     // Preflight: verify Claude CLI is reachable before spawning workers.
     preflight: {
         const pf_argv = [_][]const u8{ "claude", "--version" };
@@ -165,6 +167,7 @@ pub fn run(
             break :preflight;
         };
         logger.info("[daemon] preflight passed: claude CLI is reachable", .{});
+        preflight_ok = true;
     }
 
     // Sync LMDB → SQLite so dashboard has data
@@ -178,11 +181,13 @@ pub fn run(
     }
 
     // Spawn initial workers as green threads
-    if (pool.hasActiveTasks()) {
+    if (preflight_ok and pool.hasActiveTasks()) {
         const spawn_count = @min(cfg.workers.count, MAX_WORKERS);
         for (0..spawn_count) |_| {
             spawnWorker(cfg, paths, store, pool, logger, io, allocator, &state);
         }
+    } else if (!preflight_ok) {
+        logger.err("[daemon] skipping worker spawn — Claude CLI not available. Fix the installation and restart.", .{});
     }
 
     // Main loop — polls via cooperative sleep
