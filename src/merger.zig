@@ -424,7 +424,7 @@ fn runBuildStep(
 
     const session_id = try store.createSession(header, "", "", paths.root);
 
-    const fix_prompt_path = try std.fs.path.join(allocator, &.{ paths.prompts_dir, "fix.txt" });
+    const fix_prompt_path = try std.fs.path.join(allocator, &.{ paths.bees_dir, "roles", "fix", "prompt.md" });
     defer allocator.free(fix_prompt_path);
 
     const error_context = try std.fmt.allocPrint(allocator, "The {s} command `{s}` failed with:\n{s}\n{s}\nFix the issue.", .{ step_name, command, result.stdout, result.stderr });
