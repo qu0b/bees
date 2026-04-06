@@ -113,6 +113,7 @@ const default_steps = [_]Step{
     .{ .role = "user" },
     .{ .role = "sre", .condition = "tool_errors" },
     .{ .role = "founder", .every = 10 },
+    .{ .role = "researcher", .every = 2 },
     .{ .role = "strategist", .every = 3 },
 };
 
