@@ -149,6 +149,8 @@ pub fn run(
     runStrategistWithPrep(cfg, paths, store, logger, io, allocator);
     tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
 
+    var preflight_ok = false;
+
     // Preflight: verify Claude CLI is reachable before spawning workers.
     preflight: {
         const pf_argv = [_][]const u8{ "claude", "--version" };
@@ -165,24 +167,35 @@ pub fn run(
             break :preflight;
         };
         logger.info("[daemon] preflight passed: claude CLI is reachable", .{});
+        preflight_ok = true;
     }
 
     // Sync LMDB → SQLite so dashboard has data
     syncToSqlite(paths, store, logger, allocator);
 
-    // Load tasks from LMDB (single source of truth)
-    var pool = tasks_mod.TaskPool.loadFromStore(store, allocator) catch
+    // Load tasks from LMDB (single source of truth) and spawn initial workers
+    // only if the Claude CLI preflight passed — otherwise workers would all fail
+    // silently with 0 turns and $0.00 cost.
+    var pool = if (preflight_ok)
+        tasks_mod.TaskPool.loadFromStore(store, allocator) catch
+            try tasks_mod.TaskPool.load(allocator, paths.tasks_file)
+    else
         try tasks_mod.TaskPool.load(allocator, paths.tasks_file);
-    if (!pool.hasActiveTasks()) {
-        logger.warn("[daemon] no active tasks after startup strategist, waiting for SRE/manual intervention", .{});
-    }
 
-    // Spawn initial workers as green threads
-    if (pool.hasActiveTasks()) {
-        const spawn_count = @min(cfg.workers.count, MAX_WORKERS);
-        for (0..spawn_count) |_| {
-            spawnWorker(cfg, paths, store, pool, logger, io, allocator, &state);
+    if (preflight_ok) {
+        if (!pool.hasActiveTasks()) {
+            logger.warn("[daemon] no active tasks after startup strategist, waiting for SRE/manual intervention", .{});
         }
+
+        // Spawn initial workers as green threads
+        if (pool.hasActiveTasks()) {
+            const spawn_count = @min(cfg.workers.count, MAX_WORKERS);
+            for (0..spawn_count) |_| {
+                spawnWorker(cfg, paths, store, pool, logger, io, allocator, &state);
+            }
+        }
+    } else {
+        logger.err("[daemon] skipping worker spawn — Claude CLI not available. Fix the installation and restart.", .{});
     }
 
     // Main loop — polls via cooperative sleep
