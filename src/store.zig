@@ -710,7 +710,7 @@ pub const Store = struct {
                     .conflict_status => stats.conflicts += 1,
                     .build_failed => stats.build_failures += 1,
                     .err => stats.errors += 1,
-                    else => {},
+                    .running, .done => {},
                 }
                 stats.total_cost_cents += @as(u64, session.header.cost_microdollars) / 10000;
             }
