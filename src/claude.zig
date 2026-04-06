@@ -427,7 +427,7 @@ pub fn streamEvent(s: *Io.Writer, meta: types.EventMeta, line: []const u8) void 
             }
             s.flush() catch {};
         },
-        else => {},
+        .init_event, .tool_result => {},
     }
 }
 
