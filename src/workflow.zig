@@ -29,9 +29,9 @@ const fs = @import("fs.zig");
 const config_mod = @import("config.zig");
 
 pub const StepKind = enum {
-    single,   // Run one instance of a role
+    single, // Run one instance of a role
     parallel, // Run N instances of the same role
-    group,    // Run multiple different roles in parallel
+    group, // Run multiple different roles in parallel
 };
 
 pub const Step = struct {
