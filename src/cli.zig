@@ -18,6 +18,7 @@ pub const Command = union(enum) {
     config: OutputOptions,
     tasks: OutputOptions,
     tasks_sync: struct { file: ?[]const u8 = null },
+    sync,
     sessions: struct { session_type: ?types.SessionType = null, json: bool = false, limit: u32 = 50 },
     session: struct { id: u64, json: bool = false },
     knowledge,
@@ -69,6 +70,7 @@ pub fn parse(args: []const []const u8) !Command {
         }
         return .{ .tasks = .{ .json = hasFlag(args[2..], "--json") } };
     }
+    if (std.mem.eql(u8, cmd, "sync")) return .sync;
     if (std.mem.eql(u8, cmd, "log")) {
         return .{ .log = .{ .follow = hasFlag(args[2..], "--follow") or hasFlag(args[2..], "-f") } };
     }

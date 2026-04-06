@@ -22,6 +22,7 @@ const knowledge = @import("knowledge.zig");
 const sqlite = @import("db/sqlite.zig");
 const db_query = @import("db/query.zig");
 const funding = @import("funding.zig");
+const sync_mod = @import("db/sync.zig");
 
 pub const version = "0.1.0";
 
@@ -296,6 +297,7 @@ fn runCommand(cmd: cli.Command, arena: std.mem.Allocator, io: Io, stdout: *Io.Wr
         .config => |opts| try cmdConfig(arena, stdout, opts.json),
         .tasks => |opts| try cmdTasks(arena, stdout, opts.json),
         .tasks_sync => |opts| try cmdTasksSync(arena, stdout, opts.file),
+        .sync => try cmdSync(arena, stdout),
         .sessions => |opts| try cmdSessions(arena, stdout, opts.session_type, opts.json, opts.limit),
         .session => |opts| try cmdSession(arena, stdout, opts.id, opts.json),
         .knowledge => try cmdKnowledge(arena, stdout),
@@ -1358,6 +1360,33 @@ fn cmdTasksSync(arena: std.mem.Allocator, stdout: *Io.Writer, file: ?[]const u8)
     try stdout.print("Tasks synced to LMDB from {s}\n", .{tasks_path});
 }
 
+fn cmdSync(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
+    const project = try loadProject(arena);
+    const paths = project[1];
+
+    var store = store_mod.Store.open(paths.db_dir) catch |e| {
+        try stdout.print("Failed to open LMDB: {s}\n", .{@errorName(e)});
+        return;
+    };
+    defer store.close();
+
+    const sqlite_path = try std.fs.path.join(arena, &.{ paths.db_dir, "data.sqlite" });
+    var sync = sync_mod.SyncEngine.init(sqlite_path) catch |e| {
+        try stdout.print("Failed to open SQLite: {s}\n", .{@errorName(e)});
+        return;
+    };
+    defer sync.deinit();
+
+    const stats = sync.syncAll(&store) catch |e| {
+        try stdout.print("Sync failed: {s}\n", .{@errorName(e)});
+        return;
+    };
+
+    try stdout.print("Synced: {d} sessions, {d} events, {d} tasks\n", .{
+        stats.sessions_synced, stats.events_synced, stats.tasks_synced,
+    });
+}
+
 fn cmdKnowledge(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
     const project = try loadProject(arena);
     const paths = project[1];
@@ -1884,6 +1913,7 @@ fn printUsage(stdout: *Io.Writer) !void {
         \\  config [--json]          Show config
         \\  tasks [--json]           List tasks (from LMDB if available)
         \\  tasks sync [file]       Sync tasks.json into LMDB
+        \\  sync                     Sync LMDB data to SQLite replica
         \\  sessions [--type X] [--limit N] [--json]  List sessions
         \\  session <id> [--json]    Show session detail (--json includes raw event data)
         \\  knowledge                List knowledge base entries
