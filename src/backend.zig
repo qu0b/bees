@@ -533,18 +533,36 @@ fn chromeDataDir() []const u8 {
     return written;
 }
 
-/// Spawn a headless Chrome instance for MCP-enabled roles.
-/// Returns the child PID, or null if Chrome could not be started.
+/// Find a Chrome/Chromium binary. Checks common paths in priority order.
+fn findChromeBinary() ?[]const u8 {
+    const candidates = [_][*:0]const u8{
+        "/opt/google/chrome/chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+        "/snap/bin/chromium",
+    };
+    for (candidates) |path| {
+        if (std.c.access(path, std.c.F_OK) == 0) return std.mem.sliceTo(path, 0);
+    }
+    return null;
+}
+
+/// Spawn a headless Chrome/Chromium instance for MCP-enabled roles.
+/// Returns the child PID, or null if no browser found or it could not be started.
 /// Kills any orphaned Chrome on the same port before spawning.
 pub fn spawnChrome(io: Io) ?std.posix.pid_t {
     // Kill any orphaned Chrome from a previous daemon run
     killOrphanedChrome(io);
 
+    const chrome_bin = findChromeBinary() orelse return null;
+
     var data_dir_arg_buf: [300]u8 = undefined;
     const data_dir_arg = std.fmt.bufPrint(&data_dir_arg_buf, "--user-data-dir={s}", .{chromeDataDir()}) catch return null;
 
     const argv = [_][]const u8{
-        "/opt/google/chrome/chrome",
+        chrome_bin,
         "--headless=new",
         "--no-first-run",
         "--disable-gpu",
