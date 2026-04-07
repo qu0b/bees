@@ -56,8 +56,26 @@ echo "Installed bees to ${INSTALL_DIR}/${BINARY}"
 case ":$PATH:" in
     *":${INSTALL_DIR}:"*) ;;
     *)
+        SHELL_NAME=$(basename "${SHELL:-/bin/sh}")
         echo ""
         echo "Add bees to your PATH:"
-        echo "  echo 'export PATH=\"${INSTALL_DIR}:\$PATH\"' >> ~/.bashrc && source ~/.bashrc"
+        case "$SHELL_NAME" in
+            bash)
+                echo "  echo 'export PATH=\"${INSTALL_DIR}:\$PATH\"' >> ~/.bashrc && source ~/.bashrc"
+                ;;
+            zsh)
+                echo "  echo 'export PATH=\"${INSTALL_DIR}:\$PATH\"' >> ~/.zshrc && source ~/.zshrc"
+                ;;
+            fish)
+                echo "  fish_add_path ${INSTALL_DIR}"
+                ;;
+            ksh)
+                echo "  echo 'export PATH=\"${INSTALL_DIR}:\$PATH\"' >> ~/.kshrc && . ~/.kshrc"
+                ;;
+            *)
+                echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+                echo "  # Add the above to your shell's rc file to persist"
+                ;;
+        esac
         ;;
 esac
