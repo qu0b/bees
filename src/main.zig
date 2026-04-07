@@ -361,16 +361,27 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: 
         try stdout.flush();
 
         const prompt = try buildInitPrompt(arena, cwd, project_name, base_branch, bees_dir);
-        const success = runInitSession(arena, io, stdout, cwd, prompt);
+        const result = runInitSession(arena, io, stdout, cwd, prompt);
 
-        if (success) {
-            // Validate generated config
-            _ = config_mod.load(arena, config_path) catch {
-                try stdout.print("\nGenerated config.json is invalid, replacing with defaults...\n", .{});
-                writeDefaultConfig(arena, config_path, project_name, base_branch) catch {};
-            };
-        } else {
-            try stdout.print("\nClaude analysis failed, using defaults...\n", .{});
+        switch (result) {
+            .ok => {
+                // Validate generated config
+                _ = config_mod.load(arena, config_path) catch {
+                    try stdout.print("\nGenerated config.json is invalid, replacing with defaults...\n", .{});
+                    writeDefaultConfig(arena, config_path, project_name, base_branch) catch {};
+                };
+            },
+            .auth_error => {
+                try stdout.print(
+                    \\
+                    \\Authentication failed. Run `claude` to log in, then re-run `bees init`.
+                    \\
+                , .{});
+                return;
+            },
+            .failed => {
+                try stdout.print("\nClaude analysis failed, using defaults...\n", .{});
+            },
         }
     }
 
@@ -417,10 +428,20 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: 
 
     // Interactive strategy conversation — generates tailored roles/strategist/prompt.md
     if (!skip_analysis) {
-        const success = runStrategyConversation(arena, io, stdout, cwd, bees_dir);
-        if (!success) {
-            try stdout.print("\nStrategy setup skipped — using default strategist prompt.\n", .{});
-            try stdout.print("You can re-run with `claude` in .bees/ to customize later.\n", .{});
+        switch (runStrategyConversation(arena, io, stdout, cwd, bees_dir)) {
+            .ok => {},
+            .auth_error => {
+                try stdout.print(
+                    \\
+                    \\Authentication failed. Run `claude` to log in, then re-run `bees init`.
+                    \\
+                , .{});
+                return;
+            },
+            .failed => {
+                try stdout.print("\nStrategy setup skipped — using default strategist prompt.\n", .{});
+                try stdout.print("You can re-run with `claude` in .bees/ to customize later.\n", .{});
+            },
         }
     }
 
@@ -457,7 +478,9 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: 
     , .{});
 }
 
-fn runInitSession(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, cwd: []const u8, prompt: []const u8) bool {
+const InitResult = enum { ok, auth_error, failed };
+
+fn runInitSession(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, cwd: []const u8, prompt: []const u8) InitResult {
     var child = claude.spawnClaude(arena, io, .{
         .prompt = prompt,
         .cwd = cwd,
@@ -467,8 +490,10 @@ fn runInitSession(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, cwd: []c
         .max_turns = 20,
     }) catch {
         stdout.print("Failed to start Claude CLI. Is it installed?\n", .{}) catch {};
-        return false;
+        return .failed;
     };
+
+    var saw_auth_error = false;
 
     if (child.stdout) |stdout_file| {
         var read_buf: [256 * 1024]u8 = undefined;
@@ -486,15 +511,24 @@ fn runInitSession(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, cwd: []c
             const line_data = line.?;
             if (line_data.len == 0) continue;
 
+            // Detect authentication failures from Claude CLI stderr passed through stream-json
+            if (std.mem.indexOf(u8, line_data, "authentication_error") != null or
+                std.mem.indexOf(u8, line_data, "\"401\"") != null or
+                std.mem.indexOf(u8, line_data, "Invalid authentication") != null)
+            {
+                saw_auth_error = true;
+            }
+
             const meta = claude.parseEventMeta(line_data);
             claude.streamEvent(stdout, meta, line_data);
         }
     }
 
-    const term = child.wait(io) catch return false;
+    const term = child.wait(io) catch return .failed;
+    if (saw_auth_error) return .auth_error;
     return switch (term) {
-        .exited => |code| code == 0,
-        else => false,
+        .exited => |code| if (code == 0) .ok else .failed,
+        else => .failed,
     };
 }
 
@@ -558,9 +592,9 @@ fn buildInitPrompt(arena: std.mem.Allocator, cwd: []const u8, name: []const u8, 
     , .{ name, cwd, branch, bees_dir, bees_dir, name, branch, cwd, bees_dir, bees_dir });
 }
 
-fn runStrategyConversation(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, cwd: []const u8, bees_dir: []const u8) bool {
-    const strategist_path = std.fs.path.join(arena, &.{ bees_dir, "roles", "strategist", "prompt.md" }) catch return false;
-    const users_dir = std.fs.path.join(arena, &.{ bees_dir, "prompts", "users" }) catch return false;
+fn runStrategyConversation(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, cwd: []const u8, bees_dir: []const u8) InitResult {
+    const strategist_path = std.fs.path.join(arena, &.{ bees_dir, "roles", "strategist", "prompt.md" }) catch return .failed;
+    const users_dir = std.fs.path.join(arena, &.{ bees_dir, "prompts", "users" }) catch return .failed;
 
     stdout.print("\nGenerating strategy (user profiles + strategist prompt)...\n\n", .{}) catch {};
     stdout.flush() catch {};
@@ -576,7 +610,7 @@ fn runStrategyConversation(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer,
         \\Strategist prompt: {s}
         \\User profiles dir: {s}  (one .txt file per user type)
         \\
-    , .{ strategy_setup_prompt, cwd, bees_dir, strategist_path, users_dir }) catch return false;
+    , .{ strategy_setup_prompt, cwd, bees_dir, strategist_path, users_dir }) catch return .failed;
 
     var child = claude.spawnClaude(arena, io, .{
         .prompt = prompt,
@@ -587,8 +621,10 @@ fn runStrategyConversation(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer,
         .max_turns = 20,
     }) catch {
         stdout.print("Failed to start Claude CLI for strategy setup.\n", .{}) catch {};
-        return false;
+        return .failed;
     };
+
+    var saw_auth_error = false;
 
     if (child.stdout) |stdout_file| {
         var read_buf: [256 * 1024]u8 = undefined;
@@ -606,15 +642,23 @@ fn runStrategyConversation(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer,
             const line_data = line.?;
             if (line_data.len == 0) continue;
 
+            if (std.mem.indexOf(u8, line_data, "authentication_error") != null or
+                std.mem.indexOf(u8, line_data, "\"401\"") != null or
+                std.mem.indexOf(u8, line_data, "Invalid authentication") != null)
+            {
+                saw_auth_error = true;
+            }
+
             const meta = claude.parseEventMeta(line_data);
             claude.streamEvent(stdout, meta, line_data);
         }
     }
 
-    const term = child.wait(io) catch return false;
+    const term = child.wait(io) catch return .failed;
+    if (saw_auth_error) return .auth_error;
     return switch (term) {
-        .exited => |code| code == 0,
-        else => false,
+        .exited => |code| if (code == 0) .ok else .failed,
+        else => .failed,
     };
 }
 
