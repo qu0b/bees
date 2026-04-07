@@ -524,7 +524,14 @@ pub fn runSession(
 // Roles create/close their own tabs via MCP; the daemon manages the process.
 
 const CHROME_PORT: u16 = 9222;
-const CHROME_DATA_DIR = "/home/ubuntu/.cache/chrome-headless-bees";
+var chrome_data_dir_buf: [256]u8 = undefined;
+
+fn chromeDataDir() []const u8 {
+    const home = std.c.getenv("HOME") orelse "/tmp";
+    const written = std.fmt.bufPrint(&chrome_data_dir_buf, "{s}/.cache/chrome-headless-bees", .{home}) catch
+        return "/tmp/.cache/chrome-headless-bees";
+    return written;
+}
 
 /// Spawn a headless Chrome instance for MCP-enabled roles.
 /// Returns the child PID, or null if Chrome could not be started.
@@ -532,6 +539,9 @@ const CHROME_DATA_DIR = "/home/ubuntu/.cache/chrome-headless-bees";
 pub fn spawnChrome(io: Io) ?std.posix.pid_t {
     // Kill any orphaned Chrome from a previous daemon run
     killOrphanedChrome(io);
+
+    var data_dir_arg_buf: [300]u8 = undefined;
+    const data_dir_arg = std.fmt.bufPrint(&data_dir_arg_buf, "--user-data-dir={s}", .{chromeDataDir()}) catch return null;
 
     const argv = [_][]const u8{
         "/opt/google/chrome/chrome",
@@ -546,7 +556,7 @@ pub fn spawnChrome(io: Io) ?std.posix.pid_t {
         "--disable-renderer-backgrounding",
         "--renderer-process-limit=4",
         "--remote-debugging-port=9222",
-        "--user-data-dir=" ++ CHROME_DATA_DIR,
+        data_dir_arg,
         "--noerrdialogs",
         "--ozone-platform=headless",
         "--ozone-override-screen-size=800,600",
