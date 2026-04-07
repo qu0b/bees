@@ -240,7 +240,7 @@ pub fn buildWorkerSummary(db: *sqlite.Db, allocator: std.mem.Allocator) ?[]const
         buf.appendSlice(allocator, task) catch continue;
         var detail_buf: [128]u8 = undefined;
         const detail = std.fmt.bufPrint(&detail_buf, "' — {d} commits, {s} (${d}.{d:0>2})\n", .{
-            commits, status.label(), cost_cents / 100, cost_cents % 100,
+            commits, status.summaryLabel(), cost_cents / 100, cost_cents % 100,
         }) catch continue;
         buf.appendSlice(allocator, detail) catch continue;
     }

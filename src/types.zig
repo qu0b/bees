@@ -53,6 +53,17 @@ pub const SessionStatus = enum(u3) {
             .err => "error",
         };
     }
+
+    /// Human-readable label for worker summaries injected into agent prompts.
+    /// Distinguishes "done but awaiting merge cycle" from terminal states so
+    /// downstream roles (QA, strategist) don't misread pending work as failed.
+    pub fn summaryLabel(self: SessionStatus) []const u8 {
+        return switch (self) {
+            .done => "awaiting merge",
+            .running => "in progress",
+            else => self.label(),
+        };
+    }
 };
 
 pub const EventType = enum(u3) {

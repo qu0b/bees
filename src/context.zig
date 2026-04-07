@@ -135,7 +135,7 @@ pub fn buildWorkerSummary(store: *store_mod.Store, sql_db: ?*sqlite.Db, allocato
         const cost_cents = @as(u64, entry.view.header.cost_microdollars) / 10000;
         const detail = std.fmt.bufPrint(&detail_buf, "' — {d} commits, {s} (${d}.{d:0>2})\n", .{
             entry.view.header.commit_count,
-            entry.view.header.status.label(),
+            entry.view.header.status.summaryLabel(),
             cost_cents / 100,
             cost_cents % 100,
         }) catch continue;
