@@ -56,7 +56,18 @@ echo "Installed bees to ${INSTALL_DIR}/${BINARY}"
 case ":$PATH:" in
     *":${INSTALL_DIR}:"*) ;;
     *)
-        SHELL_NAME=$(basename "${SHELL:-/bin/sh}")
+        # Detect the user's interactive shell. $SHELL is the login shell from
+        # /etc/passwd which may differ from what they're actually running.
+        # Check the parent process first (the shell that invoked curl|sh),
+        # then fall back to $SHELL.
+        SHELL_NAME=""
+        if [ -r "/proc/$PPID/comm" ]; then
+            SHELL_NAME=$(cat "/proc/$PPID/comm")
+        fi
+        case "$SHELL_NAME" in
+            bash|zsh|fish|ksh) ;;
+            *) SHELL_NAME=$(basename "${SHELL:-/bin/sh}") ;;
+        esac
         echo ""
         echo "Add bees to your PATH:"
         case "$SHELL_NAME" in
