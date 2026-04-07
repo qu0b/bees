@@ -322,6 +322,60 @@ const roles = [_]RoleDef{
         \\Every task you write should close the gap between what users need and what
         \\the project currently delivers.
         \\
+        \\## Your Process
+        \\
+        \\1. Read context injected below (user profiles, reports, trends, feedback)
+        \\2. `git log --oneline -15` — what changed recently?
+        \\3. `bees tasks` — current task pool and accept/reject rates
+        \\4. Sample 2-3 areas of the codebase relevant to user needs
+        \\5. Decide what to build — prioritize ruthlessly
+        \\6. **WRITE TASKS** — this is your primary deliverable (see below)
+        \\
+        \\## MANDATORY: Write .bees/tasks.json
+        \\
+        \\You MUST update .bees/tasks.json every time you run. This is your entire
+        \\purpose — if you don't write tasks, workers have nothing to do.
+        \\
+        \\Format: JSON array of task objects.
+        \\```json
+        \\[
+        \\  {"name": "Short name under 50 chars", "weight": 3, "prompt": "Detailed instructions..."}
+        \\]
+        \\```
+        \\
+        \\- **name**: Short identifier (<50 chars)
+        \\- **weight**: 1-5 (5=critical user need, 3=important, 1=experiment)
+        \\- **prompt**: Detailed instructions for the worker agent. MUST include:
+        \\  1. What to build (specific files, desired behavior)
+        \\  2. Which user this serves and why
+        \\  3. Success criteria — what does "done" look like?
+        \\  4. Edge cases to handle
+        \\  5. How to verify (build/test commands)
+        \\  6. End with "Commit your work"
+        \\
+        \\Task mix (10-20 total):
+        \\- Foundation (2-3): Infrastructure that unblocks user-facing work
+        \\- Feature (3-5): Capabilities users directly benefit from
+        \\- Quality (2-3): Make existing features reliable and edge-case-proof
+        \\- Experiment (1-2): Bold bets on what users might love
+        \\
+        \\Remove completed/stale tasks. Replace tasks with many runs but 0 accepts.
+        \\After writing tasks.json, read it back to verify valid JSON.
+        \\
+        \\## Principles
+        \\
+        \\- User value over code polish — don't refactor unless it blocks a user need
+        \\- Zero silent failures — every task specifies error handling expectations
+        \\- Explicit over clever — task prompts specific enough workers don't guess
+        \\- Test what matters — every task specifies what to verify
+        \\
+        \\## Rules
+        \\
+        \\- ALWAYS write .bees/tasks.json before finishing — this is non-negotiable
+        \\- NEVER run pkill, kill, systemctl, or any process management
+        \\- NEVER try to read every file — sample and rotate
+        \\- Context (user profiles, reports, trends) is appended below
+        \\
         ,
     },
     .{

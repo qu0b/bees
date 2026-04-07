@@ -677,7 +677,24 @@ fn runStrategistWithPrep(
         cfg.default_backend,
     ) catch |e| {
         logger.err("[daemon] strategist failed: {}", .{e});
+        return;
     };
+
+    // Validate that the strategist actually wrote tasks.
+    // Read tasks.json and check it contains real tasks, not just "[]".
+    const tasks_data = fs.readFileAlloc(allocator, paths.tasks_file, 1024 * 1024) catch {
+        logger.warn("[daemon] strategist did not create tasks.json — workers will have nothing to do", .{});
+        return;
+    };
+    defer allocator.free(tasks_data);
+
+    // Strip whitespace and check for empty array
+    var stripped = std.mem.trim(u8, tasks_data, " \t\n\r");
+    if (stripped.len <= 2 or std.mem.eql(u8, stripped, "[]")) {
+        logger.warn("[daemon] strategist left tasks.json empty — workers will have nothing to do", .{});
+    } else {
+        logger.info("[daemon] strategist wrote tasks ({d} bytes)", .{stripped.len});
+    }
 }
 
 /// Map a role name string to the corresponding SessionType enum.
