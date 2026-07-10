@@ -6,11 +6,11 @@ const claude = @import("claude.zig");
 const fs = @import("fs.zig");
 
 /// Build CLI args and spawn `pi -p --mode json`.
-pub fn spawnPi(allocator: std.mem.Allocator, io: Io, options: backend.BackendOptions) !std.process.Child {
+pub fn spawnPi(allocator: std.mem.Allocator, io: Io, options: backend.BackendOptions, binary_name: []const u8) !std.process.Child {
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(allocator);
 
-    try args.append(allocator, "pi");
+    try args.append(allocator, binary_name);
     try args.append(allocator, "-p");
     try args.append(allocator, "--mode");
     try args.append(allocator, "json");

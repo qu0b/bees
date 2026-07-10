@@ -428,7 +428,7 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: 
 
     // Interactive strategy conversation — generates tailored roles/strategist/prompt.md
     if (!skip_analysis) {
-        switch (runStrategyConversation(arena, io, stdout, cwd, bees_dir)) {
+        switch (runStrategyConversation(arena, io, stdout, cwd, bees_dir, "claude")) {
             .ok => {},
             .auth_error => {
                 try stdout.print(
@@ -480,7 +480,7 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: 
 
 const InitResult = enum { ok, auth_error, failed };
 
-fn runInitSession(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, cwd: []const u8, prompt: []const u8) InitResult {
+fn runInitSession(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, cwd: []const u8, prompt: []const u8, claude_binary: []const u8) InitResult {
     var child = claude.spawnClaude(arena, io, .{
         .prompt = prompt,
         .cwd = cwd,
@@ -488,7 +488,7 @@ fn runInitSession(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, cwd: []c
         .effort = "high",
         .max_budget_usd = 5.0,
         .max_turns = 20,
-    }) catch {
+    }, claude_binary) catch {
         stdout.print("Failed to start Claude CLI. Is it installed?\n", .{}) catch {};
         return .failed;
     };
@@ -592,7 +592,7 @@ fn buildInitPrompt(arena: std.mem.Allocator, cwd: []const u8, name: []const u8, 
     , .{ name, cwd, branch, bees_dir, bees_dir, name, branch, cwd, bees_dir, bees_dir });
 }
 
-fn runStrategyConversation(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, cwd: []const u8, bees_dir: []const u8) InitResult {
+fn runStrategyConversation(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, cwd: []const u8, bees_dir: []const u8, claude_binary: []const u8) InitResult {
     const strategist_path = std.fs.path.join(arena, &.{ bees_dir, "roles", "strategist", "prompt.md" }) catch return .failed;
     const users_dir = std.fs.path.join(arena, &.{ bees_dir, "prompts", "users" }) catch return .failed;
 
@@ -619,7 +619,7 @@ fn runStrategyConversation(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer,
         .effort = "high",
         .max_budget_usd = 5.0,
         .max_turns = 20,
-    }) catch {
+    }, claude_binary) catch {
         stdout.print("Failed to start Claude CLI for strategy setup.\n", .{}) catch {};
         return .failed;
     };
@@ -895,9 +895,9 @@ fn cmdRunWorker(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, id: ?u32) 
     defer logger.deinit();
 
     if (id) |worker_id| {
-        _ = try worker.runWorker(cfg, paths, &store, &pool, &logger, io, worker_id, arena, true);
+        _ = try worker.runWorker(cfg, paths, &store, &pool, &logger, io, worker_id, arena, true, null);
     } else {
-        try worker.runAllWorkers(cfg, paths, &store, &pool, &logger, io, arena, true);
+        try worker.runAllWorkers(cfg, paths, &store, &pool, &logger, io, arena, true, null);
     }
 
     try stdout.print("Worker run complete\n", .{});
@@ -918,7 +918,7 @@ fn cmdRunMerger(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     var logger = log_mod.Logger.init(log_path);
     defer logger.deinit();
 
-    try merger.runMerger(cfg, paths, &store, &logger, io, arena);
+    try merger.runMerger(cfg, paths, &store, &logger, io, arena, null);
     try stdout.print("Merger run complete\n", .{});
 }
 
@@ -1016,6 +1016,7 @@ fn cmdRunStrategist(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void 
         context,
         true,
         cfg.default_backend,
+        null,
     );
     try stdout.print("Strategist run complete\n", .{});
 }
@@ -1065,6 +1066,7 @@ fn cmdRunSre(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         null,
         true,
         cfg.default_backend,
+        null,
     );
     try stdout.print("SRE run complete\n", .{});
 }
@@ -1153,6 +1155,7 @@ fn cmdRunQa(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         null,
         true,
         cfg.default_backend,
+        null,
     );
     try stdout.print("QA run complete\n", .{});
 }
@@ -1209,6 +1212,7 @@ fn cmdRunResearcher(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void 
         step_ctx,
         true,
         cfg.default_backend,
+        null,
     );
     try stdout.print("Researcher run complete\n", .{});
 }
@@ -1257,6 +1261,7 @@ fn cmdRunUser(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         null,
         true,
         cfg.default_backend,
+        null,
     );
     try stdout.print("User engagement complete\n", .{});
 }
@@ -1542,7 +1547,8 @@ fn approveFunding(
 
     const title = findJsonStr(data, "title") orelse id;
     const amount = findJsonStr(data, "amount_usdc");
-    const token = findJsonStr(data, "token") orelse funding.DEFAULT_TOKEN;
+    const chain = if (findJsonStr(data, "chain")) |c| funding.Chain.parse(c) else funding.Chain.tempo;
+    const token = findJsonStr(data, "token") orelse chain.defaultToken();
 
     // Resolve recipient: explicit in request, or derive from role's wallet
     const roles_dir = try std.fs.path.join(arena, &.{ paths.bees_dir, "roles" });
@@ -1556,10 +1562,12 @@ fn approveFunding(
     // Execute on-chain transfer if amount and recipient are specified
     if (amount) |amt| {
         if (recipient) |to| {
-            try stdout.print("Transferring {s} USDC.e to {s}...\n", .{ amt, to });
+            try stdout.print("Transferring {s} USDC to {s} on {s}...\n", .{ amt, to, @tagName(chain) });
 
-            // Investor wallet (default tempo login) sends to recipient — no private_key override
-            const tx_hash = funding.transfer(io, arena, amt, token, to, null) catch |e| {
+            // Investor wallet sends to recipient. Tempo: default wallet from
+            // `tempo wallet login`. Ethereum: private key picked up by `cast`
+            // from the ETH_PRIVATE_KEY env var.
+            const tx_hash = funding.transfer(io, arena, chain, amt, token, to, null) catch |e| {
                 try stdout.print("Transfer failed: {s}\n", .{@errorName(e)});
                 return;
             };
@@ -1567,9 +1575,14 @@ fn approveFunding(
             if (tx_hash) |hash| {
                 defer arena.free(hash);
                 try stdout.print("Transfer complete: {s}\n", .{hash});
-                try stdout.print("  https://explore.tempo.xyz/tx/{s}\n", .{hash});
+                var url_buf: [160]u8 = undefined;
+                const url = try chain.explorerTxUrl(&url_buf, hash);
+                try stdout.print("  {s}\n", .{url});
             } else {
-                try stdout.print("Transfer failed — check `tempo wallet whoami` for balance and connectivity.\n", .{});
+                switch (chain) {
+                    .tempo => try stdout.print("Transfer failed — check `tempo wallet whoami` for balance and connectivity.\n", .{}),
+                    .ethereum => try stdout.print("Transfer failed — ensure `cast` is installed and ETH_RPC_URL + ETH_PRIVATE_KEY are set.\n", .{}),
+                }
             }
         } else {
             try stdout.print("Approved: {s}\n", .{title});
@@ -2036,4 +2049,5 @@ comptime {
     _ = @import("db/sync.zig");
     _ = @import("db/duckdb.zig");
     _ = @import("db/query.zig");
+    _ = @import("seed.zig");
 }

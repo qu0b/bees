@@ -25,6 +25,8 @@ pub const ClaudeOptions = struct {
     add_dirs: ?[]const []const u8 = null,
     /// Fallback model when primary is overloaded (529). E.g., "sonnet" for opus sessions.
     fallback_model: ?[]const u8 = null,
+    /// When true with --resume, creates a new session instead of reusing the original.
+    fork_session: bool = false,
 
     // -- Per-role security (replaces --dangerously-skip-permissions) --
 
@@ -61,11 +63,11 @@ pub const SessionResult = struct {
     duration_api_ms: u32 = 0,
 };
 
-pub fn spawnClaude(allocator: std.mem.Allocator, io: Io, options: ClaudeOptions) !std.process.Child {
+pub fn spawnClaude(allocator: std.mem.Allocator, io: Io, options: ClaudeOptions, binary_name: []const u8) !std.process.Child {
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(allocator);
 
-    try args.append(allocator, "claude");
+    try args.append(allocator, binary_name);
 
     // --mcp-config must come before -p because -p makes all
     // subsequent positional args the prompt
@@ -119,6 +121,9 @@ pub fn spawnClaude(allocator: std.mem.Allocator, io: Io, options: ClaudeOptions)
     if (options.resume_session_id) |rsid| {
         try args.append(allocator, "--resume");
         try args.append(allocator, rsid);
+    }
+    if (options.fork_session) {
+        try args.append(allocator, "--fork-session");
     }
 
     if (options.system_prompt_file) |spf| {

@@ -9,6 +9,7 @@ const backend = @import("backend.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 const ctx_mod = @import("context.zig");
+const seed_mod = @import("seed.zig");
 
 const WorktreeCandidate = struct {
     branch: []const u8,
@@ -24,6 +25,7 @@ pub fn runMerger(
     logger: *log_mod.Logger,
     io: Io,
     allocator: std.mem.Allocator,
+    seed_uuid: ?[]const u8,
 ) !void {
     assert(cfg.project.name.len > 0);
     assert(paths.root.len > 0);
@@ -131,7 +133,7 @@ pub fn runMerger(
         const pre_head = git.getCurrentHead(allocator, io, paths.root) catch continue;
         defer allocator.free(pre_head);
 
-        reviewAndMerge(cfg, paths, store, logger, io, candidate, allocator);
+        reviewAndMerge(cfg, paths, store, logger, io, candidate, allocator, seed_uuid);
 
         const post_head = git.getCurrentHead(allocator, io, paths.root) catch continue;
         defer allocator.free(post_head);
@@ -193,6 +195,7 @@ fn reviewAndMerge(
     io: Io,
     candidate: *WorktreeCandidate,
     allocator: std.mem.Allocator,
+    seed_uuid: ?[]const u8,
 ) void {
     const diff = git.getDiff(allocator, io, paths.root, candidate.branch, cfg.project.base_branch) catch |e| {
         logger.err("[merger] diff failed for {s}: {}", .{ candidate.branch, e });
@@ -248,7 +251,20 @@ fn reviewAndMerge(
         "";
     defer if (task_context.len > 0) allocator.free(task_context);
 
-    const review_prompt = std.fmt.allocPrint(allocator,
+    // When seed is set, prepend review prompt.md content into user message
+    const use_seed = seed_uuid != null;
+    const review_prompt_content: ?[]const u8 = if (use_seed)
+        fs.readFileAlloc(allocator, review_prompt_path, 256 * 1024) catch null
+    else
+        null;
+    defer if (review_prompt_content) |rp| allocator.free(rp);
+
+    var prompt_parts: std.ArrayList(u8) = .empty;
+    if (review_prompt_content) |rp| {
+        prompt_parts.appendSlice(allocator, rp) catch {};
+        prompt_parts.appendSlice(allocator, "\n\n") catch {};
+    }
+    const review_body = std.fmt.allocPrint(allocator,
         \\Review and merge the following diff from branch `{s}`.
         \\
         \\You have full tool access. You can read source files, run the build, and run tests.
@@ -266,6 +282,10 @@ fn reviewAndMerge(
         \\{s}
         \\```
     , .{ candidate.branch, task_context, candidate.branch, diff_preview }) catch return;
+    defer allocator.free(review_body);
+    prompt_parts.appendSlice(allocator, review_body) catch {};
+
+    const review_prompt = prompt_parts.toOwnedSlice(allocator) catch return;
     defer allocator.free(review_prompt);
 
     logger.info("[merger] reviewing {s}", .{candidate.branch});
@@ -274,14 +294,16 @@ fn reviewAndMerge(
         .backend = review_bt,
         .prompt = review_prompt,
         .cwd = paths.root,
-        .append_prompt_file = review_prompt_path,
+        .append_prompt_file = if (use_seed) null else review_prompt_path,
+        .resume_session_id = seed_uuid,
+        .fork_session = use_seed,
         .model = cfg.merger.model,
         .fallback_model = cfg.merger.fallback_model,
         .effort = cfg.merger.effort,
         .max_budget_usd = cfg.merger.max_budget_usd,
         .max_turns = 20,
         .db_dir = paths.db_dir,
-    }, session_id, allocator) catch |e| {
+    }, session_id, allocator, cfg.claude_binary, cfg.pi_binary) catch |e| {
         logger.err("[merger] review session failed for {s}: {}", .{ candidate.branch, e });
         return;
     };
@@ -440,7 +462,7 @@ fn runBuildStep(
         .effort = cfg.merger.effort,
         .max_budget_usd = cfg.merger.max_budget_usd,
         .db_dir = paths.db_dir,
-    }, session_id, allocator) catch {
+    }, session_id, allocator, cfg.claude_binary, cfg.pi_binary) catch {
         logger.err("[merger] AI fix failed", .{});
         git.resetHard(allocator, io, paths.root, saved_head) catch {};
         return false;

@@ -18,6 +18,7 @@ const knowledge = @import("knowledge.zig");
 const funding = @import("funding.zig");
 const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
+const seed_mod = @import("seed.zig");
 
 /// Run a generic agent role through the standard session lifecycle.
 /// Handles: session creation, prompt assembly, Claude execution, status update,
@@ -34,6 +35,7 @@ pub fn runRole(
     injected_context: ?[]const u8,
     stream_output: bool,
     default_backend: []const u8,
+    seed_uuid: ?[]const u8,
 ) !void {
     assert(role.name.len > 0);
     assert(paths.root.len > 0);
@@ -77,14 +79,32 @@ pub fn runRole(
 
     const session_id = try store.createSession(header, session_label, "", paths.root);
 
-    // Build prompt: static instruction + injected context
+    // Build prompt: when seed is set, role prompt moves to user message for cache sharing.
+    // Otherwise, falls back to current behavior (role prompt via --append-system-prompt-file).
+    const role_prompt_content: ?[]const u8 = if (seed_uuid != null and role.prompt_path.len > 0)
+        fs.readFileAlloc(allocator, role.prompt_path, 256 * 1024) catch null
+    else
+        null;
+    defer if (role_prompt_content) |rp| allocator.free(rp);
+
+    // Read per-role context_files
+    const role_ctx_files = seed_mod.readRoleContextFiles(paths.root, role.context_files, allocator);
+    defer if (role_ctx_files) |rc| allocator.free(rc);
+
     const static_prompt_buf = std.fmt.allocPrint(allocator, "Run your {s} cycle for this project.", .{role_name}) catch "Run your cycle.";
     defer if (static_prompt_buf.ptr != "Run your cycle.".ptr) allocator.free(static_prompt_buf);
 
-    const prompt = if (injected_context) |ic|
-        std.fmt.allocPrint(allocator, "{s}{s}", .{ static_prompt_buf, ic }) catch static_prompt_buf
-    else
-        static_prompt_buf;
+    // Assemble: [role_ctx_files] + [role_prompt] + static + [injected_context]
+    var prompt_parts: std.ArrayList(u8) = .empty;
+    if (role_ctx_files) |rc| prompt_parts.appendSlice(allocator, rc) catch {};
+    if (role_prompt_content) |rp| {
+        prompt_parts.appendSlice(allocator, rp) catch {};
+        prompt_parts.appendSlice(allocator, "\n\n") catch {};
+    }
+    prompt_parts.appendSlice(allocator, static_prompt_buf) catch {};
+    if (injected_context) |ic| prompt_parts.appendSlice(allocator, ic) catch {};
+
+    const prompt = prompt_parts.toOwnedSlice(allocator) catch static_prompt_buf;
     defer if (prompt.ptr != static_prompt_buf.ptr) allocator.free(prompt);
 
     // Load role's Tempo wallet key (if it has one) for paid API access
@@ -100,12 +120,17 @@ pub fn runRole(
         break :blk null;
     } else null;
 
-    // Run Claude session
+    // Run Claude session — use seed for cache sharing when available
+    const use_seed = seed_uuid != null;
     const result = backend.runSession(store, io, .{
         .backend = bt,
         .prompt = prompt,
         .cwd = paths.root,
-        .append_prompt_file = if (role.prompt_path.len > 0) role.prompt_path else null,
+        // Seed mode: role prompt already in user message, no append file needed.
+        // Normal mode: role prompt via --append-system-prompt-file.
+        .append_prompt_file = if (use_seed) null else if (role.prompt_path.len > 0) role.prompt_path else null,
+        .resume_session_id = seed_uuid,
+        .fork_session = use_seed,
         .model = role.model,
         .fallback_model = role.fallback_model,
         .effort = role.effort,
@@ -118,7 +143,7 @@ pub fn runRole(
         .allowed_tools = if (perms) |p| if (p.allowed_tools.len > 0) p.allowed_tools else null else null,
         .disallowed_tools = if (perms) |p| if (p.disallowed_tools.len > 0) p.disallowed_tools else null else null,
         .extra_env = extra_env,
-    }, session_id, allocator) catch |e| {
+    }, session_id, allocator, cfg.claude_binary, cfg.pi_binary) catch |e| {
         logger.err("[{s}] session failed: {}", .{ role_name, e });
         // Mark session as error so it doesn't stay stale as "running".
         var err_header = header;

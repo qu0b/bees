@@ -1,4 +1,4 @@
-//! Tempo blockchain funding — per-role wallets and on-chain USDC transfers.
+//! Per-role wallets and on-chain USDC transfers across supported chains (Tempo, Ethereum).
 //!
 //! Each role's wallet lives alongside its config in `.bees/roles/<role>/`:
 //!   .bees/roles/founder/
@@ -11,7 +11,8 @@
 //! The founder distributes to other roles from its own wallet.
 //!
 //! Key generation and address derivation are done natively using Zig's
-//! stdlib secp256k1 and keccak256 — no external dependencies.
+//! stdlib secp256k1 and keccak256 — no external dependencies. On-chain
+//! transfers shell out: `tempo` for Tempo, `cast` (Foundry) for Ethereum.
 
 const std = @import("std");
 const Io = std.Io;
@@ -20,8 +21,40 @@ const fs = @import("fs.zig");
 const Secp256k1 = std.crypto.ecc.Secp256k1;
 const Keccak256 = std.crypto.hash.sha3.Keccak256;
 
+/// Supported chains for on-chain transfers. Wallets themselves are chain-agnostic
+/// (both chains use Ethereum-compatible secp256k1 keys and keccak256 addresses).
+pub const Chain = enum {
+    tempo,
+    ethereum,
+
+    pub fn parse(s: []const u8) Chain {
+        if (std.ascii.eqlIgnoreCase(s, "ethereum") or std.ascii.eqlIgnoreCase(s, "eth")) return .ethereum;
+        return .tempo;
+    }
+
+    pub fn defaultToken(self: Chain) []const u8 {
+        return switch (self) {
+            .tempo => DEFAULT_TOKEN_TEMPO,
+            .ethereum => DEFAULT_TOKEN_ETHEREUM,
+        };
+    }
+
+    pub fn explorerTxUrl(self: Chain, buf: []u8, hash: []const u8) ![]const u8 {
+        return switch (self) {
+            .tempo => std.fmt.bufPrint(buf, "https://explore.tempo.xyz/tx/{s}", .{hash}),
+            .ethereum => std.fmt.bufPrint(buf, "https://etherscan.io/tx/{s}", .{hash}),
+        };
+    }
+};
+
 /// Default TIP-20 token on Tempo mainnet: USDC.e (Bridged USDC via Stargate).
-pub const DEFAULT_TOKEN: []const u8 = "0x20c000000000000000000000b9537d11c60e8b50";
+pub const DEFAULT_TOKEN_TEMPO: []const u8 = "0x20c000000000000000000000b9537d11c60e8b50";
+
+/// Default ERC-20 token on Ethereum mainnet: native USDC (Circle).
+pub const DEFAULT_TOKEN_ETHEREUM: []const u8 = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+
+/// Back-compat alias — still used by callers that default to Tempo.
+pub const DEFAULT_TOKEN: []const u8 = DEFAULT_TOKEN_TEMPO;
 
 /// ECDSA signature scheme: secp256k1 with SHA-256 for deterministic nonce (RFC 6979).
 /// Messages are pre-hashed with keccak256 before signing (Ethereum convention).
@@ -238,12 +271,34 @@ pub fn getAddress(
     return allocator.dupe(u8, &addr) catch null;
 }
 
-// ── Transfers (still uses tempo CLI) ───────────────────────────────────
+// ── Transfers ──────────────────────────────────────────────────────────
 
-/// Execute an on-chain transfer. If private_key is null, uses the default
-/// (investor) wallet from `tempo wallet login`. Otherwise uses the specified key.
+/// Execute an on-chain transfer. Branches on `chain`:
+///   - Tempo: shells out to `tempo wallet transfer`. private_key=null uses the
+///     default wallet from `tempo wallet login`.
+///   - Ethereum: shells out to `cast send` (Foundry). private_key=null falls
+///     back to the `ETH_PRIVATE_KEY` env var (read by cast). The RPC endpoint
+///     is taken from the `ETH_RPC_URL` env var.
+///
+/// `amount` is a human-readable USDC amount (e.g. "100" or "1.5"). For
+/// Ethereum, it is scaled to raw units (USDC has 6 decimals on both chains).
 /// Returns the transaction hash on success, or null on failure.
 pub fn transfer(
+    io: Io,
+    allocator: std.mem.Allocator,
+    chain: Chain,
+    amount: []const u8,
+    token: []const u8,
+    to: []const u8,
+    private_key: ?[]const u8,
+) !?[]const u8 {
+    return switch (chain) {
+        .tempo => tempoTransfer(io, allocator, amount, token, to, private_key),
+        .ethereum => ethereumTransfer(io, allocator, amount, token, to, private_key),
+    };
+}
+
+fn tempoTransfer(
     io: Io,
     allocator: std.mem.Allocator,
     amount: []const u8,
@@ -275,56 +330,78 @@ pub fn transfer(
     argv_buf[argc] = "-t";
     argc += 1;
 
-    var child = try std.process.spawn(io, .{
-        .argv = argv_buf[0..argc],
-        .stdout = .pipe,
-        .stderr = .pipe,
-    });
+    const result = try runCapture(io, argv_buf[0..argc]);
+    if (result.exit_code != 0) return null;
 
-    var stdout_buf: [4096]u8 = undefined;
-    var stdout_len: usize = 0;
-    if (child.stdout) |stdout| {
-        while (stdout_len < stdout_buf.len) {
-            var iov = [1][]u8{stdout_buf[stdout_len..]};
-            const n = io.vtable.netRead(io.userdata, stdout.handle, &iov) catch break;
-            if (n == 0) break;
-            stdout_len += n;
-        }
-    }
+    const tx_hash = extractJsonField(result.stdout, "tx_hash") orelse
+        extractQuotedValue(result.stdout, "tx_hash:") orelse
+        extractTxHash(result.stdout);
 
-    // Drain stderr to avoid pipe deadlock
-    var stderr_buf: [4096]u8 = undefined;
-    var stderr_len: usize = 0;
-    if (child.stderr) |stderr| {
-        while (stderr_len < stderr_buf.len) {
-            var iov = [1][]u8{stderr_buf[stderr_len..]};
-            const n = io.vtable.netRead(io.userdata, stderr.handle, &iov) catch break;
-            if (n == 0) break;
-            stderr_len += n;
-        }
-    }
-
-    const term = try child.wait(io);
-    const exit_code: i16 = switch (term) {
-        .exited => |code| @intCast(code),
-        else => -1,
-    };
-
-    if (exit_code != 0) return null;
-
-    const stdout_data = stdout_buf[0..stdout_len];
-    const tx_hash = extractJsonField(stdout_data, "tx_hash") orelse
-        extractQuotedValue(stdout_data, "tx_hash:") orelse
-        extractTxHash(stdout_data);
-
-    if (tx_hash) |hash| {
-        return try allocator.dupe(u8, hash);
-    }
+    if (tx_hash) |hash| return try allocator.dupe(u8, hash);
     return null;
 }
 
-/// Check a wallet's balance via `tempo wallet whoami`.
+fn ethereumTransfer(
+    io: Io,
+    allocator: std.mem.Allocator,
+    amount: []const u8,
+    token: []const u8,
+    to: []const u8,
+    private_key: ?[]const u8,
+) !?[]const u8 {
+    const units = try toUsdcUnits(allocator, amount);
+    defer allocator.free(units);
+
+    var argv_buf: [14][]const u8 = undefined;
+    var argc: usize = 0;
+
+    argv_buf[argc] = castPath();
+    argc += 1;
+    argv_buf[argc] = "send";
+    argc += 1;
+    argv_buf[argc] = token;
+    argc += 1;
+    argv_buf[argc] = "transfer(address,uint256)";
+    argc += 1;
+    argv_buf[argc] = to;
+    argc += 1;
+    argv_buf[argc] = units;
+    argc += 1;
+    argv_buf[argc] = "--json";
+    argc += 1;
+    if (private_key) |pk| {
+        argv_buf[argc] = "--private-key";
+        argc += 1;
+        argv_buf[argc] = pk;
+        argc += 1;
+    }
+
+    const result = try runCapture(io, argv_buf[0..argc]);
+    if (result.exit_code != 0) return null;
+
+    const tx_hash = extractJsonField(result.stdout, "transactionHash") orelse
+        extractTxHash(result.stdout);
+
+    if (tx_hash) |hash| return try allocator.dupe(u8, hash);
+    return null;
+}
+
+/// Check a wallet's balance. Tempo: `tempo wallet whoami` (rich output).
+/// Ethereum: `cast call <token> balanceOf(address)(uint256) <addr>` — returns
+/// the raw token-unit balance as a string.
 pub fn getBalance(
+    io: Io,
+    allocator: std.mem.Allocator,
+    chain: Chain,
+    private_key: ?[]const u8,
+) !?[]const u8 {
+    return switch (chain) {
+        .tempo => tempoBalance(io, allocator, private_key),
+        .ethereum => ethereumBalance(io, allocator, private_key),
+    };
+}
+
+fn tempoBalance(
     io: Io,
     allocator: std.mem.Allocator,
     private_key: ?[]const u8,
@@ -346,20 +423,78 @@ pub fn getBalance(
     argv_buf[argc] = "-t";
     argc += 1;
 
+    const result = try runCapture(io, argv_buf[0..argc]);
+    if (result.exit_code != 0 or result.stdout.len == 0) return null;
+    return try allocator.dupe(u8, result.stdout);
+}
+
+fn ethereumBalance(
+    io: Io,
+    allocator: std.mem.Allocator,
+    private_key: ?[]const u8,
+) !?[]const u8 {
+    // Derive the address from the private key (required for balanceOf lookup).
+    const pk_hex = private_key orelse return null;
+    const pk_bytes = parseHexKey(pk_hex) catch return null;
+    const addr = deriveAddressFromKey(pk_bytes) catch return null;
+
+    var argv_buf: [8][]const u8 = undefined;
+    var argc: usize = 0;
+    argv_buf[argc] = castPath();
+    argc += 1;
+    argv_buf[argc] = "call";
+    argc += 1;
+    argv_buf[argc] = DEFAULT_TOKEN_ETHEREUM;
+    argc += 1;
+    argv_buf[argc] = "balanceOf(address)(uint256)";
+    argc += 1;
+    argv_buf[argc] = &addr;
+    argc += 1;
+
+    const result = try runCapture(io, argv_buf[0..argc]);
+    if (result.exit_code != 0 or result.stdout.len == 0) return null;
+    return try allocator.dupe(u8, std.mem.trim(u8, result.stdout, &std.ascii.whitespace));
+}
+
+// ── Subprocess runner ──────────────────────────────────────────────────
+
+const CaptureResult = struct {
+    stdout: []const u8,
+    exit_code: i16,
+};
+
+/// Spawn a child, drain stdout (and stderr to avoid deadlock), return captured
+/// stdout plus exit code. The stdout slice points into a fixed per-call buffer
+/// and is valid until the next call from the same stack frame.
+fn runCapture(io: Io, argv: []const []const u8) !CaptureResult {
+    const S = struct {
+        threadlocal var stdout_buf: [8192]u8 = undefined;
+        threadlocal var stderr_buf: [4096]u8 = undefined;
+    };
+
     var child = try std.process.spawn(io, .{
-        .argv = argv_buf[0..argc],
+        .argv = argv,
         .stdout = .pipe,
-        .stderr = .ignore,
+        .stderr = .pipe,
     });
 
-    var stdout_buf: [8192]u8 = undefined;
     var stdout_len: usize = 0;
     if (child.stdout) |stdout| {
-        while (stdout_len < stdout_buf.len) {
-            var iov = [1][]u8{stdout_buf[stdout_len..]};
+        while (stdout_len < S.stdout_buf.len) {
+            var iov = [1][]u8{S.stdout_buf[stdout_len..]};
             const n = io.vtable.netRead(io.userdata, stdout.handle, &iov) catch break;
             if (n == 0) break;
             stdout_len += n;
+        }
+    }
+
+    var stderr_len: usize = 0;
+    if (child.stderr) |stderr| {
+        while (stderr_len < S.stderr_buf.len) {
+            var iov = [1][]u8{S.stderr_buf[stderr_len..]};
+            const n = io.vtable.netRead(io.userdata, stderr.handle, &iov) catch break;
+            if (n == 0) break;
+            stderr_len += n;
         }
     }
 
@@ -369,10 +504,30 @@ pub fn getBalance(
         else => -1,
     };
 
-    if (exit_code != 0) return null;
-    if (stdout_len == 0) return null;
+    return .{ .stdout = S.stdout_buf[0..stdout_len], .exit_code = exit_code };
+}
 
-    return try allocator.dupe(u8, stdout_buf[0..stdout_len]);
+/// Scale a human-readable USDC amount (e.g. "100", "1.5") to its raw
+/// 6-decimal unit string (e.g. "100000000", "1500000"). Rejects more than 6
+/// fractional digits.
+fn toUsdcUnits(allocator: std.mem.Allocator, amount: []const u8) ![]const u8 {
+    const decimals: usize = 6;
+    const trimmed = std.mem.trim(u8, amount, &std.ascii.whitespace);
+    const dot_pos = std.mem.indexOfScalar(u8, trimmed, '.');
+
+    if (dot_pos == null) {
+        var zeros: [decimals]u8 = [_]u8{'0'} ** decimals;
+        return std.fmt.allocPrint(allocator, "{s}{s}", .{ trimmed, &zeros });
+    }
+
+    const int_part = trimmed[0..dot_pos.?];
+    const frac_part = trimmed[dot_pos.? + 1 ..];
+    if (frac_part.len > decimals) return error.TooManyDecimals;
+
+    const int_display = if (int_part.len == 0) "0" else int_part;
+    const pad_len = decimals - frac_part.len;
+    var zeros: [decimals]u8 = [_]u8{'0'} ** decimals;
+    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ int_display, frac_part, zeros[0..pad_len] });
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────
@@ -405,24 +560,33 @@ fn setFileMode(path: []const u8) void {
 
 /// Resolve the tempo CLI binary path.
 fn tempoPath() []const u8 {
+    return resolveCliPath(&tempo_path_buf, "/.tempo/bin/tempo", "tempo");
+}
+
+/// Resolve the cast (Foundry) CLI binary path.
+fn castPath() []const u8 {
+    return resolveCliPath(&cast_path_buf, "/.foundry/bin/cast", "cast");
+}
+
+fn resolveCliPath(buf: []u8, home_suffix: []const u8, fallback: []const u8) []const u8 {
     var i: usize = 0;
     while (std.c.environ[i]) |entry| : (i += 1) {
         const s = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(entry)), 0);
         if (std.mem.startsWith(u8, s, "HOME=")) {
             const home = s["HOME=".len..];
-            const suffix = "/.tempo/bin/tempo";
-            if (home.len + suffix.len < tempo_path_buf.len) {
-                @memcpy(tempo_path_buf[0..home.len], home);
-                @memcpy(tempo_path_buf[home.len..][0..suffix.len], suffix);
-                const full = tempo_path_buf[0 .. home.len + suffix.len];
+            if (home.len + home_suffix.len < buf.len) {
+                @memcpy(buf[0..home.len], home);
+                @memcpy(buf[home.len..][0..home_suffix.len], home_suffix);
+                const full = buf[0 .. home.len + home_suffix.len];
                 if (fs.access(full)) return full;
             }
         }
     }
-    return "tempo";
+    return fallback;
 }
 
 var tempo_path_buf: [256]u8 = undefined;
+var cast_path_buf: [256]u8 = undefined;
 
 /// Extract a JSON string value: "key":"value"
 pub fn extractJsonField(data: []const u8, key: []const u8) ?[]const u8 {

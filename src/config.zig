@@ -4,6 +4,8 @@ const fs = @import("fs.zig");
 
 pub const Config = struct {
     project: Project,
+    claude_binary: []const u8 = "claude",
+    pi_binary: []const u8 = "pi",
     default_backend: []const u8 = "claude",
     workers: Workers = .{},
     merger: Merger = .{},
@@ -18,6 +20,7 @@ pub const Config = struct {
     serve: Serve = .{},
     smoke_test: SmokeTest = .{},
     timeouts: Timeouts = .{},
+    cache: Cache = .{},
 
     pub const Project = struct {
         name: []const u8,
@@ -136,6 +139,17 @@ pub const Config = struct {
         max_idle_secs: u32 = 600,
         stale_hours: u32 = 24,
         cleanup_hours: u32 = 72,
+    };
+
+    pub const Cache = struct {
+        /// Enable shared context seed sessions for cross-role prompt caching.
+        shared_context: bool = true,
+        /// Maximum bytes of source files to include in the seed (default ~200k tokens).
+        max_bytes: u32 = 800_000,
+        /// Files always included in the seed regardless of haiku selection.
+        always_include: []const []const u8 = &.{},
+        /// Directory prefixes excluded from file selection (e.g., "vendor/", "node_modules/").
+        always_exclude: []const []const u8 = &.{},
     };
 };
 

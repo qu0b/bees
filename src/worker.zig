@@ -14,6 +14,7 @@ const knowledge = @import("knowledge.zig");
 const ctx = @import("context.zig");
 const mc_connector = @import("mc_connector.zig");
 const security_profiles = @import("security_profiles.zig");
+const seed_mod = @import("seed.zig");
 
 pub const WorkerResult = struct {
     session_id: u64 = 0,
@@ -30,8 +31,9 @@ pub fn runWorkerWithTimeout(
     worker_id: u32,
     allocator: std.mem.Allocator,
     timeout_secs: u32,
+    context_blob: ?[]const u8,
 ) !WorkerResult {
-    return runWorkerImpl(cfg, paths, store, pool, logger, io, worker_id, allocator, timeout_secs, cfg.daemon.restart_timeout_minutes * 60, cfg.daemon.max_restarts, false);
+    return runWorkerImpl(cfg, paths, store, pool, logger, io, worker_id, allocator, timeout_secs, cfg.daemon.restart_timeout_minutes * 60, cfg.daemon.max_restarts, false, context_blob);
 }
 
 pub fn runWorker(
@@ -44,8 +46,9 @@ pub fn runWorker(
     worker_id: u32,
     allocator: std.mem.Allocator,
     stream_output: bool,
+    context_blob: ?[]const u8,
 ) !WorkerResult {
-    return runWorkerImpl(cfg, paths, store, pool, logger, io, worker_id, allocator, 0, 0, 0, stream_output);
+    return runWorkerImpl(cfg, paths, store, pool, logger, io, worker_id, allocator, 0, 0, 0, stream_output, context_blob);
 }
 
 fn runWorkerImpl(
@@ -61,6 +64,7 @@ fn runWorkerImpl(
     restart_timeout_secs: u32,
     max_restarts: u32,
     stream_output: bool,
+    context_blob: ?[]const u8,
 ) !WorkerResult {
     assert(worker_id > 0);
     assert(paths.root.len > 0);
@@ -200,11 +204,30 @@ fn runWorkerImpl(
     };
     defer if (kb_context) |kc| allocator.free(kc);
 
-    // Combine task prompt with knowledge context
-    const effective_prompt = if (kb_context) |kc|
-        std.fmt.allocPrint(allocator, "{s}\n{s}", .{ task.prompt, kc }) catch task.prompt
+    // Read per-role context_files for worker
+    const role_ctx_files = if (role_config) |rc|
+        seed_mod.readRoleContextFiles(paths.root, rc.context_files, allocator)
     else
-        task.prompt;
+        null;
+    defer if (role_ctx_files) |rc| allocator.free(rc);
+
+    // Combine: [context_blob] + [role_ctx_files] + task prompt + [kb_context]
+    var prompt_parts: std.ArrayList(u8) = .empty;
+    if (context_blob) |cb| {
+        prompt_parts.appendSlice(allocator, cb) catch {};
+        prompt_parts.appendSlice(allocator, "\n\n") catch {};
+    }
+    if (role_ctx_files) |rc| {
+        prompt_parts.appendSlice(allocator, rc) catch {};
+        prompt_parts.appendSlice(allocator, "\n\n") catch {};
+    }
+    prompt_parts.appendSlice(allocator, task.prompt) catch {};
+    if (kb_context) |kc| {
+        prompt_parts.append(allocator, '\n') catch {};
+        prompt_parts.appendSlice(allocator, kc) catch {};
+    }
+
+    const effective_prompt = prompt_parts.toOwnedSlice(allocator) catch task.prompt;
     defer if (effective_prompt.ptr != task.prompt.ptr) allocator.free(effective_prompt);
 
     // Run Claude with restart-on-timeout support
@@ -252,7 +275,7 @@ fn runWorkerImpl(
             .permission_mode = if (perms) |p| p.permission_mode else null,
             .allowed_tools = if (perms) |p| if (p.allowed_tools.len > 0) p.allowed_tools else null else null,
             .disallowed_tools = if (perms) |p| if (p.disallowed_tools.len > 0) p.disallowed_tools else null else null,
-        }, session_id, allocator) catch |e| {
+        }, session_id, allocator, cfg.claude_binary, cfg.pi_binary) catch |e| {
             logger.err("[worker:{d}] session failed: {}", .{ worker_id, e });
             break;
         };
@@ -390,6 +413,7 @@ pub fn runAllWorkers(
     io: Io,
     allocator: std.mem.Allocator,
     stream_output: bool,
+    context_blob: ?[]const u8,
 ) !void {
     const count = cfg.workers.count;
     logger.info("spawning {d} workers as async green threads", .{count});
@@ -398,7 +422,7 @@ pub fn runAllWorkers(
     for (0..count) |i| {
         const worker_id: u32 = @intCast(i + 1);
         group.async(io, workerGroupTask, .{
-            cfg, paths, store, pool, logger, io, worker_id, allocator, stream_output,
+            cfg, paths, store, pool, logger, io, worker_id, allocator, stream_output, context_blob,
         });
     }
     group.await(io) catch {};
@@ -415,8 +439,9 @@ fn workerGroupTask(
     worker_id: u32,
     allocator: std.mem.Allocator,
     stream_output: bool,
+    context_blob: ?[]const u8,
 ) void {
-    _ = runWorker(cfg, paths, store, pool, logger, io, worker_id, allocator, stream_output) catch |e| {
+    _ = runWorker(cfg, paths, store, pool, logger, io, worker_id, allocator, stream_output, context_blob) catch |e| {
         logger.err("[worker:{d}] fatal: {}", .{ worker_id, e });
         return;
     };

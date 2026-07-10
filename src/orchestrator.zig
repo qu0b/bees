@@ -20,6 +20,7 @@ const api = @import("api.zig");
 const MAX_WORKERS = 32;
 
 const backend = @import("backend.zig");
+const seed_mod = @import("seed.zig");
 
 /// Returned by `run` to tell the caller how the daemon loop ended.
 pub const DaemonAction = enum { shutdown, reload };
@@ -144,9 +145,19 @@ pub fn run(
         logger.info("[daemon] quiet hours ended, resuming", .{});
     }
 
+    // Build seed session for cross-role cache sharing
+    var seed_result = seed_mod.buildSeed(paths.root, cfg.project.name, cfg.cache, store, allocator, io);
+    var seed_uuid: ?[]const u8 = seed_result.uuid;
+    var context_blob: ?[]const u8 = seed_result.context_blob;
+    if (seed_uuid) |su| {
+        logger.info("[daemon] seed session built: {s}", .{su});
+    } else {
+        logger.info("[daemon] seed session disabled or failed, using standard prompts", .{});
+    }
+
     // Always run strategist at startup to refresh stale tasks before spawning workers
     logger.info("[daemon] running startup strategist to refresh tasks", .{});
-    runStrategistWithPrep(cfg, paths, store, logger, io, allocator);
+    runStrategistWithPrep(cfg, paths, store, logger, io, allocator, seed_uuid);
     tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
 
     var preflight_ok = false;
@@ -191,7 +202,7 @@ pub fn run(
         if (pool.hasActiveTasks()) {
             const spawn_count = @min(cfg.workers.count, MAX_WORKERS);
             for (0..spawn_count) |_| {
-                spawnWorker(cfg, paths, store, pool, logger, io, allocator, &state);
+                spawnWorker(cfg, paths, store, pool, logger, io, allocator, &state, context_blob);
             }
         }
     } else {
@@ -230,7 +241,7 @@ pub fn run(
             // Capture HEAD before merge for diff-aware QA
             const pre_merge_head = git.getCurrentHead(allocator, io, paths.root) catch null;
 
-            merger.runMerger(cfg, paths, store, logger, io, allocator) catch |e| {
+            merger.runMerger(cfg, paths, store, logger, io, allocator, seed_uuid) catch |e| {
                 logger.err("[daemon] merger failed: {}", .{e});
             };
 
@@ -262,6 +273,11 @@ pub fn run(
 
             // Build + restart once (serves QA, user agent, and strategist)
             prepareForStrategist(cfg, paths, logger, io, allocator);
+
+            // Rebuild seed session with fresh file contents after merge
+            seed_result = seed_mod.buildSeed(paths.root, cfg.project.name, cfg.cache, store, allocator, io);
+            seed_uuid = seed_result.uuid;
+            context_blob = seed_result.context_blob;
 
             // Precompute shared context values
             const worker_summary = ctx.buildWorkerSummary(store, null, allocator);
@@ -337,6 +353,7 @@ pub fn run(
                     step_ctx,
                     false,
                     cfg.default_backend,
+                    seed_uuid,
                 ) catch |e| {
                     logger.err("[daemon] {s} failed: {}", .{ step.role, e });
                 };
@@ -385,7 +402,7 @@ pub fn run(
 
             if (!pool.hasActiveTasks()) {
                 logger.info("[daemon] all tasks exhausted, running strategist", .{});
-                runStrategistWithPrep(cfg, paths, store, logger, io, allocator);
+                runStrategistWithPrep(cfg, paths, store, logger, io, allocator, seed_uuid);
                 tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
                 reloadPool(&pool, store, paths.tasks_file, allocator);
             }
@@ -397,7 +414,7 @@ pub fn run(
                 if (need > 0) {
                     logger.info("[daemon] spawning {d} new workers", .{need});
                     for (0..need) |_| {
-                        spawnWorker(cfg, paths, store, pool, logger, io, allocator, &state);
+                        spawnWorker(cfg, paths, store, pool, logger, io, allocator, &state, context_blob);
                     }
                 }
             } else {
@@ -441,6 +458,7 @@ fn spawnWorker(
     io: Io,
     allocator: std.mem.Allocator,
     state: *DaemonState,
+    ctx_blob: ?[]const u8,
 ) void {
     const wid = @atomicRmw(u32, &state.next_worker_id, .Add, 1, .monotonic);
     _ = @atomicRmw(u32, &state.active_count, .Add, 1, .release);
@@ -451,7 +469,7 @@ fn spawnWorker(
         0;
 
     _ = io.async(workerTask, .{
-        cfg, paths, store, pool, logger, io, wid, allocator, timeout_secs, state,
+        cfg, paths, store, pool, logger, io, wid, allocator, timeout_secs, state, ctx_blob,
     });
 }
 
@@ -467,12 +485,13 @@ fn workerTask(
     allocator: std.mem.Allocator,
     timeout_secs: u32,
     state: *DaemonState,
+    ctx_blob: ?[]const u8,
 ) void {
     defer {
         _ = @atomicRmw(u32, &state.done_count, .Add, 1, .release);
         _ = @atomicRmw(u32, &state.active_count, .Sub, 1, .release);
     }
-    const result = worker.runWorkerWithTimeout(cfg, paths, store, &pool, logger, io, wid, allocator, timeout_secs) catch |e| {
+    const result = worker.runWorkerWithTimeout(cfg, paths, store, &pool, logger, io, wid, allocator, timeout_secs, ctx_blob) catch |e| {
         logger.err("[worker:{d}] fatal: {}", .{ wid, e });
         return;
     };
@@ -572,6 +591,7 @@ fn drainSreTriggers(
         sre_context,
         false,
         cfg.default_backend,
+        null, // SRE runs reactively, seed context may be stale
     ) catch |e| {
         logger.err("[sre] fatal: {}", .{e});
     };
@@ -641,6 +661,7 @@ fn runStrategistWithPrep(
     logger: *log_mod.Logger,
     io: Io,
     allocator: std.mem.Allocator,
+    seed_uuid: ?[]const u8,
 ) void {
     prepareForStrategist(cfg, paths, logger, io, allocator);
     writeTaskTrends(cfg, paths, store, logger, allocator);
@@ -675,6 +696,7 @@ fn runStrategistWithPrep(
         context,
         false,
         cfg.default_backend,
+        seed_uuid,
     ) catch |e| {
         logger.err("[daemon] strategist failed: {}", .{e});
         return;

@@ -51,6 +51,9 @@ pub const RoleConfig = struct {
     /// Used when `permissions` is null.
     security_profile: ?[]const u8 = null,
 
+    /// Files always pre-loaded into this role's context (paths relative to project root).
+    context_files: []const []const u8 = &.{},
+
     /// Resolve effective permissions: explicit > named profile > null.
     pub fn resolvePermissions(self: *const RoleConfig) ?ToolPermissions {
         if (self.permissions) |p| return p;

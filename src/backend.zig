@@ -115,6 +115,8 @@ pub const BackendOptions = struct {
     no_session_persistence: bool = true,
     add_dirs: ?[]const []const u8 = null,
     fallback_model: ?[]const u8 = null,
+    /// When true with --resume, create a new session instead of reusing the original.
+    fork_session: bool = false,
 
     // -- Per-role security --
     permission_mode: ?[]const u8 = null,
@@ -153,7 +155,7 @@ pub fn resolveBackend(default_backend: []const u8, role_backend: []const u8) typ
 }
 
 /// Dispatch spawn to the appropriate backend.
-fn spawn(backend: types.BackendType, allocator: std.mem.Allocator, io: Io, options: BackendOptions) !std.process.Child {
+fn spawn(backend: types.BackendType, allocator: std.mem.Allocator, io: Io, options: BackendOptions, claude_binary: []const u8, pi_binary: []const u8) !std.process.Child {
     return switch (backend) {
         .claude => claude.spawnClaude(allocator, io, .{
             .prompt = options.prompt,
@@ -166,6 +168,7 @@ fn spawn(backend: types.BackendType, allocator: std.mem.Allocator, io: Io, optio
             .stdin_data = options.stdin_data,
             .timeout_secs = options.timeout_secs,
             .resume_session_id = options.resume_session_id,
+            .fork_session = options.fork_session,
             .mcp_config = options.mcp_config,
             .max_turns = options.max_turns,
             .stream_output = options.stream_output,
@@ -177,10 +180,10 @@ fn spawn(backend: types.BackendType, allocator: std.mem.Allocator, io: Io, optio
             .allowed_tools = options.allowed_tools,
             .disallowed_tools = options.disallowed_tools,
             .extra_env = options.extra_env,
-        }),
+        }, claude_binary),
         .codex => backend_codex.spawnCodex(allocator, io, options),
         .opencode => backend_opencode.spawnOpenCode(allocator, io, options),
-        .pi => backend_pi.spawnPi(allocator, io, options),
+        .pi => backend_pi.spawnPi(allocator, io, options, pi_binary),
     };
 }
 
@@ -262,12 +265,14 @@ pub fn runSession(
     options: BackendOptions,
     session_id: u64,
     allocator: std.mem.Allocator,
+    claude_binary: []const u8,
+    pi_binary: []const u8,
 ) !SessionResult {
     assert(session_id > 0);
     assert(options.prompt.len > 0);
     assert(options.cwd.len > 0);
 
-    var child = try spawn(options.backend, allocator, io, options);
+    var child = try spawn(options.backend, allocator, io, options, claude_binary, pi_binary);
 
     // Set up stdout writer for streaming mode
     var stream_buf: [8192]u8 = undefined;
