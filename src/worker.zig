@@ -80,12 +80,18 @@ fn runWorkerImpl(
     }
     defer releaseLock(lock_path);
 
-    // Select task
-    const task = pool.select() orelse {
+    // Select task. The returned pointer aliases the shared pool, which the
+    // main loop's reloadPool can free while this session runs for up to an
+    // hour — so take owned copies of the strings we need for the whole session.
+    const selected = pool.select() orelse {
         logger.info("[worker:{d}] no active tasks, skipping", .{worker_id});
         return .{};
     };
-    logger.info("[worker:{d}] start task=\"{s}\"", .{ worker_id, task.name });
+    const task_name = try allocator.dupe(u8, selected.name);
+    defer allocator.free(task_name);
+    const task_prompt = try allocator.dupe(u8, selected.prompt);
+    defer allocator.free(task_prompt);
+    logger.info("[worker:{d}] start task=\"{s}\"", .{ worker_id, task_name });
 
     // Create worktree
     var ts_buf: [32]u8 = undefined;
@@ -159,7 +165,7 @@ fn runWorkerImpl(
         .cache_read_tokens = 0,
     };
 
-    const session_id = store.createSession(header, task.name, branch_name, worktree_dir) catch |e| {
+    const session_id = store.createSession(header, task_name, branch_name, worktree_dir) catch |e| {
         logger.err("[worker:{d}] session create failed: {}", .{ worker_id, e });
         return .{};
     };
@@ -171,7 +177,14 @@ fn runWorkerImpl(
         const role_set = role_mod.loadRoles(paths, allocator) catch break :blk null;
         break :blk role_set.get("worker");
     };
-    const perms = if (role_config) |rc| rc.resolvePermissions() else security_profiles.getDefaultForSessionType(.worker);
+    // Fail CLOSED: if a worker role config exists but resolves no permissions
+    // (no `permissions`, no `security_profile`, or an unknown profile name), fall
+    // back to the built-in worker sandbox rather than running with
+    // --dangerously-skip-permissions.
+    const perms = if (role_config) |rc|
+        (rc.resolvePermissions() orelse security_profiles.getDefaultForSessionType(.worker))
+    else
+        security_profiles.getDefaultForSessionType(.worker);
 
     // Resolve mc plugin MCP config if role declares plugins
     var merged_mcp_path: ?[]const u8 = null;
@@ -221,14 +234,14 @@ fn runWorkerImpl(
         prompt_parts.appendSlice(allocator, rc) catch {};
         prompt_parts.appendSlice(allocator, "\n\n") catch {};
     }
-    prompt_parts.appendSlice(allocator, task.prompt) catch {};
+    prompt_parts.appendSlice(allocator, task_prompt) catch {};
     if (kb_context) |kc| {
         prompt_parts.append(allocator, '\n') catch {};
         prompt_parts.appendSlice(allocator, kc) catch {};
     }
 
-    const effective_prompt = prompt_parts.toOwnedSlice(allocator) catch task.prompt;
-    defer if (effective_prompt.ptr != task.prompt.ptr) allocator.free(effective_prompt);
+    const effective_prompt = prompt_parts.toOwnedSlice(allocator) catch task_prompt;
+    defer if (effective_prompt.ptr != task_prompt.ptr) allocator.free(effective_prompt);
 
     // Run Claude with restart-on-timeout support
     var claude_session_id: ?[]const u8 = null;
@@ -308,7 +321,16 @@ fn runWorkerImpl(
         break; // Normal completion or non-resumable error
     }
 
-    const result = last_result orelse return .{ .session_id = session_id };
+    const result = last_result orelse {
+        // Every runSession attempt failed to even start (spawn error). Don't
+        // leave the session stuck as "running" until the next daemon restart —
+        // mark it errored so status queries and slot accounting stay accurate.
+        var err_header = header;
+        err_header.status = .err;
+        err_header.finished_at = @truncate(fs.timestamp());
+        store.updateSessionStatus(session_id, .running, header.started_at, err_header) catch {};
+        return .{ .session_id = session_id };
+    };
     defer {
         if (result.result_text.len > 0) allocator.free(result.result_text);
         if (result.claude_session_id.len > 0) allocator.free(result.claude_session_id);
@@ -342,7 +364,7 @@ fn runWorkerImpl(
         .exit_code = result.exit_code,
         .started_at = @truncate(now),
         .finished_at = @truncate(finish_time),
-        .duration_ms = @intCast(@min((finish_time - now) * 1000, std.math.maxInt(u32))),
+        .duration_ms = @intCast(@min((finish_time -| now) * 1000, std.math.maxInt(u32))),
         .cost_microdollars = result.cost_microdollars,
         .input_tokens = result.input_tokens,
         .output_tokens = result.output_tokens,
@@ -380,8 +402,8 @@ fn runWorkerImpl(
     {
         const txn = store.beginWriteTxn() catch null;
         if (txn) |t| {
-            store.incrementTaskStat(t, task.name, .total_runs) catch {};
-            if (commits == 0) store.incrementTaskStat(t, task.name, .empty) catch {};
+            store.incrementTaskStat(t, task_name, .total_runs) catch {};
+            if (commits == 0) store.incrementTaskStat(t, task_name, .empty) catch {};
             store_mod.Store.commitTxn(t) catch {};
         }
     }
@@ -391,7 +413,7 @@ fn runWorkerImpl(
         const stop = if (result.stop_reason.len > 0) result.stop_reason else "-";
         logger.info("[worker:{d}] done task=\"{s}\" commits={d} cost=${d:.2} turns={d} subtype={s} stop={s} tool_errors={d}", .{
             worker_id,
-            task.name,
+            task_name,
             commits,
             @as(f64, @floatFromInt(result.cost_microdollars)) / 1000000.0,
             result.num_turns,

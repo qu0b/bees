@@ -10,6 +10,9 @@ pub fn spawnPi(allocator: std.mem.Allocator, io: Io, options: backend.BackendOpt
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(allocator);
 
+    var timeout_secs_buf: [16]u8 = undefined;
+    try backend.appendTimeoutPrefix(&args, allocator, options.timeout_secs, &timeout_secs_buf);
+
     try args.append(allocator, binary_name);
     try args.append(allocator, "-p");
     try args.append(allocator, "--mode");

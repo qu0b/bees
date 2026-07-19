@@ -65,8 +65,14 @@ pub fn buildSeed(
     // Write seed JSONL
     const wrote = writeSeedJsonl(project_root, &uuid, blob, allocator, io);
 
+    // `uuid` is a stack-local [36]u8; the returned slice must own heap memory
+    // or it would dangle once this frame returns (the daemon keeps it for its
+    // whole lifetime as the --resume argument of every seeded session).
+    const owned_uuid: ?[]const u8 = if (wrote) (allocator.dupe(u8, &uuid) catch null) else null;
+    assert(owned_uuid == null or owned_uuid.?.len == 36);
+
     return .{
-        .uuid = if (wrote) uuid[0..] else null,
+        .uuid = owned_uuid,
         .context_blob = blob,
     };
 }

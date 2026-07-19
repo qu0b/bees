@@ -34,7 +34,7 @@ pub fn runRole(
     allocator: std.mem.Allocator,
     injected_context: ?[]const u8,
     stream_output: bool,
-    default_backend: []const u8,
+    cfg: config_mod.Config,
     seed_uuid: ?[]const u8,
 ) !void {
     assert(role.name.len > 0);
@@ -45,7 +45,14 @@ pub fn runRole(
 
     // Resolve model and backend
     const model = types.ModelType.fromString(role.model);
-    const bt = backend.resolveBackend(default_backend, role.backend);
+    const bt = backend.resolveBackend(cfg.default_backend, role.backend);
+
+    // Context lineage / caching: the seed is a synthetic Claude session that
+    // agents --resume --fork-session from to share a cached codebase prefix. It
+    // is Claude-specific, so only fork it for Claude agents. Codex agents run
+    // fresh (their own provider handles caching); passing a Claude session id to
+    // them would be meaningless.
+    const use_seed = seed_uuid != null and bt == .claude;
 
     // Resolve per-role security permissions
     const perms = role.resolvePermissions() orelse
@@ -81,7 +88,7 @@ pub fn runRole(
 
     // Build prompt: when seed is set, role prompt moves to user message for cache sharing.
     // Otherwise, falls back to current behavior (role prompt via --append-system-prompt-file).
-    const role_prompt_content: ?[]const u8 = if (seed_uuid != null and role.prompt_path.len > 0)
+    const role_prompt_content: ?[]const u8 = if (use_seed and role.prompt_path.len > 0)
         fs.readFileAlloc(allocator, role.prompt_path, 256 * 1024) catch null
     else
         null;
@@ -120,8 +127,7 @@ pub fn runRole(
         break :blk null;
     } else null;
 
-    // Run Claude session — use seed for cache sharing when available
-    const use_seed = seed_uuid != null;
+    // Run the session — fork the seed for cache sharing only for Claude agents.
     const result = backend.runSession(store, io, .{
         .backend = bt,
         .prompt = prompt,
@@ -129,7 +135,7 @@ pub fn runRole(
         // Seed mode: role prompt already in user message, no append file needed.
         // Normal mode: role prompt via --append-system-prompt-file.
         .append_prompt_file = if (use_seed) null else if (role.prompt_path.len > 0) role.prompt_path else null,
-        .resume_session_id = seed_uuid,
+        .resume_session_id = if (use_seed) seed_uuid else null,
         .fork_session = use_seed,
         .model = role.model,
         .fallback_model = role.fallback_model,
@@ -179,7 +185,7 @@ pub fn runRole(
         .exit_code = result.exit_code,
         .started_at = @truncate(now),
         .finished_at = @truncate(finish_time),
-        .duration_ms = @intCast(@min((finish_time - now) * 1000, std.math.maxInt(u32))),
+        .duration_ms = @intCast(@min((finish_time -| now) * 1000, std.math.maxInt(u32))),
         .cost_microdollars = result.cost_microdollars,
         .input_tokens = result.input_tokens,
         .output_tokens = result.output_tokens,

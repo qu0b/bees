@@ -7,6 +7,14 @@ pub const Config = struct {
     claude_binary: []const u8 = "claude",
     pi_binary: []const u8 = "pi",
     default_backend: []const u8 = "claude",
+    /// Codex model + reasoning effort for thinking/knowledge roles (strategist,
+    /// researcher). `sol` is the stronger reasoner; runs at the highest (xhigh)
+    /// reasoning effort — higher than the execution workers.
+    codex_thinking: CodexRole = .{ .model = "gpt-5.6-sol", .effort = "xhigh" },
+    /// Codex model + reasoning effort for clearly-defined execution roles
+    /// (workers). `terra` runs at high reasoning (the floor; the thinker runs
+    /// a tier above).
+    codex_execution: CodexRole = .{ .model = "gpt-5.6-terra", .effort = "high" },
     workers: Workers = .{},
     merger: Merger = .{},
     sre: Sre = .{},
@@ -21,6 +29,7 @@ pub const Config = struct {
     smoke_test: SmokeTest = .{},
     timeouts: Timeouts = .{},
     cache: Cache = .{},
+    funding: Funding = .{},
 
     pub const Project = struct {
         name: []const u8,
@@ -29,16 +38,19 @@ pub const Config = struct {
 
     pub const Workers = struct {
         count: u32 = 5,
-        model: []const u8 = "sonnet",
+        model: []const u8 = "opus",
         effort: []const u8 = "high",
         max_budget_usd: f64 = 30.0,
         fallback_model: ?[]const u8 = null,
         schedule: []const u8 = "0 * * * *",
         backend: []const u8 = "",
+        /// Fraction of workers (0.0-1.0) routed to the Codex backend instead of
+        /// the Claude default. 0.5 = half. Codex workers use `codex_execution`.
+        codex_fraction: f64 = 0.5,
     };
 
     pub const Merger = struct {
-        model: []const u8 = "sonnet",
+        model: []const u8 = "opus",
         effort: []const u8 = "high",
         max_budget_usd: f64 = 30.0,
         fallback_model: ?[]const u8 = null,
@@ -49,7 +61,7 @@ pub const Config = struct {
     };
 
     pub const Sre = struct {
-        model: []const u8 = "sonnet",
+        model: []const u8 = "opus",
         effort: []const u8 = "high",
         max_budget_usd: f64 = 30.0,
         fallback_model: ?[]const u8 = null,
@@ -60,13 +72,17 @@ pub const Config = struct {
     };
 
     pub const Strategist = struct {
-        model: []const u8 = "opus",
+        // Deep-reasoning role — defaults to Fable.
+        model: []const u8 = "fable",
         effort: []const u8 = "high",
         max_budget_usd: f64 = 30.0,
-        fallback_model: ?[]const u8 = "sonnet",
+        fallback_model: ?[]const u8 = "opus",
         cycle_interval: u32 = 3,
         mcp_config: ?[]const u8 = null,
         backend: []const u8 = "",
+        /// Fraction of strategist runs (0.0-1.0) routed to the Codex backend
+        /// instead of Claude. 0.25 = a quarter. Codex runs use `codex_thinking`.
+        codex_fraction: f64 = 0.25,
     };
 
     pub const Qa = struct {
@@ -79,7 +95,7 @@ pub const Config = struct {
     };
 
     pub const User = struct {
-        model: []const u8 = "sonnet",
+        model: []const u8 = "opus",
         effort: []const u8 = "high",
         max_budget_usd: f64 = 30.0,
         fallback_model: ?[]const u8 = null,
@@ -151,6 +167,48 @@ pub const Config = struct {
         /// Directory prefixes excluded from file selection (e.g., "vendor/", "node_modules/").
         always_exclude: []const []const u8 = &.{},
     };
+
+    /// A Codex model paired with its reasoning effort, assigned by task type.
+    pub const CodexRole = struct {
+        /// OpenAI model passed to `codex exec -m`.
+        model: []const u8,
+        /// Reasoning effort passed to codex as `model_reasoning_effort`.
+        effort: []const u8 = "high",
+    };
+
+    pub const Funding = struct {
+        /// Hard ceiling on a single funding request, in whole USDC. Requests above
+        /// this are refused. 0 disables all on-chain transfers.
+        max_per_request_usdc: u32 = 100,
+        /// Hard ceiling on cumulative USDC transferred across the project lifetime
+        /// (tracked in a ledger under the funding dir). 0 disables all transfers.
+        max_cumulative_usdc: u32 = 1000,
+    };
+
+    /// Validate a loaded config. Fails fast on values that would corrupt paths,
+    /// spin the daemon, or move the base branch unexpectedly.
+    pub fn validate(self: Config) !void {
+        // project.name flows unescaped into /tmp/bees-{name} worktree/lock paths
+        // and the systemd unit name bees-{name}.service — must be a safe segment.
+        const name = self.project.name;
+        if (name.len == 0 or name.len > 64) return error.InvalidProjectName;
+        if (std.mem.indexOfAny(u8, name, "/\\\x00") != null) return error.InvalidProjectName;
+        if (std.mem.indexOf(u8, name, "..") != null) return error.InvalidProjectName;
+        for (name) |ch| {
+            if (ch < 0x20) return error.InvalidProjectName; // no control chars
+        }
+        if (self.project.base_branch.len == 0) return error.InvalidBaseBranch;
+        if (self.project.base_branch[0] == '-') return error.InvalidBaseBranch; // git option-like
+
+        // Zero workers idles the daemon forever; merge_threshold 0 spins the merger.
+        if (self.workers.count == 0 or self.workers.count > 64) return error.InvalidWorkerCount;
+        if (self.merger.merge_threshold == 0) return error.InvalidMergeThreshold;
+
+        // Budgets must be finite and positive, else the cost cap is meaningless.
+        if (!(self.workers.max_budget_usd > 0) or !std.math.isFinite(self.workers.max_budget_usd)) {
+            return error.InvalidBudget;
+        }
+    }
 };
 
 pub const ProjectPaths = struct {
@@ -198,12 +256,14 @@ pub fn findProjectRoot(allocator: std.mem.Allocator, start_dir: []const u8) !?[]
     }
 }
 
-/// Load and parse config.json
+/// Load and parse config.json, then validate it.
 pub fn load(allocator: std.mem.Allocator, path: []const u8) !Config {
     const data = try fs.readFileAlloc(allocator, path, 1024 * 1024);
     const parsed = try std.json.parseFromSlice(Config, allocator, data, .{
         .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
     });
+    try parsed.value.validate();
     return parsed.value;
 }
 
@@ -213,7 +273,25 @@ test "default config values" {
     };
     try std.testing.expectEqual(@as(u32, 5), cfg.workers.count);
     try std.testing.expectEqualStrings("main", cfg.project.base_branch);
-    try std.testing.expectEqualStrings("sonnet", cfg.workers.model);
+    try std.testing.expectEqualStrings("opus", cfg.workers.model);
+    try std.testing.expectEqualStrings("fable", cfg.strategist.model);
+    try std.testing.expectEqual(@as(f64, 0.5), cfg.workers.codex_fraction);
+    try std.testing.expectEqual(@as(f64, 0.25), cfg.strategist.codex_fraction);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", cfg.codex_thinking.model);
+    try std.testing.expectEqualStrings("xhigh", cfg.codex_thinking.effort);
+    try std.testing.expectEqualStrings("gpt-5.6-terra", cfg.codex_execution.model);
+    try std.testing.expectEqualStrings("high", cfg.codex_execution.effort);
     try std.testing.expectEqual(@as(f64, 30.0), cfg.workers.max_budget_usd);
     try std.testing.expectEqual(false, cfg.smoke_test.enabled);
+}
+
+test "validate accepts a sane config and rejects dangerous ones" {
+    try (Config{ .project = .{ .name = "my-project" } }).validate();
+
+    try std.testing.expectError(error.InvalidProjectName, (Config{ .project = .{ .name = "" } }).validate());
+    try std.testing.expectError(error.InvalidProjectName, (Config{ .project = .{ .name = "../etc" } }).validate());
+    try std.testing.expectError(error.InvalidProjectName, (Config{ .project = .{ .name = "a/b" } }).validate());
+    try std.testing.expectError(error.InvalidWorkerCount, (Config{ .project = .{ .name = "ok" }, .workers = .{ .count = 0 } }).validate());
+    try std.testing.expectError(error.InvalidMergeThreshold, (Config{ .project = .{ .name = "ok" }, .merger = .{ .merge_threshold = 0 } }).validate());
+    try std.testing.expectError(error.InvalidBaseBranch, (Config{ .project = .{ .name = "ok", .base_branch = "-x" } }).validate());
 }

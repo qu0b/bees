@@ -65,17 +65,48 @@ pub fn getSessionBranch(db: *sqlite.Db, id: u64, buf: []u8) ![]const u8 {
     return buf[0..len];
 }
 
+/// Safely convert a replica integer to an enum label, returning "unknown" for
+/// out-of-range/invalid values. Replica ints are not trusted to be enum-exact —
+/// a corrupt row or a value written by a newer schema would otherwise panic in
+/// `@intCast`/`@enumFromInt` and crash the whole query/API handler.
+fn enumLabel(comptime E: type, v: i64) []const u8 {
+    const Tag = @typeInfo(E).@"enum".tag_type;
+    if (v >= 0 and v <= std.math.maxInt(Tag)) {
+        const tag_val: Tag = @intCast(v);
+        inline for (@typeInfo(E).@"enum".fields) |f| {
+            if (f.value == tag_val) return (@as(E, @enumFromInt(tag_val))).label();
+        }
+    }
+    return "unknown";
+}
+
+/// Safely convert a replica integer to an enum value, falling back to `default`
+/// for out-of-range/invalid values (used when the value is compared, not labeled).
+fn safeEnum(comptime E: type, v: i64, default: E) E {
+    const Tag = @typeInfo(E).@"enum".tag_type;
+    if (v >= 0 and v <= std.math.maxInt(Tag)) {
+        const tag_val: Tag = @intCast(v);
+        inline for (@typeInfo(E).@"enum".fields) |f| {
+            if (f.value == tag_val) return @enumFromInt(tag_val);
+        }
+    }
+    return default;
+}
+
 fn writeSessionRowJson(stmt: *sqlite.Stmt, w: *Io.Writer) !void {
     const id = stmt.columnInt(0);
-    const session_type: types.SessionType = @enumFromInt(@as(u4, @intCast(stmt.columnInt(1))));
-    const status: types.SessionStatus = @enumFromInt(@as(u3, @intCast(stmt.columnInt(2))));
-    const backend: types.BackendType = @enumFromInt(@as(u2, @intCast(stmt.columnInt(3))));
     const commits = stmt.columnInt(4);
     const cost_micro = stmt.columnInt(5);
     const cost_cents = @divTrunc(cost_micro, 10000);
 
     try w.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"backend\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"cost_microdollars\":{d},\"task\":", .{
-        id, session_type.label(), status.label(), backend.label(), commits, cost_cents, cost_micro,
+        id,
+        enumLabel(types.SessionType, stmt.columnInt(1)),
+        enumLabel(types.SessionStatus, stmt.columnInt(2)),
+        enumLabel(types.BackendType, stmt.columnInt(3)),
+        commits,
+        cost_cents,
+        cost_micro,
     });
     try writeJsonStr(w, stmt.columnText(6)); // task
     try w.print(",\"branch\":", .{});
@@ -97,10 +128,10 @@ fn writeSessionRowJson(stmt: *sqlite.Stmt, w: *Io.Writer) !void {
     // Result detail
     const result_subtype = stmt.columnInt(16);
     if (result_subtype > 0) {
-        const rs: types.ResultSubtype = @enumFromInt(@as(u3, @intCast(result_subtype)));
-        const sr: types.StopReason = @enumFromInt(@as(u2, @intCast(stmt.columnInt(17))));
         try w.print(",\"result_subtype\":\"{s}\",\"stop_reason\":\"{s}\",\"duration_api_ms\":{d}", .{
-            rs.label(), sr.label(), stmt.columnInt(18),
+            enumLabel(types.ResultSubtype, result_subtype),
+            enumLabel(types.StopReason, stmt.columnInt(17)),
+            stmt.columnInt(18),
         });
     }
 
@@ -126,12 +157,12 @@ pub fn writeSessionEventsJson(db: *sqlite.Db, w: *Io.Writer, session_id: u64) !v
         first = false;
 
         const seq = stmt.columnInt(0);
-        const event_type: types.EventType = @enumFromInt(@as(u3, @intCast(stmt.columnInt(1))));
-        const tool_name: types.ToolName = @enumFromInt(@as(u4, @intCast(stmt.columnInt(2))));
-        const role: types.Role = @enumFromInt(@as(u2, @intCast(stmt.columnInt(3))));
+        const role = safeEnum(types.Role, stmt.columnInt(3), .none);
 
         try w.print("{{\"seq\":{d},\"type\":\"{s}\",\"tool\":\"{s}\"", .{
-            seq, event_type.label(), tool_name.label(),
+            seq,
+            enumLabel(types.EventType, stmt.columnInt(1)),
+            enumLabel(types.ToolName, stmt.columnInt(2)),
         });
         if (role != .none) {
             try w.print(",\"role\":\"{s}\"", .{role.label()});
@@ -160,16 +191,13 @@ pub fn writeTasksJson(db: *sqlite.Db, w: *Io.Writer) !void {
         if (!first) try w.writeAll(",");
         first = false;
 
-        const status: types.TaskStatus = @enumFromInt(@as(u2, @intCast(stmt.columnInt(7))));
-        const origin: types.TaskOrigin = @enumFromInt(@as(u2, @intCast(stmt.columnInt(8))));
-
         try w.print("{{\"name\":", .{});
         try writeJsonStr(w, stmt.columnText(0));
         try w.print(",\"weight\":{d},\"prompt\":", .{stmt.columnInt(1)});
         try writeJsonStr(w, stmt.columnText(2));
         try w.print(",\"total_runs\":{d},\"accepted\":{d},\"rejected\":{d},\"empty\":{d},\"status\":\"{s}\",\"origin\":\"{s}\"}}", .{
-            stmt.columnInt(3), stmt.columnInt(4), stmt.columnInt(5), stmt.columnInt(6),
-            status.label(),    origin.label(),
+            stmt.columnInt(3),                             stmt.columnInt(4), stmt.columnInt(5), stmt.columnInt(6),
+            enumLabel(types.TaskStatus, stmt.columnInt(7)), enumLabel(types.TaskOrigin, stmt.columnInt(8)),
         });
     }
     try w.writeAll("]");
@@ -233,8 +261,9 @@ pub fn buildWorkerSummary(db: *sqlite.Db, allocator: std.mem.Allocator) ?[]const
         if (!has_row) break;
         const task = stmt.columnText(0);
         const commits = stmt.columnInt(1);
-        const status: types.SessionStatus = @enumFromInt(@as(u3, @intCast(stmt.columnInt(2))));
-        const cost_cents: u64 = @intCast(@divTrunc(stmt.columnInt(3), 10000));
+        const status = safeEnum(types.SessionStatus, stmt.columnInt(2), .err);
+        const raw_cost = stmt.columnInt(3);
+        const cost_cents: u64 = if (raw_cost > 0) @intCast(@divTrunc(raw_cost, 10000)) else 0;
 
         buf.appendSlice(allocator, "- Task: '") catch continue;
         buf.appendSlice(allocator, task) catch continue;

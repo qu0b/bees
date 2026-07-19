@@ -122,8 +122,11 @@ pub const TaskPool = struct {
 
     /// Select a task. Uses round-robin so consecutive calls within a
     /// batch always return different tasks (when batch size <= pool size).
-    /// Weight still matters across cycles — higher-weight tasks appear
-    /// more often in the rotation order.
+    ///
+    /// LIFETIME: the returned pointer aliases `self.tasks`, which the main
+    /// loop's reloadPool can free. Callers MUST copy any fields they need
+    /// (name/prompt) before the next suspension point — the pool may be gone
+    /// after that. Workers do this immediately (see worker.zig).
     pub fn select(self: *const TaskPool) ?*const Task {
         if (self.tasks.len == 0) return null;
         if (self.total_weight == 0) return null;
@@ -167,7 +170,7 @@ pub fn syncFromJson(
     defer parsed.deinit();
     const items = parsed.value;
 
-    const txn = try store.beginWriteTxn();
+    var txn = try store.beginWriteTxn();
     errdefer store_mod.Store.abortTxn(txn);
 
     // Collect existing task names before any writes
@@ -234,7 +237,7 @@ pub fn syncFromJson(
     // Write tasks JSON to meta for dashboard direct reads
     writeTasksMeta(store, txn, allocator) catch {};
 
-    try store_mod.Store.commitTxn(txn);
+    try store_mod.Store.commitTxnConsume(&txn);
 }
 
 /// Write a JSON array of all tasks to the meta sub-database.

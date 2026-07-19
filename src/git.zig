@@ -171,6 +171,22 @@ pub fn getChangedFiles(allocator: std.mem.Allocator, io: Io, repo_path: []const 
     return result.stdout;
 }
 
+/// Strip the ref namespace from a symbolic-ref result, preserving branch names
+/// that themselves contain slashes — e.g. "feat/x" from "refs/heads/feat/x", or
+/// "feat/x" from "refs/remotes/origin/feat/x". Splitting on the LAST slash (the
+/// old behavior) mangled slashed branch names into a nonexistent ref.
+fn stripRefPrefix(ref: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, ref, "refs/heads/")) return ref["refs/heads/".len..];
+    if (std.mem.startsWith(u8, ref, "refs/remotes/")) {
+        const rest = ref["refs/remotes/".len..];
+        // Drop the remote name (first segment); keep the branch path verbatim.
+        if (std.mem.indexOfScalar(u8, rest, '/')) |slash| return rest[slash + 1 ..];
+        return rest;
+    }
+    if (std.mem.lastIndexOfScalar(u8, ref, '/')) |pos| return ref[pos + 1 ..];
+    return ref;
+}
+
 pub fn getDefaultBranch(allocator: std.mem.Allocator, io: Io, repo_path: []const u8) ?[]const u8 {
     // Try remote HEAD first (works when origin is configured)
     const refs = [_][]const u8{
@@ -182,8 +198,9 @@ pub fn getDefaultBranch(allocator: std.mem.Allocator, io: Io, repo_path: []const
         defer allocator.free(result.stderr);
         if (result.exit_code == 0) {
             const trimmed = std.mem.trim(u8, result.stdout, &std.ascii.whitespace);
-            if (std.mem.lastIndexOfScalar(u8, trimmed, '/')) |pos| {
-                const branch = allocator.dupe(u8, trimmed[pos + 1 ..]) catch {
+            const name = stripRefPrefix(trimmed);
+            if (name.len > 0) {
+                const branch = allocator.dupe(u8, name) catch {
                     allocator.free(result.stdout);
                     continue;
                 };
@@ -213,4 +230,11 @@ pub fn isGitRepo(allocator: std.mem.Allocator, io: Io, path: []const u8) bool {
     allocator.free(result.stdout);
     allocator.free(result.stderr);
     return result.exit_code == 0;
+}
+
+test "stripRefPrefix preserves slashed branch names" {
+    try std.testing.expectEqualStrings("main", stripRefPrefix("refs/heads/main"));
+    try std.testing.expectEqualStrings("feat/internal-actor-policy", stripRefPrefix("refs/heads/feat/internal-actor-policy"));
+    try std.testing.expectEqualStrings("main", stripRefPrefix("refs/remotes/origin/main"));
+    try std.testing.expectEqualStrings("feat/x", stripRefPrefix("refs/remotes/origin/feat/x"));
 }

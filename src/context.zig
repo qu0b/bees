@@ -4,6 +4,7 @@
 //! in a single LMDB read transaction and assembles the prompt context string.
 //!
 //! Sources:
+//!   - mission:           .bees/MISSION.md (durable product intent & horizon)
 //!   - user_profiles:     .bees/prompts/users/*.txt (target personas)
 //!   - operator_feedback: .bees/feedback.json (dashboard steering input)
 //!   - report_qa:         LMDB report:qa (QA validation results)
@@ -25,6 +26,7 @@ const db_query = @import("db/query.zig");
 const knowledge = @import("knowledge.zig");
 
 pub const Source = enum {
+    mission,
     user_profiles,
     operator_feedback,
     report_qa,
@@ -67,6 +69,7 @@ pub fn build(
 
     for (sources) |source| {
         switch (source) {
+            .mission => appendMission(&parts, paths, allocator),
             .user_profiles => appendUserProfiles(&parts, paths, allocator),
             .operator_feedback => appendFeedback(&parts, paths, allocator),
             .report_qa => appendMeta(&parts, store, txn, "report:qa", "Latest QA Report", allocator),
@@ -169,6 +172,24 @@ pub fn getTaskContext(store: *store_mod.Store, sql_db: ?*sqlite.Db, worker_sessi
 }
 
 // === Internal helpers ===
+
+fn appendMission(parts: *std.ArrayList(u8), paths: config_mod.ProjectPaths, allocator: std.mem.Allocator) void {
+    const path = std.fs.path.join(allocator, &.{ paths.bees_dir, "MISSION.md" }) catch return;
+    defer allocator.free(path);
+    const mission = fs.readFileAlloc(allocator, path, 64 * 1024) catch return;
+    defer allocator.free(mission);
+    if (std.mem.trim(u8, mission, &std.ascii.whitespace).len == 0) return;
+    parts.appendSlice(allocator,
+        \\
+        \\
+        \\## Mission — the real problem we solve for users (north star)
+        \\This is the durable intent for the product. Judge every decision by whether it
+        \\solves a real problem for a real user and moves the product toward this mission.
+        \\Reports and trends below are evidence to read, never targets to optimize.
+        \\
+    ) catch {};
+    parts.appendSlice(allocator, mission) catch {};
+}
 
 fn appendUserProfiles(parts: *std.ArrayList(u8), paths: config_mod.ProjectPaths, allocator: std.mem.Allocator) void {
     const users_dir = std.fs.path.join(allocator, &.{ paths.prompts_dir, "users" }) catch return;

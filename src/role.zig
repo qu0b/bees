@@ -149,7 +149,9 @@ pub fn resolveContextSources(role: RoleConfig, allocator: std.mem.Allocator) Res
     var has_knowledge = false;
 
     for (role.sources) |s| {
-        if (std.mem.eql(u8, s, "user_profiles")) {
+        if (std.mem.eql(u8, s, "mission")) {
+            sources.append(allocator, .mission) catch continue;
+        } else if (std.mem.eql(u8, s, "user_profiles")) {
             sources.append(allocator, .user_profiles) catch continue;
         } else if (std.mem.eql(u8, s, "operator_feedback")) {
             sources.append(allocator, .operator_feedback) catch continue;
@@ -226,4 +228,16 @@ fn parseRoleConfig(allocator: std.mem.Allocator, path: []const u8) ?RoleConfig {
         .ignore_unknown_fields = true,
     }) catch return null;
     return parsed.value;
+}
+
+test "resolveContextSources maps the mission north-star source" {
+    const alloc = std.testing.allocator;
+    const role = RoleConfig{ .name = "improver", .sources = &.{ "mission", "user_profiles" } };
+    const resolved = resolveContextSources(role, alloc);
+    defer alloc.free(resolved.sources);
+    try std.testing.expectEqual(@as(usize, 2), resolved.sources.len);
+    try std.testing.expectEqual(context.Source.mission, resolved.sources[0]);
+    try std.testing.expectEqual(context.Source.user_profiles, resolved.sources[1]);
+    // No knowledge requested → knowledge stays inactive.
+    try std.testing.expect(resolved.knowledge_tags == null);
 }

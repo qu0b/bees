@@ -172,9 +172,11 @@ pub fn extractUpdates(result_text: []const u8, allocator: std.mem.Allocator) []c
             continue;
         }
 
-        // Parse optional tags line and find content after "---" separator
+        // Parse optional tags line and find content after "---" separator.
+        // Clamp: a directive on the final line (no trailing newline) yields
+        // line_end == section.len, so line_end + 1 would overrun the slice.
         var tags_list: std.ArrayList([]const u8) = .empty;
-        var content_start = line_end + 1;
+        var content_start = @min(line_end + 1, section.len);
 
         // Look for "tags:" line before "---"
         if (content_start < section.len) {
@@ -186,7 +188,7 @@ pub fn extractUpdates(result_text: []const u8, allocator: std.mem.Allocator) []c
                 if (std.mem.indexOf(u8, tags_str, "tags:")) |ti| {
                     parseTags(tags_str[ti + 5 ..], &tags_list, allocator);
                 }
-                content_start = tags_line_end + 1;
+                content_start = @min(tags_line_end + 1, section.len);
             }
         }
 
@@ -214,6 +216,7 @@ pub fn extractUpdates(result_text: []const u8, allocator: std.mem.Allocator) []c
             break :blk section.len;
         };
 
+        assert(content_start <= content_end);
         const content = std.mem.trim(u8, section[content_start..content_end], &std.ascii.whitespace);
 
         if (content.len > 0) {
@@ -284,27 +287,25 @@ pub fn applyUpdates(
                 fs.closeFile(file);
             },
             .append => {
-                // Read existing content and append
-                const existing = fs.readFileAlloc(allocator, file_path, max_page_size) catch "";
-                defer if (existing.len > 0) allocator.free(existing);
-
-                const file = fs.createFile(file_path, .{ .truncate = true }) catch continue;
-                if (existing.len > 0) {
-                    fs.writeFile(file, existing) catch {
+                // Append at EOF via positional write — never read+truncate. The
+                // old code read the page into a 32 KB-capped buffer and rewrote
+                // it, so any page >= 32 KB (StreamTooLong) collapsed to just the
+                // new content, destroying all prior knowledge on that page.
+                if (fs.openFileWrite(file_path)) |file| {
+                    var pos: u64 = fs.fileLength(file);
+                    // Blank-line separator between existing content and new block.
+                    if (pos > 0) fs.writeFileAppend(file, "\n\n", &pos) catch {};
+                    fs.writeFileAppend(file, upd.content, &pos) catch {};
+                    fs.closeFile(file);
+                } else |_| {
+                    // No existing page — create it with the content.
+                    const file = fs.createFile(file_path, .{ .truncate = true }) catch continue;
+                    fs.writeFile(file, upd.content) catch {
                         fs.closeFile(file);
                         continue;
                     };
-                    // Ensure newline between existing and appended
-                    if (existing[existing.len - 1] != '\n') {
-                        fs.writeFile(file, "\n") catch {};
-                    }
-                    fs.writeFile(file, "\n") catch {};
-                }
-                fs.writeFile(file, upd.content) catch {
                     fs.closeFile(file);
-                    continue;
-                };
-                fs.closeFile(file);
+                }
             },
         }
 
@@ -326,10 +327,21 @@ pub fn applyUpdates(
     const index_json = serializeIndex(current_index.items, allocator) orelse return error.SerializeFailed;
     defer allocator.free(index_json);
 
-    const wtxn = try store.beginWriteTxn();
+    // Round-trip guard: if the serialized index does not parse back, refuse to
+    // persist it. Overwriting with unparseable JSON would make the next load
+    // return null and silently wipe the entire knowledge base. Fail loud instead.
+    {
+        const verify = std.json.parseFromSlice([]const IndexEntry, allocator, index_json, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch return error.IndexRoundTripFailed;
+        verify.deinit();
+    }
+
+    var wtxn = try store.beginWriteTxn();
     errdefer store_mod.Store.abortTxn(wtxn);
     try store.putMeta(wtxn, index_key, index_json);
-    try store_mod.Store.commitTxn(wtxn);
+    try store_mod.Store.commitTxnConsume(&wtxn);
 
     // Append to _log.md
     appendLog(knowledge_dir, updates, role_name, now, allocator);
@@ -459,10 +471,22 @@ fn extractSummary(content: []const u8) []const u8 {
         if (trimmed.len == 0) continue;
         if (std.mem.startsWith(u8, trimmed, "#")) continue;
         if (std.mem.startsWith(u8, trimmed, "---")) continue;
-        // Return first meaningful line, capped at 120 chars
-        return trimmed[0..@min(trimmed.len, 120)];
+        // First meaningful line, capped at 120 bytes on a UTF-8 boundary so we
+        // never cut a multi-byte codepoint (which would make the JSON index
+        // invalid and poison the whole knowledge base on the next parse).
+        return utf8TruncateBytes(trimmed, 120);
     }
     return "";
+}
+
+/// Truncate `s` to at most `max` bytes without splitting a UTF-8 codepoint.
+fn utf8TruncateBytes(s: []const u8, max: usize) []const u8 {
+    if (s.len <= max) return s;
+    var end = max;
+    // Back up while `s[end]` is a UTF-8 continuation byte (0b10xxxxxx), so the
+    // cut lands before the start of the codepoint it would have split.
+    while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
+    return s[0..end];
 }
 
 fn getDefaultTags(path: []const u8, allocator: std.mem.Allocator) []const []const u8 {
@@ -494,7 +518,17 @@ fn appendJsonEscaped(buf: *std.ArrayList(u8), str: []const u8, allocator: std.me
             '\n' => buf.appendSlice(allocator, "\\n") catch {},
             '\r' => buf.appendSlice(allocator, "\\r") catch {},
             '\t' => buf.appendSlice(allocator, "\\t") catch {},
-            else => buf.append(allocator, ch) catch {},
+            else => {
+                // Any other control byte (< 0x20) must be \u-escaped or std.json
+                // rejects the whole index. Everything else passes through.
+                if (ch < 0x20) {
+                    var esc: [6]u8 = undefined;
+                    const s = std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{ch}) catch return;
+                    buf.appendSlice(allocator, s) catch {};
+                } else {
+                    buf.append(allocator, ch) catch {};
+                }
+            },
         }
     }
 }
@@ -664,3 +698,58 @@ pub const schema_document =
     \\- **Redundant pages** that should be merged
     \\
 ;
+
+fn freeUpdatesForTest(allocator: std.mem.Allocator, updates: []const Update) void {
+    for (updates) |u| {
+        allocator.free(u.path);
+        allocator.free(u.tags);
+        allocator.free(u.content);
+    }
+    allocator.free(updates);
+}
+
+test "extractUpdates: directive on final line without trailing newline does not panic" {
+    // Regression: a session cut off mid-directive (budget/max_tokens) ends the
+    // output exactly at a directive line, so line_end == section.len and the
+    // old `line_end + 1` overran the slice → daemon abort. Must be safe now.
+    const out = "## Knowledge Updates\n\n### CREATE decisions/foo.md";
+    const updates = extractUpdates(out, std.testing.allocator);
+    defer freeUpdatesForTest(std.testing.allocator, updates);
+    // No content follows the directive, so nothing is emitted — but crucially,
+    // the call returns instead of panicking.
+    try std.testing.expectEqual(@as(usize, 0), updates.len);
+}
+
+test "extractUpdates: well-formed CREATE directive still parses" {
+    const out = "## Knowledge Updates\n\n### CREATE decisions/foo.md\n---\nThe body text.\n";
+    const updates = extractUpdates(out, std.testing.allocator);
+    defer freeUpdatesForTest(std.testing.allocator, updates);
+    try std.testing.expectEqual(@as(usize, 1), updates.len);
+    try std.testing.expectEqual(UpdateOp.create, updates[0].op);
+    try std.testing.expectEqualStrings("decisions/foo.md", updates[0].path);
+    try std.testing.expectEqualStrings("The body text.", updates[0].content);
+}
+
+test "utf8TruncateBytes never splits a codepoint" {
+    // "aé" where é is 2 bytes (0xC3 0xA9). Truncating to 2 bytes must drop the
+    // whole é rather than leave a lone lead byte.
+    try std.testing.expectEqualStrings("a", utf8TruncateBytes("a\xC3\xA9", 2));
+    // Truncating to 3 keeps both.
+    try std.testing.expectEqualStrings("a\xC3\xA9", utf8TruncateBytes("a\xC3\xA9", 3));
+    // ASCII within budget is unchanged.
+    try std.testing.expectEqualStrings("hello", utf8TruncateBytes("hello", 120));
+}
+
+test "appendJsonEscaped output parses as JSON" {
+    // A summary with a control byte and a multibyte char must yield valid JSON so
+    // the whole index does not get rejected and wiped.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    buf.appendSlice(std.testing.allocator, "\"") catch unreachable;
+    appendJsonEscaped(&buf, "line\x01two\tend\xC3\xA9", std.testing.allocator);
+    buf.appendSlice(std.testing.allocator, "\"") catch unreachable;
+
+    const parsed = try std.json.parseFromSlice([]const u8, std.testing.allocator, buf.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("line\x01two\tend\xC3\xA9", parsed.value);
+}

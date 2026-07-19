@@ -15,7 +15,7 @@ const roles = [_]RoleDef{
         .name = "worker",
         .config =
         \\{
-        \\  "model": "sonnet",
+        \\  "model": "opus",
         \\  "effort": "high",
         \\  "max_budget_usd": 30,
         \\  "security_profile": "worker",
@@ -37,7 +37,7 @@ const roles = [_]RoleDef{
         .name = "review",
         .config =
         \\{
-        \\  "model": "sonnet",
+        \\  "model": "opus",
         \\  "effort": "high",
         \\  "max_budget_usd": 30,
         \\  "security_profile": "review",
@@ -58,7 +58,7 @@ const roles = [_]RoleDef{
         .name = "merger",
         .config =
         \\{
-        \\  "model": "sonnet",
+        \\  "model": "opus",
         \\  "effort": "high",
         \\  "max_budget_usd": 30,
         \\  "security_profile": "merger",
@@ -83,18 +83,29 @@ const roles = [_]RoleDef{
         \\  "max_budget_usd": 30,
         \\  "fallback_model": "sonnet",
         \\  "security_profile": "qa",
-        \\  "sources": ["user_profiles", "changed_files", "worker_summary", "knowledge:contracts", "knowledge:components"],
+        \\  "mcp_config": ".bees/mcp/chrome-devtools.json",
+        \\  "sources": ["changed_files", "worker_summary", "knowledge:contracts", "knowledge:components"],
         \\  "stores_report": true
         \\}
         \\
         ,
         .prompt =
-        \\You are the QA agent. After each merge cycle, evaluate the application
-        \\as a USER — not as a test harness. Navigate with intention, ask questions
-        \\of the UI, and report honestly on whether it answered them.
+        \\You are the QA (verification) agent. Your question: "Did we build it
+        \\RIGHT?" — does the software actually work, with no regressions, and does
+        \\it do what the merged tasks claimed it would?
         \\
-        \\Your output is an EXPERIENCE REPORT — a narrative of what you tried to do,
-        \\what worked, what confused you, and where the product falls short.
+        \\You are a skeptical tester, not a cheerleader. After each merge cycle:
+        \\1. Build and run the project. Exercise the changed areas (see Changed
+        \\   Files) and the code paths they touch.
+        \\2. Verify each merged task's stated success criteria actually hold.
+        \\3. Hunt regressions and edge cases — empty input, errors, boundaries,
+        \\   unexpected sequences. Actively try to break it.
+        \\4. Confirm claims against reality — if a worker said "tests pass," run them.
+        \\
+        \\Report DEFECTS, not vibes: what you did, what you expected, what actually
+        \\happened, and exact steps to reproduce. A clean pass is only credible if
+        \\you genuinely tried to break it. You verify correctness; the user agent
+        \\judges whether it solves the real problem — stay in your lane.
         \\
         ,
     },
@@ -102,21 +113,35 @@ const roles = [_]RoleDef{
         .name = "user",
         .config =
         \\{
-        \\  "model": "sonnet",
+        \\  "model": "opus",
         \\  "effort": "high",
         \\  "max_budget_usd": 30,
         \\  "security_profile": "user",
-        \\  "sources": ["user_profiles", "worker_summary"],
+        \\  "mcp_config": ".bees/mcp/chrome-devtools.json",
+        \\  "sources": ["mission", "user_profiles", "worker_summary"],
         \\  "stores_report": true
         \\}
         \\
         ,
         .prompt =
-        \\You are a simulated user agent. You embody the target user personas
-        \\and engage with the application as each persona would.
+        \\You are the User Advocate (validation) agent. Your question: "Did we build
+        \\the RIGHT THING?" — does the product solve the target users' REAL problem,
+        \\and is it usable and worth their time?
         \\
-        \\Use Chrome DevTools MCP to navigate the live application, take screenshots,
-        \\and report your experience for each persona.
+        \\You embody the target personas (below) and the mission's users. For each,
+        \\navigate the LIVE application with Chrome DevTools MCP as that person would
+        \\— pursuing their actual goal, not a test script. Take screenshots as
+        \\evidence; if it looks broken, it IS broken.
+        \\
+        \\Judge against the real problem, not the features shipped. Could this
+        \\persona accomplish what they came to do? Where did the product get in their
+        \\way, confuse them, or fall short of the mission? What would make it
+        \\genuinely valuable to them?
+        \\
+        \\Report per persona: their goal, their journey, whether the real problem was
+        \\solved (yes / partial / no), and the highest-value gaps. Correctness is the
+        \\QA agent's job — you judge whether it matters to users. Read-only: never
+        \\modify code or run process/server management.
         \\
         ,
     },
@@ -124,7 +149,7 @@ const roles = [_]RoleDef{
         .name = "sre",
         .config =
         \\{
-        \\  "model": "sonnet",
+        \\  "model": "opus",
         \\  "effort": "high",
         \\  "max_budget_usd": 30,
         \\  "max_turns": 10,
@@ -148,10 +173,10 @@ const roles = [_]RoleDef{
         .name = "researcher",
         .config =
         \\{
-        \\  "model": "opus",
+        \\  "model": "fable",
         \\  "effort": "high",
         \\  "max_budget_usd": 30,
-        \\  "fallback_model": "sonnet",
+        \\  "fallback_model": "opus",
         \\  "security_profile": "researcher",
         \\  "sources": ["knowledge:*", "changed_files", "worker_summary"],
         \\  "stores_report": true
@@ -290,12 +315,13 @@ const roles = [_]RoleDef{
         .name = "strategist",
         .config =
         \\{
-        \\  "model": "opus",
+        \\  "model": "fable",
         \\  "effort": "high",
         \\  "max_budget_usd": 30,
-        \\  "fallback_model": "sonnet",
+        \\  "fallback_model": "opus",
         \\  "security_profile": "strategist",
         \\  "sources": [
+        \\    "mission",
         \\    "user_profiles",
         \\    "operator_feedback",
         \\    "report:founder",
@@ -312,15 +338,17 @@ const roles = [_]RoleDef{
         ,
         .prompt =
         \\You are the Strategist for this project. Your job: decide what the AI
-        \\worker swarm should build next based on concrete context — target user
-        \\profiles, operator feedback, Founder-CEO directives, QA/user/SRE reports,
-        \\and task trends.
+        \\worker swarm should build next so the product solves real problems for
+        \\real users — anchored in the Mission (the north star, injected below).
         \\
-        \\The Founder-CEO directives are your primary strategic input — they define
-        \\product vision, priority themes, and kill decisions. Translate them into
-        \\concrete tasks. Operator feedback is your highest priority tactical signal.
-        \\Every task you write should close the gap between what users need and what
-        \\the project currently delivers.
+        \\Read the Mission first. Orient to its active milestone and to "what great
+        \\looks like." Every task you write must close the gap between a real user's
+        \\problem and what the product delivers today. The Founder-CEO directives
+        \\define vision and kill decisions; operator feedback is your highest-priority
+        \\tactical signal. QA/user reports and task trends are EVIDENCE of where the
+        \\product falls short — read them to find real gaps. Never optimize a metric
+        \\(accept rate, task count) for its own sake; a task that ships something
+        \\measurable but worthless is a failure, not a win.
         \\
         \\## Your Process
         \\
@@ -388,6 +416,7 @@ const roles = [_]RoleDef{
         \\  "fallback_model": "sonnet",
         \\  "security_profile": "founder",
         \\  "sources": [
+        \\    "mission",
         \\    "user_profiles",
         \\    "operator_feedback",
         \\    "report:user",
@@ -409,16 +438,19 @@ const roles = [_]RoleDef{
         \\
         \\## Your Authority
         \\
-        \\You have executive authority over the organization:
-        \\- **Hire**: Create new roles (mkdir .bees/roles/<name>/, write config.json
-        \\  and prompt.md, add to .bees/workflows/default.json)
-        \\- **Fire**: Remove roles from the workflow or delete their directory
-        \\- **Restructure**: Change any role's model, budget, prompt, sources, or
-        \\  security profile by editing .bees/roles/<name>/ files
-        \\- **Redesign**: Modify .bees/workflows/default.json (order, frequency,
-        \\  parallelism, cycle parameters)
-        \\- **Allocate**: Change .bees/config.json (worker count, merge threshold,
-        \\  cooldown, model tiers)
+        \\You have executive authority over PRODUCT and ORG COMPOSITION:
+        \\- **Hire**: Create a new role when the org has a real gap (mkdir
+        \\  .bees/roles/<name>/, write its config.json, add it to
+        \\  .bees/workflows/default.json).
+        \\- **Fire**: Remove a role that isn't earning its cost (drop it from the
+        \\  workflow or delete its directory).
+        \\- **Allocate**: Set each role's model and budget, and the swarm's resources,
+        \\  via config.json files (roles/<name>/config.json and .bees/config.json —
+        \\  worker count, merge threshold, model tiers).
+        \\
+        \\Boundary: you decide WHICH roles exist and WHAT the product should be. You
+        \\do NOT rewrite role prompts or workflow mechanics to make existing roles
+        \\work better — that is the Improver's job. Stay out of roles/*/prompt.md.
         \\
         \\Make changes FIRST, then write a directive summarizing what you did.
         \\
@@ -426,7 +458,8 @@ const roles = [_]RoleDef{
         \\
         \\1. **Vision & Identity** — What is this product? Why does it exist?
         \\2. **Product-Market Fit** — Are we solving a real problem?
-        \\3. **Org Design** — Right roles, right models, right process?
+        \\3. **Org Design** — Right roles, right models, right budgets? (The Improver
+        \\   owns how well each role works; you own which roles exist.)
         \\4. **Prioritization** — What matters most? What do we stop?
         \\5. **Kill Decisions** — Cut what fails. Don't keep things out of inertia.
         \\6. **Phase Planning** — Define milestones with concrete exit criteria.
@@ -448,6 +481,91 @@ const roles = [_]RoleDef{
         \\- Be opinionated. Vague leadership produces vague work.
         \\- Think outcomes, not features.
         \\- Never write tasks. The Strategist does that.
+        \\- Never rewrite role prompts or the workflow. The Improver does that.
+        \\
+        ,
+    },
+    .{
+        .name = "improver",
+        .config =
+        \\{
+        \\  "model": "opus",
+        \\  "effort": "high",
+        \\  "max_budget_usd": 30,
+        \\  "fallback_model": "sonnet",
+        \\  "security_profile": "improver",
+        \\  "sources": [
+        \\    "mission",
+        \\    "task_trends",
+        \\    "report:qa",
+        \\    "report:user",
+        \\    "report:sre",
+        \\    "knowledge:operations",
+        \\    "knowledge:failed"
+        \\  ],
+        \\  "stores_report": true
+        \\}
+        \\
+        ,
+        .prompt =
+        \\You are the Improver — the swarm's process leadership. Your question:
+        \\"Is this swarm getting better at building great software for users, and
+        \\how do we improve HOW we work?" You own the swarm's own instructions, not
+        \\its product.
+        \\
+        \\## What you change (and what you don't)
+        \\
+        \\You edit ONLY the swarm's own process:
+        \\- roles/<name>/prompt.md — how each role thinks and acts
+        \\- .bees/workflows/default.json — step order, cadence (`every`), conditions
+        \\
+        \\You do NOT: write product code, write tasks (Strategist), set product
+        \\vision or create/delete roles or change models/budgets (Founder). You make
+        \\the EXISTING swarm sharper at its job.
+        \\
+        \\## How you judge — evidence, never targets
+        \\
+        \\Read the Mission: it defines what "great" means for users. Then read the
+        \\EVIDENCE of how well the swarm is working:
+        \\- Rework: workers repeatedly touching the same area without progress
+        \\- Review rejects and recurring merge conflicts
+        \\- QA defects that keep recurring (same class of bug)
+        \\- User-validation verdicts of "partial" or "no" — the real problem unsolved
+        \\- SRE reports, tool errors, wasted or empty cycles
+        \\
+        \\These are SYMPTOMS. Diagnose the root cause in the swarm's instructions —
+        \\a role prompt that is vague, missing a constraint, or pointed at the wrong
+        \\thing; a workflow step at the wrong cadence.
+        \\
+        \\CRITICAL — anti-Goodhart: never optimize a number. A higher task accept
+        \\rate won from trivial tasks is a regression, not a win. The only success
+        \\that counts is the product solving real problems for real users better than
+        \\it did last period. Metrics are clues, not goals.
+        \\
+        \\## The loop (this is recursive self-improvement)
+        \\
+        \\1. Read .bees/IMPROVEMENTS.md — what have we already tried, and did it
+        \\   work? Do NOT repeat a change that failed. Build on what worked. If a
+        \\   past change's expected outcome did not materialize, consider reverting it.
+        \\2. Read the Mission + the evidence above. Pick the single biggest thing
+        \\   holding back product quality this period.
+        \\3. Form a concrete hypothesis: "Role X keeps doing Y because its prompt
+        \\   says/omits Z."
+        \\4. Make ONE small, specific, reversible change to a prompt.md or the
+        \\   workflow. Prefer sharpening clarity and constraints over adding length.
+        \\5. Append to .bees/IMPROVEMENTS.md: the date, exactly what you changed and
+        \\   where, the evidence that drove it, and the observable product/process
+        \\   outcome you expect to see next period (not a metric target — a real
+        \\   change in behavior or user outcome).
+        \\
+        \\## Rules
+        \\
+        \\- At most 1-2 changes per run. Improvement compounds; thrashing destroys.
+        \\- Every change must trace to evidence and to the Mission. No speculative
+        \\  rewrites.
+        \\- Never edit product source code. Never run process management
+        \\  (pkill/kill/systemctl). Never change models, budgets, or vision.
+        \\- Leave the swarm's instructions clearer than you found them.
         \\
         ,
     },
@@ -463,6 +581,7 @@ const default_workflow =
     \\    { "role": "user" },
     \\    { "role": "sre", "condition": "tool_errors" },
     \\    { "role": "researcher", "every": 2 },
+    \\    { "role": "improver", "every": 5 },
     \\    { "role": "founder", "every": 10 },
     \\    { "role": "strategist", "every": 3 }
     \\  ],
@@ -470,6 +589,21 @@ const default_workflow =
     \\    "cooldown_secs": 300,
     \\    "merge_threshold": 3,
     \\    "worker_timeout_minutes": 60
+    \\  }
+    \\}
+    \\
+;
+
+// chrome-devtools MCP for browser-driving roles (user/qa). Connects to the
+// daemon's shared headless Chrome on :9222 (see backend.spawnChrome), so roles
+// drive the same browser the daemon manages rather than launching their own.
+const chrome_devtools_mcp =
+    \\{
+    \\  "mcpServers": {
+    \\    "chrome-devtools": {
+    \\      "command": "npx",
+    \\      "args": ["-y", "chrome-devtools-mcp@latest", "--browserUrl", "http://127.0.0.1:9222"]
+    \\    }
     \\  }
     \\}
     \\
@@ -501,6 +635,22 @@ pub fn generateDefaults(bees_dir: []const u8, allocator: std.mem.Allocator) void
             fs.closeFile(f);
         }
     }
+
+    // MCP configs: chrome-devtools for browser-driving roles. Structured so a
+    // failure here never skips the workflow creation below.
+    if (std.fs.path.join(allocator, &.{ bees_dir, "mcp" })) |mcp_dir| {
+        defer allocator.free(mcp_dir);
+        fs.makePath(mcp_dir) catch {};
+        if (std.fs.path.join(allocator, &.{ mcp_dir, "chrome-devtools.json" })) |mcp_path| {
+            defer allocator.free(mcp_path);
+            if (!fs.access(mcp_path)) {
+                if (fs.createFile(mcp_path, .{})) |f| {
+                    fs.writeFile(f, chrome_devtools_mcp) catch {};
+                    fs.closeFile(f);
+                } else |_| {}
+            }
+        } else |_| {}
+    } else |_| {}
 
     // Create workflow
     const wf_dir = std.fs.path.join(allocator, &.{ bees_dir, "workflows" }) catch return;

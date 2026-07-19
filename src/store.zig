@@ -51,7 +51,7 @@ pub const Store = struct {
         const tasks_dbi = try openDbi(txn, types.DbNames.tasks);
         const meta_dbi = try openDbi(txn, types.DbNames.meta);
 
-        try check(c.mdb_txn_commit(txn));
+        try commitTxnConsume(&txn);
 
         return .{
             .env = env,
@@ -163,7 +163,7 @@ pub const Store = struct {
         var time_key_val = mkValSlice(time_key.toBytes());
         try check(c.mdb_put(txn, self.sessions_by_time, &time_key_val, &empty_val, 0));
 
-        try check(c.mdb_txn_commit(txn));
+        try commitTxnConsume(&txn);
         return id;
     }
 
@@ -233,7 +233,7 @@ pub const Store = struct {
         var empty_val = mkValEmpty();
         try check(c.mdb_put(txn, self.sessions_by_status, &new_status_val, &empty_val, 0));
 
-        try check(c.mdb_txn_commit(txn));
+        try commitTxnConsume(&txn);
     }
 
     /// Write a JSON representation of a session to the meta sub-database.
@@ -667,6 +667,16 @@ pub const Store = struct {
         try check(c.mdb_txn_commit(txn));
     }
 
+    /// Commit and consume the handle: nulls the caller's pointer so a paired
+    /// `errdefer`/`defer abortTxn` is a no-op. LMDB frees the txn on BOTH
+    /// commit success and failure (see mdb.c `_mdb_txn_commit` `fail:` →
+    /// `_mdb_txn_abort` → free), so aborting afterwards double-frees.
+    pub fn commitTxnConsume(txn_ptr: *?*c.MDB_txn) !void {
+        const txn = txn_ptr.*;
+        txn_ptr.* = null;
+        try check(c.mdb_txn_commit(txn));
+    }
+
     pub fn abortTxn(txn: ?*c.MDB_txn) void {
         c.mdb_txn_abort(txn);
     }
@@ -891,7 +901,7 @@ test "store insert and iterate events" {
     const json2 = "{\"type\":\"message\"}";
 
     {
-        const txn = try store.beginWriteTxn();
+        var txn = try store.beginWriteTxn();
         errdefer Store.abortTxn(txn);
 
         const h1 = types.EventHeader{
@@ -909,7 +919,7 @@ test "store insert and iterate events" {
             .timestamp_offset_ms = 100,
         };
         try store.insertEvent(txn, session_id, 1, h2, json2);
-        try Store.commitTxn(txn);
+        try Store.commitTxnConsume(&txn);
     }
 
     {

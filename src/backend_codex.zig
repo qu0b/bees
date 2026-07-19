@@ -9,13 +9,26 @@ pub fn spawnCodex(allocator: std.mem.Allocator, io: Io, options: backend.Backend
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(allocator);
 
+    var timeout_secs_buf: [16]u8 = undefined;
+    try backend.appendTimeoutPrefix(&args, allocator, options.timeout_secs, &timeout_secs_buf);
+
     try args.append(allocator, "codex");
     try args.append(allocator, "exec");
     try args.append(allocator, "--json");
     try args.append(allocator, "--cd");
     try args.append(allocator, options.cwd);
-    try args.append(allocator, "-m");
-    try args.append(allocator, options.model);
+    // Only pass -m for a real (non-Claude) model; otherwise let Codex use its
+    // configured default rather than choking on a Claude model name.
+    if (options.model.len > 0 and !backend.isClaudeModelName(options.model)) {
+        try args.append(allocator, "-m");
+        try args.append(allocator, options.model);
+    }
+    // Reasoning effort — Codex reads this from config, so set it via -c. The
+    // string (e.g. "high", "xhigh") comes straight from the role/codex config.
+    if (options.effort.len > 0) {
+        try args.append(allocator, "-c");
+        try args.append(allocator, try std.fmt.allocPrint(allocator, "model_reasoning_effort={s}", .{options.effort}));
+    }
     try args.append(allocator, "--dangerously-bypass-approvals-and-sandbox");
 
     // Codex has no system prompt file flag — prepend/append to prompt text
@@ -30,7 +43,7 @@ pub fn spawnCodex(allocator: std.mem.Allocator, io: Io, options: backend.Backend
         .cwd = .{ .path = options.cwd },
         .environ_map = &env_map,
         .stdout = .pipe,
-        .stderr = .inherit,
+        .stderr = if (options.silence_stderr) .ignore else .inherit,
         .stdin = if (options.stdin_data != null) .pipe else .ignore,
     });
 

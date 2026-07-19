@@ -130,10 +130,12 @@ pub const Stmt = struct {
     }
 
     /// Execute (step until done), then reset. For INSERT/UPDATE/DELETE.
+    /// Reset runs even if step() errors — otherwise a single failed row would
+    /// leave this cached statement in a halted state, so every later bind returns
+    /// SQLITE_MISUSE and reuses stale bindings.
     pub fn exec(self: *Stmt) SqliteError!void {
-        const has_row = try self.step();
-        _ = has_row;
-        self.reset();
+        defer self.reset();
+        _ = try self.step();
     }
 
     pub fn finalize(self: *Stmt) void {

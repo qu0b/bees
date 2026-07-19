@@ -27,6 +27,11 @@ pub fn openFile(path: []const u8) !File {
     return cwd().openFile(io, path, .{});
 }
 
+/// Open an existing file for read+write (needed for positional append writes).
+pub fn openFileWrite(path: []const u8) !File {
+    return cwd().openFile(io, path, .{ .mode = .read_write });
+}
+
 pub fn closeFile(file: File) void {
     file.close(io);
 }

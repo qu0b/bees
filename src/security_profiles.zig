@@ -33,23 +33,28 @@ pub fn getProfile(name: []const u8) ?ToolPermissions {
     if (std.mem.eql(u8, name, "researcher")) return researcher;
     if (std.mem.eql(u8, name, "review")) return readonly;
     if (std.mem.eql(u8, name, "founder")) return founder_profile;
+    if (std.mem.eql(u8, name, "improver")) return improver_profile;
     if (std.mem.eql(u8, name, "readonly")) return readonly;
     return null;
 }
 
-/// Map session type to its default profile.
+/// Map session type to its default profile. Exhaustive on purpose: adding a
+/// SessionType variant is a compile error here rather than a silent fall-through
+/// to `--dangerously-skip-permissions`. conflict/fix operate on merges, so they
+/// inherit the merger sandbox.
 pub fn getDefaultForSessionType(session_type: types.SessionType) ?ToolPermissions {
     return switch (session_type) {
         .worker => worker,
         .merger => merger,
+        .conflict, .fix => merger,
         .qa => qa,
         .sre => sre,
         .strategist => strategist,
         .user => user_agent,
         .researcher => researcher,
         .founder => founder_profile,
+        .improver => improver_profile,
         .review => readonly,
-        else => null,
     };
 }
 
@@ -85,7 +90,9 @@ const worker = ToolPermissions{
         "Bash(test *)",
         "Bash(echo *)",
         "Bash(cd *)",
-        "Bash(sh *)",
+        // NOTE: `Bash(sh *)` deliberately omitted — it would let a worker run
+        // `sh -c "curl … | sh"`, bypassing every disallow rule below. Project
+        // build/setup commands are executed by the daemon itself, not the agent.
     },
     .disallowed_tools = &.{
         "WebSearch",
@@ -122,7 +129,7 @@ const merger = ToolPermissions{
         "Bash(cat *)",
         "Bash(ls *)",
         "Bash(mkdir *)",
-        "Bash(sh *)",
+        // `Bash(sh *)` omitted — interpreter escape bypasses the disallow list.
         "Bash(diff *)",
     },
     .disallowed_tools = &.{
@@ -341,6 +348,42 @@ const founder_profile = ToolPermissions{
     },
 };
 
+// ── Improver ────────────────────────────────────────────────────────────
+// Process leadership / recursive self-improvement. Reads the swarm's own
+// output quality (git history, sessions via `bees`, reports) and refines the
+// swarm's own instructions: roles/*/prompt.md and workflows/default.json.
+// Can edit .bees/ files, but never commits/merges product code or manages
+// processes — it improves how the swarm works, not the product directly.
+const improver_profile = ToolPermissions{
+    .permission_mode = "dontAsk",
+    .allowed_tools = &.{
+        "Read",
+        "Glob",
+        "Grep",
+        "Edit",
+        "Write",
+        "Bash(git log *)",
+        "Bash(git diff *)",
+        "Bash(git show *)",
+        "Bash(git status *)",
+        "Bash(git blame *)",
+        "Bash(cat *)",
+        "Bash(ls *)",
+        "Bash(bees *)",
+        "Bash(wc *)",
+    },
+    .disallowed_tools = &.{
+        "Bash(git commit *)",
+        "Bash(git push *)",
+        "Bash(git merge *)",
+        "Bash(sudo *)",
+        "Bash(kill *)",
+        "Bash(pkill *)",
+        "Bash(systemctl *)",
+        "Bash(rm -rf *)",
+    },
+};
+
 // ── Readonly ────────────────────────────────────────────────────────────
 // Strictest profile: read-only analysis, no execution.
 const readonly = ToolPermissions{
@@ -378,6 +421,8 @@ test "getDefaultForSessionType maps all agent types" {
     try std.testing.expect(getDefaultForSessionType(.strategist) != null);
     try std.testing.expect(getDefaultForSessionType(.user) != null);
     try std.testing.expect(getDefaultForSessionType(.review) != null);
+    try std.testing.expect(getDefaultForSessionType(.improver) != null);
+    try std.testing.expect(getDefaultForSessionType(.founder) != null);
 }
 
 test "worker profile has no web access" {
@@ -394,4 +439,19 @@ test "qa profile denies Edit" {
         if (std.mem.eql(u8, t, "Edit")) return; // found
     }
     return error.TestUnexpectedResult;
+}
+
+test "no profile allows the sh interpreter escape" {
+    // `Bash(sh *)` (or bash/zsh) in an allow list makes every disallow rule
+    // advisory (`sh -c "curl … | sh"`), so no profile may grant it.
+    const names = [_][]const u8{ "worker", "merger", "qa", "sre", "strategist", "user", "researcher", "founder", "improver", "review", "readonly" };
+    const escapes = [_][]const u8{ "Bash(sh *)", "Bash(bash *)", "Bash(zsh *)" };
+    for (names) |name| {
+        const p = getProfile(name) orelse continue;
+        for (p.allowed_tools) |t| {
+            for (escapes) |e| {
+                if (std.mem.eql(u8, t, e)) return error.TestUnexpectedResult;
+            }
+        }
+    }
 }

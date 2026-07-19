@@ -292,10 +292,104 @@ pub fn transfer(
     to: []const u8,
     private_key: ?[]const u8,
 ) !?[]const u8 {
+    // Validate every AI-supplied field before it reaches the CLI argv. Besides
+    // rejecting junk, this blocks CLI-option injection: a recipient/token/amount
+    // like "--rpc-url=…" or "--private-key" would be a positional argv element
+    // ahead of the real flags, which foundry/tempo would parse as an option.
+    if (!isValidAmount(amount)) return error.InvalidAmount;
+    if (!isValidAddress(to)) return error.InvalidRecipient;
+    if (!isValidAddress(token)) return error.InvalidToken;
+    if (private_key) |pk| {
+        if (pk.len == 0 or pk[0] == '-') return error.InvalidPrivateKey;
+    }
     return switch (chain) {
         .tempo => tempoTransfer(io, allocator, amount, token, to, private_key),
         .ethereum => ethereumTransfer(io, allocator, amount, token, to, private_key),
     };
+}
+
+/// A transfer recipient/token address: 0x + 40 hex chars. Also rejects any
+/// option-like string (a leading '-' is never valid hex), closing the CLI
+/// option-injection vector.
+pub fn isValidAddress(s: []const u8) bool {
+    if (s.len != 42) return false;
+    if (s[0] != '0' or (s[1] != 'x' and s[1] != 'X')) return false;
+    for (s[2..]) |ch| switch (ch) {
+        '0'...'9', 'a'...'f', 'A'...'F' => {},
+        else => return false,
+    };
+    return true;
+}
+
+/// A human-readable USDC amount: digits with an optional single '.' and at most
+/// 6 fractional digits, strictly positive. Rejects option-like and junk strings.
+pub fn isValidAmount(s: []const u8) bool {
+    if (s.len == 0 or s.len > 32) return false;
+    var seen_dot = false;
+    var seen_digit = false;
+    var nonzero = false;
+    var frac: usize = 0;
+    for (s) |ch| switch (ch) {
+        '0'...'9' => {
+            seen_digit = true;
+            if (ch != '0') nonzero = true;
+            if (seen_dot) frac += 1;
+        },
+        '.' => {
+            if (seen_dot) return false;
+            seen_dot = true;
+        },
+        else => return false,
+    };
+    return seen_digit and nonzero and frac <= 6;
+}
+
+/// Convert a validated human USDC amount to integer microdollars (USDC has 6
+/// decimals, so 1 USDC = 1_000_000 micros). Returns error on overflow/invalid.
+pub fn amountToMicros(amount: []const u8) !u64 {
+    if (!isValidAmount(amount)) return error.InvalidAmount;
+    const dot = std.mem.indexOfScalar(u8, amount, '.');
+    const int_part = if (dot) |d| amount[0..d] else amount;
+    const frac_part = if (dot) |d| amount[d + 1 ..] else "";
+
+    var micros: u64 = 0;
+    for (int_part) |ch| {
+        micros = try std.math.mul(u64, micros, 10);
+        micros = try std.math.add(u64, micros, ch - '0');
+    }
+    micros = try std.math.mul(u64, micros, 1_000_000);
+
+    var scale: u64 = 100_000; // first fractional digit = 0.1 USDC = 100_000 micros
+    for (frac_part) |ch| {
+        micros = try std.math.add(u64, micros, @as(u64, ch - '0') * scale);
+        scale /= 10;
+    }
+    return micros;
+}
+
+/// Cumulative-spend ledger: a single decimal integer (microdollars) in
+/// `<funding_dir>/_spent_micros.txt`. Survives restarts so the cumulative cap
+/// is enforced across the project lifetime.
+pub fn readSpentMicros(allocator: std.mem.Allocator, funding_dir: []const u8) u64 {
+    const path = std.fs.path.join(allocator, &.{ funding_dir, "_spent_micros.txt" }) catch return 0;
+    defer allocator.free(path);
+    const raw = fs.readFileAlloc(allocator, path, 64) catch return 0;
+    defer allocator.free(raw);
+    const trimmed = std.mem.trim(u8, raw, &std.ascii.whitespace);
+    return std.fmt.parseInt(u64, trimmed, 10) catch 0;
+}
+
+/// Persist a new cumulative total. Call only after a confirmed transfer.
+/// Returns error so the caller can decide how to handle a failed ledger write
+/// (a lost write would let the cumulative cap be under-counted).
+pub fn writeSpentMicros(allocator: std.mem.Allocator, funding_dir: []const u8, total_micros: u64) !void {
+    const path = try std.fs.path.join(allocator, &.{ funding_dir, "_spent_micros.txt" });
+    defer allocator.free(path);
+    var buf: [24]u8 = undefined;
+    const str = try std.fmt.bufPrint(&buf, "{d}", .{total_micros});
+    const f = try fs.createFile(path, .{});
+    defer fs.closeFile(f);
+    try fs.writeFile(f, str);
 }
 
 fn tempoTransfer(
@@ -693,6 +787,39 @@ test "ecdsaSign recovery ID matches public key" {
     const point = try Secp256k1.basePoint.mul(privkey, .big);
     const expected = point.toUncompressedSec1();
     try std.testing.expectEqualSlices(u8, &expected, &recovered.?);
+}
+
+test "isValidAddress accepts canonical and rejects option-injection" {
+    try std.testing.expect(isValidAddress("0x20c000000000000000000000b9537d11c60e8b50"));
+    try std.testing.expect(!isValidAddress("0x20c0")); // too short
+    try std.testing.expect(!isValidAddress("20c000000000000000000000b9537d11c60e8b50")); // no 0x
+    try std.testing.expect(!isValidAddress("--rpc-url=http://evil/rpc")); // option injection
+    try std.testing.expect(!isValidAddress("0xZZc000000000000000000000b9537d11c60e8b50")); // non-hex
+}
+
+test "isValidAmount enforces format and positivity" {
+    try std.testing.expect(isValidAmount("100"));
+    try std.testing.expect(isValidAmount("1.5"));
+    try std.testing.expect(isValidAmount("0.000001"));
+    try std.testing.expect(!isValidAmount("0")); // not positive
+    try std.testing.expect(!isValidAmount("0.0000001")); // 7 decimals
+    try std.testing.expect(!isValidAmount("1.2.3")); // two dots
+    try std.testing.expect(!isValidAmount("--private-key")); // option injection
+    try std.testing.expect(!isValidAmount("abc"));
+    try std.testing.expect(!isValidAmount(""));
+}
+
+test "amountToMicros converts USDC to microdollars" {
+    try std.testing.expectEqual(@as(u64, 100_000_000), try amountToMicros("100"));
+    try std.testing.expectEqual(@as(u64, 1_500_000), try amountToMicros("1.5"));
+    try std.testing.expectEqual(@as(u64, 1), try amountToMicros("0.000001"));
+    try std.testing.expectEqual(@as(u64, 250_000), try amountToMicros("0.25"));
+}
+
+test "transfer rejects invalid inputs before spawning" {
+    // Should fail validation, never reaching the CLI (no side effects in test).
+    const bad = transfer(undefined, std.testing.allocator, .tempo, "abc", DEFAULT_TOKEN_TEMPO, "0x20c000000000000000000000b9537d11c60e8b50", null);
+    try std.testing.expectError(error.InvalidAmount, bad);
 }
 
 test "parseHexKey without prefix" {

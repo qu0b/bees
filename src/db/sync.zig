@@ -17,11 +17,6 @@ const schema = @import("schema.zig");
 const c_sq = sqlite.c;
 
 /// Terminal session statuses — sessions at or above this value never change.
-/// running=0, done=1, merged=2, rejected=3, conflict=4, build_failed=5, err=6
-/// "done" (1) and above are terminal from the sync perspective — the orchestrator
-/// only transitions running→done, then merger transitions done→merged/rejected/etc.
-const terminal_status_threshold: i64 = 1; // done and above
-
 pub const SyncEngine = struct {
     sqlite_db: sqlite.Db,
     session_insert: sqlite.Stmt,
@@ -152,7 +147,13 @@ pub const SyncEngine = struct {
         const hwm = self.getHighWaterMark("events") catch 0;
 
         var count: u32 = 0;
-        var max_session: u64 = hwm;
+        // Highest terminal (finished) session id seen this pass, and the lowest
+        // still-running session id. The HWM must never advance up to or past a
+        // running session: that session can emit more events after this pass, and
+        // the `sess.id <= hwm` skip would then drop them forever (truncating the
+        // replica's event history at the first snapshot).
+        var max_terminal: u64 = hwm;
+        var min_running: u64 = std.math.maxInt(u64);
 
         // Iterate sessions from hwm onward and sync their events
         var sess_iter = try lmdb_store.iterSessions(lmdb_txn);
@@ -176,12 +177,21 @@ pub const SyncEngine = struct {
                 count += 1;
             }
 
-            if (sess.id > max_session) max_session = sess.id;
+            if (sess.view.header.status == .running) {
+                if (sess.id < min_running) min_running = sess.id;
+            } else {
+                if (sess.id > max_terminal) max_terminal = sess.id;
+            }
         }
 
-        // Only advance HWM for terminal sessions
-        if (max_session > hwm) {
-            self.setHighWaterMark("events", max_session) catch {};
+        // Advance only across the contiguous prefix of terminal sessions, stopping
+        // just below the lowest still-running session so its future events resync.
+        const new_hwm = if (min_running == std.math.maxInt(u64))
+            max_terminal
+        else
+            @min(max_terminal, min_running - 1);
+        if (new_hwm > hwm) {
+            self.setHighWaterMark("events", new_hwm) catch {};
         }
 
         return count;
@@ -309,7 +319,7 @@ test "LMDB to SQLite round-trip sync" {
 
     // Insert an event
     {
-        const txn = try lmdb_store.beginWriteTxn();
+        var txn = try lmdb_store.beginWriteTxn();
         errdefer Store.abortTxn(txn);
         const ev_header = types.EventHeader{
             .event_type = .tool_use,
@@ -318,7 +328,7 @@ test "LMDB to SQLite round-trip sync" {
             .timestamp_offset_ms = 1500,
         };
         try lmdb_store.insertEvent(txn, session_id, 0, ev_header, "{\"type\":\"tool_use\",\"tool\":\"Bash\"}");
-        try Store.commitTxn(txn);
+        try Store.commitTxnConsume(&txn);
     }
 
     // Set up sync engine with temporary SQLite

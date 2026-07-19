@@ -18,13 +18,14 @@ const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 const ctx_mod = @import("context.zig");
 const roles_default = @import("roles_default.zig");
+const workflow_mod = @import("workflow.zig");
 const knowledge = @import("knowledge.zig");
 const sqlite = @import("db/sqlite.zig");
 const db_query = @import("db/query.zig");
 const funding = @import("funding.zig");
 const sync_mod = @import("db/sync.zig");
 
-pub const version = "0.1.0";
+pub const version = "0.2.0";
 
 const default_strategist_prompt =
     \\You are the Strategist for this project. Your job: decide what the AI worker swarm
@@ -127,8 +128,9 @@ const strategy_setup_prompt =
     \\
     \\Read the project's key files (README, package.json, config files, .bees/config.json,
     \\source code structure) to understand the tech stack, then generate:
-    \\1. User profile files — who uses this project and what they need
-    \\2. A tailored strategist prompt
+    \\1. The Mission (.bees/MISSION.md) — the durable north star: the real user problem
+    \\2. User profile files — who uses this project and what they need
+    \\3. A tailored strategist prompt
     \\
     \\## Inferring Target Users
     \\
@@ -143,6 +145,25 @@ const strategy_setup_prompt =
     \\users from the codebase: API consumers, dashboard users, ops engineers, etc.
     \\
     \\## What to Generate
+    \\
+    \\### The Mission (.bees/MISSION.md) — do this first
+    \\The durable north star every strategic role reads for months. If an operator
+    \\intent is provided in the project context below, treat it as GROUND TRUTH —
+    \\build the mission around it, do not override it. Otherwise infer it from the
+    \\codebase, but be honest it's an inference the operator should confirm.
+    \\
+    \\Read the existing MISSION.md first (it has the section structure and guidance),
+    \\then fill in every section, replacing each _(placeholder)_ and removing the
+    \\guidance comments:
+    \\- The Real Problem — a specific problem real people have, and why it matters
+    \\- Who We Serve — the specific people with that problem (not "users")
+    \\- What Great Looks Like — observable PRODUCT outcomes (what users can do, and
+    \\  how well), NOT metrics or scores. We build a great product, not a benchmark.
+    \\- Milestones — the long-horizon path in phases, each with a real user-facing
+    \\  "done when"
+    \\- Non-Goals — what we deliberately will not build
+    \\
+    \\Keep it concrete. This file steers the whole swarm — make it real.
     \\
     \\### 1. User Profiles (one file per user type)
     \\Write to the users/ directory (path in project context below). Each file is a .txt
@@ -162,6 +183,8 @@ const strategy_setup_prompt =
     \\A system prompt for the strategist agent, tailored to THIS project. Must include:
     \\
     \\- Project identity, tech stack, key files
+    \\- Anchor to the Mission: read it first, target its active milestone; treat
+    \\  reports and trends as evidence of real gaps, never as targets to optimize
     \\- Process: read user profiles (injected at end of prompt), read QA report,
     \\  check task trends, orient via git log + bees status, sample codebase, write tasks
     \\- Task writing guidelines with this project's build/test commands
@@ -253,6 +276,50 @@ const default_user_profile =
     \\
 ;
 
+// The durable north star. The body (below the title) is used both as the init
+// stub and as the frame the strategy session refines. Product-centric on
+// purpose — success is real outcomes for users, never a metric to maximize.
+const mission_guidance =
+    \\<!-- The durable north star for this project. Everything the swarm builds is
+    \\     judged against this: does it solve a real problem for a real user? Edit
+    \\     anytime — the strategist, founder, user-advocate and improver all read it. -->
+    \\
+    \\## The Real Problem
+    \\<!-- What real problem do real people have today? Who has it, and why does it
+    \\     matter to them? Be concrete — a specific problem for specific people. -->
+    \\_(describe the real user problem this product exists to solve)_
+    \\
+    \\## Who We Serve
+    \\<!-- The specific people with this problem. Not "users" — name them. -->
+    \\_(target users)_
+    \\
+    \\## What Great Looks Like
+    \\<!-- Observable product outcomes: what a user can do, and how well, when this
+    \\     is succeeding. Real capabilities and quality — NOT metrics to maximize. -->
+    \\_(concrete outcomes for the people we serve)_
+    \\
+    \\## Milestones
+    \\<!-- The long-horizon path in phases. Each is a product capability with a
+    \\     "done when" that is a real user-facing outcome, not a number. -->
+    \\- [ ] _(phase 1 — done when: a user can ...)_
+    \\- [ ] _(phase 2 — done when: ...)_
+    \\
+    \\## Non-Goals
+    \\<!-- What we deliberately will NOT build. Guardrails against scope creep. -->
+    \\_(out of scope)_
+    \\
+;
+
+const default_improvements_log =
+    \\# Improvements Log
+    \\
+    \\<!-- The Improver appends here each run: one entry per change to the swarm's
+    \\     own process (a role prompt or the workflow), with the evidence that drove
+    \\     it and the real product/process outcome expected next period. This is how
+    \\     self-improvement compounds instead of thrashing. Newest first. -->
+    \\
+;
+
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
@@ -265,13 +332,16 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 
     const cmd = cli.parse(args) catch |e| {
-        try printError(stdout, e);
-        try stdout.flush();
-        return;
+        printError(stdout, e) catch {};
+        stdout.flush() catch {};
+        // Exit nonzero so scripts, CI, and systemd can detect the failure.
+        std.process.exit(1);
     };
 
     runCommand(cmd, arena, io, stdout) catch |e| {
-        try printError(stdout, e);
+        printError(stdout, e) catch {};
+        stdout.flush() catch {};
+        std.process.exit(1);
     };
 
     try stdout.flush();
@@ -293,6 +363,7 @@ fn runCommand(cmd: cli.Command, arena: std.mem.Allocator, io: Io, stdout: *Io.Wr
         .run_qa => try cmdRunQa(arena, io, stdout),
         .run_user => try cmdRunUser(arena, io, stdout),
         .run_researcher => try cmdRunResearcher(arena, io, stdout),
+        .doctor => |opts| try cmdDoctor(arena, io, stdout, opts.role, opts.probe),
         .log => try cmdLog(arena, stdout),
         .config => |opts| try cmdConfig(arena, stdout, opts.json),
         .tasks => |opts| try cmdTasks(arena, stdout, opts.json),
@@ -330,11 +401,39 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: 
     const config_path = try std.fs.path.join(arena, &.{ bees_dir, "config.json" });
 
     if (fs.access(config_path)) {
+        // Not a dead-end: show the current config + next steps so a user who
+        // re-runs init (or forgot where they were) gets oriented.
         try stdout.print("Project already initialized at {s}\n", .{bees_dir});
+        try printInitSummary(arena, stdout, config_path, &.{});
         return;
     }
 
-    // Create directory structure
+    const project_name = std.fs.path.basename(cwd);
+    const base_branch = git.getDefaultBranch(arena, io, cwd) orelse "main";
+
+    // ---- Phase 0: preflight — surface the runtime prerequisites that decide
+    // whether the swarm can build, commit, and run agents, before we create
+    // anything. Fail-fast and visible, but never fatal: init still produces a
+    // working default config so the user can fix issues and start.
+    const pre = try runPreflight(arena, io, cwd, base_branch);
+    if (pre.warnings.len > 0) {
+        try stdout.print("Prerequisite warnings:\n", .{});
+        for (pre.warnings) |w| try stdout.print("  ⚠ {s}\n", .{w});
+        try stdout.print("\n", .{});
+        try stdout.flush();
+    }
+    // The AI phases are pointless without Claude — skip them cleanly rather
+    // than spawning a session that's doomed to fail after scaffolding.
+    const run_ai = !skip_analysis and pre.claude_ok;
+
+    // ---- Phase 1: scaffold the full .bees/ skeleton ------------------------
+    // Everything the agents enrich must exist BEFORE they run, so both Claude
+    // sessions read-and-improve real files (rich default prompts, role configs)
+    // instead of writing them blind. This mirrors how the strategy session
+    // already worked, and applies it to every role.
+    try stdout.print("Scaffolding .bees/ ...\n", .{});
+    try stdout.flush();
+
     for ([_][]const u8{
         "db",
         "logs",
@@ -353,19 +452,71 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: 
         try fs.makePath(path);
     }
 
-    const project_name = std.fs.path.basename(cwd);
-    const base_branch = git.getDefaultBranch(arena, io, cwd) orelse "main";
+    // Roles (config.json + rich default prompt.md) and the default workflow.
+    roles_default.generateDefaults(bees_dir, arena);
 
-    if (!skip_analysis) {
+    // Empty task pool — the strategist populates this on its first run.
+    const tasks_path = try std.fs.path.join(arena, &.{ bees_dir, "tasks.json" });
+    if (!fs.access(tasks_path)) {
+        if (fs.createFile(tasks_path, .{})) |file| {
+            fs.writeFile(file, "[]\n") catch {};
+            fs.closeFile(file);
+        } else |_| {}
+    }
+
+    // Knowledge-base schema document.
+    {
+        const schema_path = try std.fs.path.join(arena, &.{ bees_dir, "knowledge", "_schema.md" });
+        if (!fs.access(schema_path)) {
+            if (fs.createFile(schema_path, .{})) |f| {
+                fs.writeFile(f, knowledge.schema_document) catch {};
+                fs.closeFile(f);
+            } else |_| {}
+        }
+    }
+
+    // Seed user profile — the strategy session refines/extends these.
+    {
+        const users_dir = try std.fs.path.join(arena, &.{ bees_dir, "prompts", "users" });
+        fs.makePath(users_dir) catch {};
+        const user_path = try std.fs.path.join(arena, &.{ users_dir, "developer.txt" });
+        if (!fs.access(user_path)) {
+            if (fs.createFile(user_path, .{})) |f| {
+                fs.writeFile(f, default_user_profile) catch {};
+                fs.closeFile(f);
+            } else |_| {}
+        }
+    }
+
+    // Durable north star + self-improvement journal. Always present so the
+    // `mission` context source works and the improver has a log to append to.
+    {
+        const mission_path = try std.fs.path.join(arena, &.{ bees_dir, "MISSION.md" });
+        if (!fs.access(mission_path)) {
+            if (fs.createFile(mission_path, .{})) |f| {
+                const body = std.fmt.allocPrint(arena, "# Mission\n\n{s}", .{mission_guidance}) catch mission_guidance;
+                fs.writeFile(f, body) catch {};
+                fs.closeFile(f);
+            } else |_| {}
+        }
+        const improvements_path = try std.fs.path.join(arena, &.{ bees_dir, "IMPROVEMENTS.md" });
+        if (!fs.access(improvements_path)) {
+            if (fs.createFile(improvements_path, .{})) |f| {
+                fs.writeFile(f, default_improvements_log) catch {};
+                fs.closeFile(f);
+            } else |_| {}
+        }
+    }
+
+    // ---- Phase 2: Claude project analysis — config.json + role prompts -----
+    if (run_ai) {
         try stdout.print("Analyzing project with Claude...\n\n", .{});
         try stdout.flush();
 
         const prompt = try buildInitPrompt(arena, cwd, project_name, base_branch, bees_dir);
-        const result = runInitSession(arena, io, stdout, cwd, prompt);
-
-        switch (result) {
+        switch (runInitSession(arena, io, stdout, cwd, prompt, "claude")) {
             .ok => {
-                // Validate generated config
+                // Validate what Claude wrote; fall back to defaults if unusable.
                 _ = config_mod.load(arena, config_path) catch {
                     try stdout.print("\nGenerated config.json is invalid, replacing with defaults...\n", .{});
                     writeDefaultConfig(arena, config_path, project_name, base_branch) catch {};
@@ -385,50 +536,21 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: 
         }
     }
 
-    // Ensure all required files exist (fill in anything Claude missed or skipped)
+    // Fallback config if analysis was skipped or produced nothing.
     if (!fs.access(config_path)) {
         writeDefaultConfig(arena, config_path, project_name, base_branch) catch {};
     }
 
-    // Create empty tasks.json — the strategist populates this on first run
-    const tasks_path = try std.fs.path.join(arena, &.{ bees_dir, "tasks.json" });
-    if (!fs.access(tasks_path)) {
-        if (fs.createFile(tasks_path, .{})) |file| {
-            fs.writeFile(file, "[]\n") catch {};
-            fs.closeFile(file);
-        } else |_| {}
-    }
+    // ---- Phase 3: capture intent + strategy conversation --------------------
+    // When a human is at the terminal, capture what they actually want the swarm
+    // to build. Persist it immediately so the mission is grounded in real intent
+    // even if the AI phase fails or is unavailable.
+    const operator_intent = if (!skip_analysis) captureOperatorIntent(arena, io, stdout) else "";
+    if (operator_intent.len > 0) seedMissionWithIntent(arena, bees_dir, operator_intent);
 
-    // Generate roles + workflow structure (creates roles/*/config.json + prompt.md)
-    roles_default.generateDefaults(bees_dir, arena);
-
-    // Write knowledge base schema document
-    {
-        const schema_path = try std.fs.path.join(arena, &.{ bees_dir, "knowledge", "_schema.md" });
-        if (!fs.access(schema_path)) {
-            if (fs.createFile(schema_path, .{})) |f| {
-                fs.writeFile(f, knowledge.schema_document) catch {};
-                fs.closeFile(f);
-            } else |_| {}
-        }
-    }
-
-    // Ensure prompts/users/ directory exists for user profiles
-    {
-        const users_dir = try std.fs.path.join(arena, &.{ bees_dir, "prompts", "users" });
-        fs.makePath(users_dir) catch {};
-        const user_path = try std.fs.path.join(arena, &.{ users_dir, "developer.txt" });
-        if (!fs.access(user_path)) {
-            if (fs.createFile(user_path, .{})) |f| {
-                fs.writeFile(f, default_user_profile) catch {};
-                fs.closeFile(f);
-            } else |_| {}
-        }
-    }
-
-    // Interactive strategy conversation — generates tailored roles/strategist/prompt.md
-    if (!skip_analysis) {
-        switch (runStrategyConversation(arena, io, stdout, cwd, bees_dir, "claude")) {
+    if (run_ai) {
+        try stdout.print("\nStrategy & personas\n", .{});
+        switch (runStrategyConversation(arena, io, stdout, cwd, bees_dir, operator_intent, "claude")) {
             .ok => {},
             .auth_error => {
                 try stdout.print(
@@ -445,7 +567,7 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: 
         }
     }
 
-    // Initialize SQLite database with schema
+    // ---- Finalize: databases + gitignore -----------------------------------
     {
         const sqlite_path = try std.fs.path.join(arena, &.{ bees_dir, "db", "data.sqlite" });
         var sql_db = sqlite.Db.open(sqlite_path) catch null;
@@ -455,16 +577,46 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: 
                 db.execMulti(ddl) catch {};
             }
             db.close();
-            try stdout.print("  Created SQLite database at {s}/db/data.sqlite\n", .{bees_dir});
         }
     }
 
-    // Add .bees/ to .gitignore
     try addToGitignore(arena, cwd);
 
     try stdout.print("\nInitialized bees project at {s}\n", .{bees_dir});
+    try printInitSummary(arena, stdout, config_path, pre.warnings);
+}
+
+/// Print what actually got configured (reflecting the final config.json), any
+/// outstanding prerequisite warnings, then the next-steps banner. Degrades to
+/// just the banner if the config can't be read — onboarding still succeeded.
+fn printInitSummary(arena: std.mem.Allocator, stdout: *Io.Writer, config_path: []const u8, warnings: []const []const u8) !void {
+    if (config_mod.load(arena, config_path)) |cfg| {
+        try stdout.print("\n=== Configuration ===\n", .{});
+        try stdout.print("  Project:      {s}\n", .{cfg.project.name});
+        try stdout.print("  Base branch:  {s}\n", .{cfg.project.base_branch});
+
+        try stdout.print("  Workers:      {d}", .{cfg.workers.count});
+        const codex_pct: u32 = @intFromFloat(@round(std.math.clamp(cfg.workers.codex_fraction, 0, 1) * 100));
+        if (codex_pct > 0) {
+            try stdout.print(" ({d}% Codex / {d}% Claude)", .{ codex_pct, 100 - codex_pct });
+        }
+        try stdout.print("\n", .{});
+        try stdout.print("  Merge after:  {d} workers\n", .{cfg.merger.merge_threshold});
+        if (cfg.build.command) |c| try stdout.print("  Build:        {s}\n", .{c});
+        if (cfg.build.test_command) |c| try stdout.print("  Test:         {s}\n", .{c});
+        if (cfg.serve.health_url) |u| try stdout.print("  Health URL:   {s}\n", .{u});
+    } else |_| {}
+
+    // Repeat prerequisite issues at the very end — the last thing before the
+    // user runs `bees start`, so they can't scroll past them unnoticed.
+    if (warnings.len > 0) {
+        try stdout.print("\n=== Action needed ===\n", .{});
+        for (warnings) |w| try stdout.print("  ⚠ {s}\n", .{w});
+    }
+
     try stdout.print(
-        \\\n=== Next steps ===
+        \\
+        \\=== Next steps ===
         \\  1. Review config:     bees config
         \\  2. Review tasks:      bees tasks
         \\  3. Test one worker:   bees run worker
@@ -476,6 +628,354 @@ fn cmdInit(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, skip_analysis: 
         \\  - Check status:       bees status
         \\
     , .{});
+}
+
+const PreflightReport = struct {
+    /// Whether the Claude CLI resolves on PATH. Gates the AI init phases.
+    claude_ok: bool,
+    /// Actionable, human-readable prerequisite issues (arena-owned).
+    warnings: []const []const u8,
+};
+
+/// Check the runtime prerequisites that decide whether the swarm can build,
+/// commit, and run agents — before init creates anything. Cheap, best-effort,
+/// and never fatal: returns warnings for the caller to surface. These are the
+/// failures that would otherwise stay silent until the daemon runs.
+fn runPreflight(arena: std.mem.Allocator, io: Io, cwd: []const u8, base_branch: []const u8) !PreflightReport {
+    var warnings: std.ArrayList([]const u8) = .empty;
+
+    const claude_ok = commandPresent(arena, io, cwd, "claude");
+    if (!claude_ok) {
+        try warnings.append(arena, "Claude CLI not found on PATH — bees drives every agent through it. Install it and run `claude` to log in. Using a default config for now; re-run analysis later.");
+    }
+
+    // The default config routes half the workers and a quarter of strategist
+    // runs to Codex, so its absence silently kills a large fraction of the swarm.
+    if (!commandPresent(arena, io, cwd, "codex")) {
+        try warnings.append(arena, "Codex CLI not found — the default config routes ~50% of workers and ~25% of strategist runs to Codex, which will fail. Install `codex`, or set workers.codex_fraction and strategist.codex_fraction to 0 in .bees/config.json.");
+    }
+
+    // Workers commit their work; without an identity every commit aborts.
+    if (!gitIdentitySet(arena, io, cwd)) {
+        try warnings.append(arena, "git commit identity not set — worker commits will fail. Run: git config user.name \"Your Name\" && git config user.email you@example.com");
+    }
+
+    // Workers branch off base_branch; with no commits, `git worktree add` fails.
+    if (!gitRefExists(arena, io, cwd, base_branch)) {
+        try warnings.append(arena, try std.fmt.allocPrint(arena, "Base branch '{s}' has no commits yet — workers can't create worktrees from it. Make an initial commit before `bees start`.", .{base_branch}));
+    }
+
+    return .{ .claude_ok = claude_ok, .warnings = try warnings.toOwnedSlice(arena) };
+}
+
+/// True if `bin` can be launched (resolves on PATH). Any exit status counts as
+/// present; only a spawn failure (binary not found) counts as absent.
+fn commandPresent(arena: std.mem.Allocator, io: Io, cwd: []const u8, bin: []const u8) bool {
+    _ = git.run(arena, io, &.{ bin, "--version" }, cwd) catch return false;
+    return true;
+}
+
+/// True if a git commit identity (user.email) is configured for this repo.
+fn gitIdentitySet(arena: std.mem.Allocator, io: Io, cwd: []const u8) bool {
+    const res = git.run(arena, io, &.{ "git", "config", "user.email" }, cwd) catch return false;
+    if (res.exit_code != 0) return false;
+    return std.mem.trim(u8, res.stdout, &std.ascii.whitespace).len > 0;
+}
+
+/// True if `ref` resolves to a commit (branch exists and has history).
+fn gitRefExists(arena: std.mem.Allocator, io: Io, cwd: []const u8, ref: []const u8) bool {
+    const res = git.run(arena, io, &.{ "git", "rev-parse", "--verify", "--quiet", ref }, cwd) catch return false;
+    return res.exit_code == 0;
+}
+
+// ── Health check (`bees doctor`) ─────────────────────────────────────────────
+// A per-role dry run: verify each role that will run can actually run — backend
+// CLI present, prompt present, and environment access (e.g. a browser for
+// browser-dependent roles). Exits non-zero on blockers so it can gate a run:
+// `bees doctor && bees start`.
+fn cmdDoctor(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, role_filter: ?[]const u8, probe: bool) !void {
+    const project = loadProject(arena) catch {
+        try stdout.print("Not a bees project. Run `bees init` first.\n", .{});
+        return;
+    };
+    const cfg = project[0];
+    const paths = project[1];
+    const cwd = try getCwd(arena);
+
+    try stdout.print("Health check — {s}\n", .{cfg.project.name});
+    try stdout.print("  ✓ ready   ⚠ warning   ✗ blocker\n\n", .{});
+
+    var blockers: u32 = 0;
+    var warnings: u32 = 0;
+
+    // ---- Shared environment ----
+    try stdout.print("Environment\n", .{});
+    if (gitIdentitySet(arena, io, cwd)) {
+        try stdout.print("  ✓ git commit identity configured\n", .{});
+    } else {
+        try stdout.print("  ✗ git commit identity not set — worker commits will fail\n", .{});
+        blockers += 1;
+    }
+    if (gitRefExists(arena, io, cwd, cfg.project.base_branch)) {
+        try stdout.print("  ✓ base branch '{s}' has commits\n", .{cfg.project.base_branch});
+    } else {
+        try stdout.print("  ✗ base branch '{s}' has no commits — workers can't branch from it\n", .{cfg.project.base_branch});
+        blockers += 1;
+    }
+    checkCommandDirs(stdout, "build", cfg.build.command, &warnings);
+    checkCommandDirs(stdout, "test", cfg.build.test_command, &warnings);
+    const chrome = backend.findChromeBinary();
+    if (chrome) |c| {
+        try stdout.print("  ✓ browser available: {s}\n", .{c});
+    } else {
+        try stdout.print("  · no Chrome/Chromium found (only matters for browser roles)\n", .{});
+    }
+
+    // ---- Per role, in the order they run ----
+    var roles = role_mod.loadRoles(paths, arena) catch role_mod.RoleSet{
+        .roles = std.StringHashMap(role_mod.RoleConfig).init(arena),
+        .allocator = arena,
+    };
+    const wf = workflow_mod.load(paths, arena);
+
+    var seen = std.StringHashMap(void).init(arena);
+    var names: std.ArrayList([]const u8) = .empty;
+    for (wf.steps) |step| {
+        if (step.role.len == 0) continue;
+        if ((seen.getOrPut(step.role) catch continue).found_existing) continue;
+        names.append(arena, step.role) catch {};
+    }
+    // review runs embedded in the merger; include it if defined.
+    if (roles.get("review") != null and !seen.contains("review")) {
+        names.append(arena, "review") catch {};
+    }
+
+    var matched = false;
+    var browser_needed = false;
+    for (names.items) |name| {
+        if (role_filter) |rf| {
+            if (!std.mem.eql(u8, rf, name)) continue;
+        }
+        matched = true;
+        const rc = roles.get(name) orelse role_mod.RoleConfig{ .name = name };
+        try checkRole(arena, io, stdout, cfg, name, rc, chrome, &blockers, &warnings, &browser_needed);
+    }
+    if (role_filter) |rf| {
+        if (!matched) try stdout.print("\nNo role '{s}' runs in this workflow.\n", .{rf});
+    }
+
+    // ---- Live probe: one minimal real call per distinct model, in parallel ----
+    if (probe) {
+        // Collect the distinct (backend, model, effort) combinations to probe.
+        var combos: std.ArrayList(RoleCombo) = .empty;
+        for (names.items) |name| {
+            if (role_filter) |rf| {
+                if (!std.mem.eql(u8, rf, name)) continue;
+            }
+            const rc = roles.get(name) orelse role_mod.RoleConfig{ .name = name };
+            var buf: [2]RoleCombo = undefined;
+            const cn = roleCombos(cfg, name, rc, &buf);
+            var j: usize = 0;
+            while (j < cn) : (j += 1) {
+                if (!comboSeen(combos.items, buf[j])) combos.append(arena, buf[j]) catch {};
+            }
+        }
+
+        const cap = 32;
+        const n = @min(combos.items.len, cap);
+        try stdout.print("\nLive agent probe — {d} model(s), in parallel (≤{d}s each)\n", .{ n, backend.probe_timeout_secs });
+        try stdout.flush();
+
+        // Launch all probes concurrently (real parallelism on io_uring), so the
+        // total wait is the slowest single probe rather than their sum. Fall back
+        // to a synchronous call if the io backend can't provide concurrency.
+        const Fut = Io.Future(backend.ProbeStatus);
+        var futures: [cap]Fut = undefined;
+        var sync_status = [_]?backend.ProbeStatus{null} ** cap;
+        for (combos.items[0..n], 0..) |c, idx| {
+            if (io.concurrent(backend.probeBackend, .{ arena, io, c.bt, c.model, c.effort, cwd, cfg.claude_binary, cfg.pi_binary })) |f| {
+                futures[idx] = f;
+            } else |_| {
+                sync_status[idx] = backend.probeBackend(arena, io, c.bt, c.model, c.effort, cwd, cfg.claude_binary, cfg.pi_binary);
+            }
+        }
+        // Await in a stable order and report as each resolves.
+        for (combos.items[0..n], 0..) |c, idx| {
+            const status = sync_status[idx] orelse futures[idx].await(io);
+            try printProbeResult(stdout, c, status, &blockers);
+            try stdout.flush();
+        }
+        if (combos.items.len > cap) {
+            try stdout.print("  … {d} more not probed (cap {d})\n", .{ combos.items.len - cap, cap });
+        }
+
+        // Browser roles: actually launch headless Chrome and confirm the DevTools
+        // endpoint comes up — not just that the binary exists on disk.
+        if (browser_needed) {
+            try stdout.print("\nBrowser (headless Chrome + DevTools)\n", .{});
+            try stdout.flush();
+            switch (backend.probeChrome(io)) {
+                .ok => try stdout.print("  ✓ Chrome serves the DevTools protocol (one shared instance)\n", .{}),
+                .no_binary => {
+                    try stdout.print("  ✗ no Chrome/Chromium binary found\n", .{});
+                    blockers += 1;
+                },
+                .launch_failed => {
+                    try stdout.print("  ✗ Chrome failed to launch (missing libs / sandbox?)\n", .{});
+                    blockers += 1;
+                },
+                .no_devtools => {
+                    try stdout.print("  ✗ Chrome launched but the DevTools endpoint never came up\n", .{});
+                    blockers += 1;
+                },
+            }
+            try stdout.flush();
+        }
+    }
+
+    // ---- Summary ----
+    try stdout.print("\n", .{});
+    if (blockers == 0 and warnings == 0) {
+        try stdout.print("All roles ready ✓\n", .{});
+    } else {
+        try stdout.print("{d} blocker(s), {d} warning(s).", .{ blockers, warnings });
+        if (blockers > 0) {
+            try stdout.print(" Fix blockers before `bees start`.\n", .{});
+        } else {
+            try stdout.print("\n", .{});
+        }
+    }
+    if (blockers > 0) {
+        stdout.flush() catch {};
+        std.process.exit(1);
+    }
+}
+
+fn checkRole(
+    arena: std.mem.Allocator,
+    io: Io,
+    stdout: *Io.Writer,
+    cfg: config_mod.Config,
+    name: []const u8,
+    rc: role_mod.RoleConfig,
+    chrome: ?[]const u8,
+    blockers: *u32,
+    warnings: *u32,
+    browser_needed: *bool,
+) !void {
+    try stdout.print("\n{s}\n", .{name});
+
+    // Prompt file — a role can't run without one.
+    if (rc.prompt_path.len == 0) {
+        try stdout.print("  ✗ missing roles/{s}/prompt.md\n", .{name});
+        blockers.* += 1;
+    } else {
+        try stdout.print("  ✓ prompt present\n", .{});
+    }
+
+    // Backend CLI(s). A role may use more than one backend — workers and the
+    // strategist route a fraction of runs to Codex.
+    var combos: [2]RoleCombo = undefined;
+    const n = roleCombos(cfg, name, rc, &combos);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const c = combos[i];
+        const bin = backendBinary(cfg, c.bt);
+        if (commandPresent(arena, io, ".", bin)) {
+            try stdout.print("  ✓ backend {s} ({s}) — '{s}' on PATH\n", .{ c.bt.label(), c.model, bin });
+        } else {
+            try stdout.print("  ✗ backend {s} — '{s}' not on PATH (model {s})\n", .{ c.bt.label(), bin, c.model });
+            blockers.* += 1;
+        }
+    }
+
+    // Browser dependency: a role needs a browser when it has an MCP config or
+    // plugins (which resolve to servers like chrome-devtools).
+    const needs_browser = rc.mcp_config != null or rc.plugins.len > 0;
+    if (needs_browser) {
+        browser_needed.* = true;
+        if (chrome != null) {
+            try stdout.print("  ✓ browser MCP configured and Chrome available\n", .{});
+        } else {
+            try stdout.print("  ✗ browser MCP configured but no Chrome/Chromium found\n", .{});
+            blockers.* += 1;
+        }
+    } else if (std.mem.eql(u8, name, "user")) {
+        try stdout.print("  ⚠ no browser MCP configured — the user agent can't navigate the live app\n", .{});
+        warnings.* += 1;
+    }
+}
+
+/// A (backend, model, effort) an agent session runs under.
+const RoleCombo = struct { bt: types.BackendType, model: []const u8, effort: []const u8 };
+
+/// The distinct backend/model/effort combinations a role may run. Workers and the
+/// strategist route a fraction of runs to Codex, so those use two.
+fn roleCombos(cfg: config_mod.Config, name: []const u8, rc: role_mod.RoleConfig, out: *[2]RoleCombo) usize {
+    const base_bt = backend.resolveBackend(cfg.default_backend, rc.backend);
+    out[0] = .{ .bt = base_bt, .model = rc.model, .effort = rc.effort };
+    if (std.mem.eql(u8, name, "worker") and cfg.workers.codex_fraction > 0 and base_bt != .codex) {
+        out[1] = .{ .bt = .codex, .model = cfg.codex_execution.model, .effort = cfg.codex_execution.effort };
+        return 2;
+    }
+    if (std.mem.eql(u8, name, "strategist") and cfg.strategist.codex_fraction > 0 and base_bt != .codex) {
+        out[1] = .{ .bt = .codex, .model = cfg.codex_thinking.model, .effort = cfg.codex_thinking.effort };
+        return 2;
+    }
+    return 1;
+}
+
+fn printProbeResult(stdout: *Io.Writer, c: RoleCombo, status: backend.ProbeStatus, blockers: *u32) !void {
+    switch (status) {
+        .ok => try stdout.print("  ✓ {s} {s} (effort {s}) responded\n", .{ c.bt.label(), c.model, c.effort }),
+        .auth_error => {
+            try stdout.print("  ✗ {s} {s} — authentication failed (run the CLI to log in)\n", .{ c.bt.label(), c.model });
+            blockers.* += 1;
+        },
+        .timeout => {
+            try stdout.print("  ✗ {s} {s} — no response within {d}s (overloaded/unavailable?)\n", .{ c.bt.label(), c.model, backend.probe_timeout_secs });
+            blockers.* += 1;
+        },
+        .failed => {
+            try stdout.print("  ✗ {s} {s} (effort {s}) — call failed (no valid completion)\n", .{ c.bt.label(), c.model, c.effort });
+            blockers.* += 1;
+        },
+    }
+}
+
+fn comboSeen(list: []const RoleCombo, c: RoleCombo) bool {
+    for (list) |x| {
+        if (x.bt == c.bt and std.mem.eql(u8, x.model, c.model) and std.mem.eql(u8, x.effort, c.effort)) return true;
+    }
+    return false;
+}
+
+/// Map a backend to the binary bees will invoke for it.
+fn backendBinary(cfg: config_mod.Config, bt: types.BackendType) []const u8 {
+    return switch (bt) {
+        .claude => cfg.claude_binary,
+        .pi => cfg.pi_binary,
+        .codex => "codex",
+        .opencode => "opencode",
+    };
+}
+
+/// Heuristic: parse `cd <abs-path>` targets out of a build/test command and warn
+/// if any don't exist. Catches stale paths (e.g. a project that was moved).
+fn checkCommandDirs(stdout: *Io.Writer, label: []const u8, cmd_opt: ?[]const u8, warnings: *u32) void {
+    const cmd = cmd_opt orelse return;
+    var it = std.mem.splitSequence(u8, cmd, "cd ");
+    _ = it.first(); // text before the first "cd "
+    while (it.next()) |rest| {
+        var end: usize = 0;
+        while (end < rest.len and rest[end] != ' ' and rest[end] != '&' and rest[end] != ';' and rest[end] != '\n') : (end += 1) {}
+        const path = rest[0..end];
+        if (path.len == 0 or path[0] != '/') continue; // only verify absolute paths
+        if (!fs.access(path)) {
+            stdout.print("  ⚠ {s} command references missing directory: {s}\n", .{ label, path }) catch {};
+            warnings.* += 1;
+        }
+    }
 }
 
 const InitResult = enum { ok, auth_error, failed };
@@ -556,24 +1056,28 @@ fn buildInitPrompt(arena: std.mem.Allocator, cwd: []const u8, name: []const u8, 
         \\    setup_command: install deps, non-interactive (--yes flags). Null if none.
         \\  workers: {{"count": 5}} — number of parallel coding agents
         \\  merger: {{"merge_threshold": 3}} — merge after N workers complete
-        \\  daemon: {{"cooldown_secs": 300, "worker_timeout_minutes": 60}}
+        \\  daemon: {{"cooldown_secs": 300}} — leave worker_timeout_minutes unset (0/disabled)
         \\  serve (optional, for web services):
         \\    {{"systemd_unit": "<name>", "health_url": "http://localhost:<port>"}}
         \\
         \\## 2. Role prompts: {s}/roles/*/prompt.md
         \\
-        \\Update the prompt.md file in each role directory with project-specific detail:
+        \\Each role already has a default prompt.md and config.json. READ each
+        \\prompt.md and ENRICH it with project-specific detail — keep the existing
+        \\structure and intent, add this project's tech stack, build/test commands,
+        \\and conventions. Do NOT replace the defaults wholesale. Priorities:
         \\
-        \\  roles/worker/prompt.md — Autonomous coding agent. Mention this project's tech stack,
-        \\    build/test commands, and coding conventions. 10-20 lines.
-        \\  roles/review/prompt.md — Code reviewer. Receives git diff. Respond ACCEPT
-        \\    or REJECT with reasoning. Only reject clearly wrong/harmful changes.
-        \\  roles/sre/prompt.md — SRE monitor. CRITICAL: Must NEVER kill/restart/stop processes
-        \\    (no pkill, kill, systemctl stop/restart). Only inspect and adjust config.
-        \\  roles/founder/prompt.md — Founder-CEO. Sets product vision, priority themes,
-        \\    kill decisions, and milestones. Mention what this product should become and
-        \\    who it serves. Does NOT write tasks — outputs directives for the strategist.
+        \\  roles/worker/prompt.md — Autonomous coding agent. Add tech stack,
+        \\    build/test commands, and coding conventions. Keep it tight.
+        \\  roles/review/prompt.md — Code reviewer. Receives a git diff; merges good
+        \\    changes, rejects clearly wrong/harmful ones. Add project-specific risks.
+        \\  roles/sre/prompt.md — SRE monitor. CRITICAL: NEVER kill/restart/stop
+        \\    processes (no pkill, kill, systemctl stop/restart). Inspect/adjust config only.
+        \\  roles/founder/prompt.md — Founder-CEO. What should this product become and
+        \\    who does it serve? Does NOT write tasks — outputs directives for the strategist.
         \\
+        \\You may also tune a role's config.json (model, max_budget_usd) when the
+        \\project clearly warrants it, but the defaults are sensible — change sparingly.
         \\Do NOT create tasks.json — the strategist generates tasks on its first run.
         \\
         \\## Database Architecture
@@ -592,12 +1096,82 @@ fn buildInitPrompt(arena: std.mem.Allocator, cwd: []const u8, name: []const u8, 
     , .{ name, cwd, branch, bees_dir, bees_dir, name, branch, cwd, bees_dir, bees_dir });
 }
 
-fn runStrategyConversation(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, cwd: []const u8, bees_dir: []const u8, claude_binary: []const u8) InitResult {
+/// When a human is at the terminal, ask them — in their own words — what real
+/// problem this swarm should solve and for whom. Returns "" when stdin isn't a
+/// TTY (piped/CI) or nothing is entered. This is the highest-signal intent
+/// capture: it grounds the mission in the operator's actual goal, not just repo
+/// inference.
+fn captureOperatorIntent(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) []const u8 {
+    const stdin = Io.File.stdin();
+    const is_tty = stdin.isTty(io) catch return "";
+    if (!is_tty) return "";
+
+    stdout.print(
+        \\
+        \\Tell the swarm what you actually want (optional — this grounds the mission).
+        \\In a few lines: what real problem should this solve, for whom, and what does
+        \\success look like? End with an empty line, or just press Enter to skip.
+        \\
+    , .{}) catch return "";
+    stdout.print("> ", .{}) catch return "";
+    stdout.flush() catch return "";
+
+    var buf: [8192]u8 = undefined;
+    var reader = stdin.readerStreaming(io, &buf);
+    var acc: std.ArrayList(u8) = .empty;
+    var lines: u32 = 0;
+    while (lines < 40) : (lines += 1) {
+        const line = reader.interface.takeDelimiter('\n') catch break;
+        const l = line orelse break; // EOF
+        if (l.len == 0) break; // blank line ends input
+        acc.appendSlice(arena, l) catch break;
+        acc.appendSlice(arena, "\n") catch break;
+        if (acc.items.len > 6000) break; // sanity cap
+        stdout.print("> ", .{}) catch {};
+        stdout.flush() catch {};
+    }
+
+    const text = std.mem.trim(u8, acc.items, &std.ascii.whitespace);
+    if (text.len == 0) return "";
+    return arena.dupe(u8, text) catch "";
+}
+
+/// Overwrite MISSION.md so the operator's verbatim intent leads the file and can
+/// never be lost — even if the AI strategy phase fails. Claude refines it after.
+fn seedMissionWithIntent(arena: std.mem.Allocator, bees_dir: []const u8, intent: []const u8) void {
+    const mission_path = std.fs.path.join(arena, &.{ bees_dir, "MISSION.md" }) catch return;
+    const content = std.fmt.allocPrint(arena,
+        \\# Mission
+        \\
+        \\## Operator Intent (verbatim — treat as ground truth)
+        \\
+        \\{s}
+        \\
+        \\{s}
+    , .{ intent, mission_guidance }) catch return;
+    const f = fs.createFile(mission_path, .{}) catch return;
+    defer fs.closeFile(f);
+    fs.writeFile(f, content) catch {};
+}
+
+fn runStrategyConversation(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, cwd: []const u8, bees_dir: []const u8, operator_intent: []const u8, claude_binary: []const u8) InitResult {
     const strategist_path = std.fs.path.join(arena, &.{ bees_dir, "roles", "strategist", "prompt.md" }) catch return .failed;
     const users_dir = std.fs.path.join(arena, &.{ bees_dir, "prompts", "users" }) catch return .failed;
+    const mission_path = std.fs.path.join(arena, &.{ bees_dir, "MISSION.md" }) catch return .failed;
 
-    stdout.print("\nGenerating strategy (user profiles + strategist prompt)...\n\n", .{}) catch {};
+    stdout.print("\nGenerating strategy (mission + user profiles + strategist prompt)...\n\n", .{}) catch {};
     stdout.flush() catch {};
+
+    // Operator intent, when captured, is ground truth for the mission.
+    const intent_block = if (operator_intent.len > 0)
+        std.fmt.allocPrint(arena,
+            \\
+            \\## Operator Intent (verbatim — treat as GROUND TRUTH for the mission)
+            \\{s}
+            \\
+        , .{operator_intent}) catch ""
+    else
+        "";
 
     // Build prompt with project-specific paths
     const prompt = std.fmt.allocPrint(arena,
@@ -607,10 +1181,11 @@ fn runStrategyConversation(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer,
         \\
         \\Project directory: {s}
         \\Config directory: {s}
+        \\Mission file: {s}  (refine every section; replace placeholders)
         \\Strategist prompt: {s}
         \\User profiles dir: {s}  (one .txt file per user type)
-        \\
-    , .{ strategy_setup_prompt, cwd, bees_dir, strategist_path, users_dir }) catch return .failed;
+        \\{s}
+    , .{ strategy_setup_prompt, cwd, bees_dir, mission_path, strategist_path, users_dir, intent_block }) catch return .failed;
 
     var child = claude.spawnClaude(arena, io, .{
         .prompt = prompt,
@@ -663,21 +1238,15 @@ fn runStrategyConversation(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer,
 }
 
 fn writeDefaultConfig(arena: std.mem.Allocator, config_path: []const u8, project_name: []const u8, base_branch: []const u8) !void {
+    // Pin only the two values that can't be inferred from defaults; everything
+    // else comes from Config's struct defaults (config.zig) — the single source
+    // of truth. Emitting more here only risks drifting from those defaults (e.g.
+    // re-enabling worker_timeout_minutes, which is deliberately 0/disabled).
     const content = try std.fmt.allocPrint(arena,
         \\{{
         \\  "project": {{
         \\    "name": "{s}",
         \\    "base_branch": "{s}"
-        \\  }},
-        \\  "workers": {{
-        \\    "count": 3
-        \\  }},
-        \\  "merger": {{
-        \\    "merge_threshold": 3
-        \\  }},
-        \\  "daemon": {{
-        \\    "cooldown_secs": 300,
-        \\    "worker_timeout_minutes": 60
         \\  }}
         \\}}
         \\
@@ -1015,7 +1584,7 @@ fn cmdRunStrategist(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void 
         arena,
         context,
         true,
-        cfg.default_backend,
+        cfg,
         null,
     );
     try stdout.print("Strategist run complete\n", .{});
@@ -1065,7 +1634,7 @@ fn cmdRunSre(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         arena,
         null,
         true,
-        cfg.default_backend,
+        cfg,
         null,
     );
     try stdout.print("SRE run complete\n", .{});
@@ -1154,7 +1723,7 @@ fn cmdRunQa(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         arena,
         null,
         true,
-        cfg.default_backend,
+        cfg,
         null,
     );
     try stdout.print("QA run complete\n", .{});
@@ -1185,8 +1754,8 @@ fn cmdRunResearcher(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void 
     };
     const role_cfg = roles.get("researcher") orelse role_mod.RoleConfig{
         .name = "researcher",
-        .model = "opus",
-        .fallback_model = "sonnet",
+        .model = "fable",
+        .fallback_model = "opus",
         .stores_report = true,
     };
 
@@ -1211,7 +1780,7 @@ fn cmdRunResearcher(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void 
         arena,
         step_ctx,
         true,
-        cfg.default_backend,
+        cfg,
         null,
     );
     try stdout.print("Researcher run complete\n", .{});
@@ -1260,7 +1829,7 @@ fn cmdRunUser(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         arena,
         null,
         true,
-        cfg.default_backend,
+        cfg,
         null,
     );
     try stdout.print("User engagement complete\n", .{});
@@ -1524,16 +2093,66 @@ fn cmdFunding(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, action: cli.
                 try stdout.print("\n{d} request(s). Use `bees funding approve <id>` or `bees funding deny <id>`.\n", .{count});
             }
         },
-        .approve => |id| try approveFunding(arena, io, stdout, paths, id),
+        .approve => |id| try approveFunding(arena, io, stdout, project[0], paths, id),
         .deny => |id| try updateFundingStatus(arena, stdout, paths.funding_dir, id, "denied"),
     }
 }
 
-/// Approve a funding request: update status, then execute on-chain transfer.
+/// Validate a funding request against format rules and spending caps.
+/// Returns the amount in microdollars if allowed, or null if refused (a reason
+/// is printed to stdout). Pure check — no side effects, no money moved.
+fn checkFundingLimits(
+    arena: std.mem.Allocator,
+    stdout: *Io.Writer,
+    cfg: config_mod.Config,
+    funding_dir: []const u8,
+    amt: []const u8,
+    to: []const u8,
+    token: []const u8,
+) !?u64 {
+    if (!funding.isValidAmount(amt)) {
+        try stdout.print("Refused: invalid amount '{s}' (digits, one dot, <=6 decimals, >0).\n", .{amt});
+        return null;
+    }
+    if (!funding.isValidAddress(to)) {
+        try stdout.print("Refused: invalid recipient address '{s}' (want 0x + 40 hex).\n", .{to});
+        return null;
+    }
+    if (!funding.isValidAddress(token)) {
+        try stdout.print("Refused: invalid token address '{s}' (want 0x + 40 hex).\n", .{token});
+        return null;
+    }
+    const micros = funding.amountToMicros(amt) catch {
+        try stdout.print("Refused: unparseable amount '{s}'.\n", .{amt});
+        return null;
+    };
+    const per_req_cap: u64 = @as(u64, cfg.funding.max_per_request_usdc) * 1_000_000;
+    const cum_cap: u64 = @as(u64, cfg.funding.max_cumulative_usdc) * 1_000_000;
+    if (per_req_cap == 0 or cum_cap == 0) {
+        try stdout.print("Refused: on-chain transfers are disabled (funding cap = 0 in config).\n", .{});
+        return null;
+    }
+    if (micros > per_req_cap) {
+        try stdout.print("Refused: {s} USDC exceeds per-request cap of {d} USDC.\n", .{ amt, cfg.funding.max_per_request_usdc });
+        return null;
+    }
+    const spent = funding.readSpentMicros(arena, funding_dir);
+    if (micros > cum_cap -| spent) {
+        try stdout.print("Refused: {s} USDC would exceed cumulative cap ({d} of {d} USDC already spent).\n", .{ amt, spent / 1_000_000, cfg.funding.max_cumulative_usdc });
+        return null;
+    }
+    return micros;
+}
+
+/// Approve a funding request: validate, enforce caps, execute the transfer, and
+/// only then mark it approved. Idempotent — a request that already has a recorded
+/// transaction (or is not "pending") is refused so a partial failure can never be
+/// re-broadcast into a double-spend.
 fn approveFunding(
     arena: std.mem.Allocator,
     io: Io,
     stdout: *Io.Writer,
+    cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
     id: []const u8,
 ) !void {
@@ -1545,52 +2164,81 @@ fn approveFunding(
         return;
     };
 
-    const title = findJsonStr(data, "title") orelse id;
+    // Idempotency guard 1: only a pending request may be approved.
+    const current_status = findJsonStr(data, "status") orelse "pending";
+    if (!std.mem.eql(u8, current_status, "pending")) {
+        try stdout.print("Request '{s}' is already '{s}' — refusing to re-process.\n", .{ id, current_status });
+        return;
+    }
+    // Idempotency guard 2: a transaction sidecar means a transfer was already
+    // attempted; never re-send (the earlier attempt may have broadcast).
+    const tx_sidecar = try std.fmt.allocPrint(arena, "{s}/{s}.tx", .{ paths.funding_dir, id });
+    if (fs.access(tx_sidecar)) {
+        try stdout.print("Request '{s}' already has a transaction record — refusing to re-send. Inspect {s}.\n", .{ id, tx_sidecar });
+        return;
+    }
+
     const amount = findJsonStr(data, "amount_usdc");
     const chain = if (findJsonStr(data, "chain")) |c| funding.Chain.parse(c) else funding.Chain.tempo;
     const token = findJsonStr(data, "token") orelse chain.defaultToken();
 
-    // Resolve recipient: explicit in request, or derive from role's wallet
     const roles_dir = try std.fs.path.join(arena, &.{ paths.bees_dir, "roles" });
     const recipient = findJsonStr(data, "recipient_wallet") orelse
         findJsonStr(data, "founder_wallet") orelse
         funding.getAddress(io, arena, roles_dir, findJsonStr(data, "recipient_role") orelse "founder");
 
-    // Update status to approved
+    // No amount: nothing to transfer — approve for the founder to apply later.
+    const amt = amount orelse {
+        try updateFundingStatus(arena, stdout, paths.funding_dir, id, "approved");
+        try stdout.print("  Note: no 'amount_usdc' field — no on-chain transfer. Founder will apply on next run.\n", .{});
+        return;
+    };
+    const to = recipient orelse {
+        try stdout.print("No recipient wallet found — create one with `bees wallet init <role>`. Request left pending.\n", .{});
+        return;
+    };
+
+    const micros = (try checkFundingLimits(arena, stdout, cfg, paths.funding_dir, amt, to, token)) orelse return;
+
+    // Mark the attempt BEFORE broadcasting so a crash mid-transfer cannot lead to
+    // a re-send. On confirmed success we overwrite this with the tx hash.
+    writeTxSidecar(arena, tx_sidecar, "PENDING");
+
+    try stdout.print("Transferring {s} USDC to {s} on {s}...\n", .{ amt, to, @tagName(chain) });
+    const tx_hash = funding.transfer(io, arena, chain, amt, token, to, null) catch |e| {
+        try stdout.print("Transfer failed: {s}. Request left pending; sidecar {s} blocks accidental re-send.\n", .{ @errorName(e), tx_sidecar });
+        return;
+    };
+
+    const hash = tx_hash orelse {
+        switch (chain) {
+            .tempo => try stdout.print("No tx hash parsed — check `tempo wallet whoami`. NOT retrying (may have broadcast).\n", .{}),
+            .ethereum => try stdout.print("No tx hash parsed — ensure `cast`/ETH_RPC_URL/ETH_PRIVATE_KEY are set. NOT retrying (may have broadcast).\n", .{}),
+        }
+        return;
+    };
+
+    // Confirmed success: record hash, advance the cumulative ledger, mark approved.
+    writeTxSidecar(arena, tx_sidecar, hash);
+    const spent = funding.readSpentMicros(arena, paths.funding_dir);
+    funding.writeSpentMicros(arena, paths.funding_dir, spent + micros) catch {
+        try stdout.print("  WARNING: transfer sent but ledger write failed — cumulative cap may under-count.\n", .{});
+    };
     try updateFundingStatus(arena, stdout, paths.funding_dir, id, "approved");
 
-    // Execute on-chain transfer if amount and recipient are specified
-    if (amount) |amt| {
-        if (recipient) |to| {
-            try stdout.print("Transferring {s} USDC to {s} on {s}...\n", .{ amt, to, @tagName(chain) });
+    try stdout.print("Transfer complete: {s}\n", .{hash});
+    var url_buf: [160]u8 = undefined;
+    const url = try chain.explorerTxUrl(&url_buf, hash);
+    try stdout.print("  {s}\n", .{url});
+}
 
-            // Investor wallet sends to recipient. Tempo: default wallet from
-            // `tempo wallet login`. Ethereum: private key picked up by `cast`
-            // from the ETH_PRIVATE_KEY env var.
-            const tx_hash = funding.transfer(io, arena, chain, amt, token, to, null) catch |e| {
-                try stdout.print("Transfer failed: {s}\n", .{@errorName(e)});
-                return;
-            };
-
-            if (tx_hash) |hash| {
-                defer arena.free(hash);
-                try stdout.print("Transfer complete: {s}\n", .{hash});
-                var url_buf: [160]u8 = undefined;
-                const url = try chain.explorerTxUrl(&url_buf, hash);
-                try stdout.print("  {s}\n", .{url});
-            } else {
-                switch (chain) {
-                    .tempo => try stdout.print("Transfer failed — check `tempo wallet whoami` for balance and connectivity.\n", .{}),
-                    .ethereum => try stdout.print("Transfer failed — ensure `cast` is installed and ETH_RPC_URL + ETH_PRIVATE_KEY are set.\n", .{}),
-                }
-            }
-        } else {
-            try stdout.print("Approved: {s}\n", .{title});
-            try stdout.print("  Note: no recipient wallet found — create one with `bees wallet init <role>`.\n", .{});
-        }
-    } else {
-        try stdout.print("  Note: no 'amount_usdc' field — no on-chain transfer. Founder will apply on next run.\n", .{});
-    }
+/// Write a funding transaction sidecar (best-effort; mode 0600 not required —
+/// contains only a public tx hash or the literal "PENDING").
+fn writeTxSidecar(arena: std.mem.Allocator, sidecar_path: []const u8, contents: []const u8) void {
+    _ = arena;
+    const f = fs.createFile(sidecar_path, .{}) catch return;
+    defer fs.closeFile(f);
+    fs.writeFile(f, contents) catch {};
 }
 
 /// Update the status field in a funding request JSON file.
@@ -1966,6 +2614,7 @@ fn printUsage(stdout: *Io.Writer) !void {
         \\  run sre                  Run SRE agent (one-shot)
         \\  run qa                   Run QA agent (one-shot)
         \\  run researcher           Run researcher agent (one-shot)
+        \\  doctor [role] [--probe]  Health check each role (--probe: live model call)
         \\  log [--follow]           Show log
         \\  config [--json]          Show config
         \\  tasks [--json]           List tasks (from LMDB if available)
@@ -2050,4 +2699,10 @@ comptime {
     _ = @import("db/duckdb.zig");
     _ = @import("db/query.zig");
     _ = @import("seed.zig");
+    _ = knowledge;
+    _ = @import("context.zig");
+    _ = @import("workflow.zig");
+    _ = @import("experiment.zig");
+    _ = @import("funding.zig");
+    _ = @import("roles_default.zig");
 }

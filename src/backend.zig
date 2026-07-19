@@ -21,6 +21,28 @@ pub const streamEvent = claude.streamEvent;
 /// Build a filtered environ map for spawning Claude CLI sessions.
 /// - Excludes CLAUDECODE to prevent "cannot launch inside another CLI" errors
 /// - Sets CLAUDE_CODE_UNATTENDED_RETRY=1 for persistent retry on 429/529
+/// Prepend a coreutils `timeout` wrapper to `args` when `timeout_secs > 0`, so a
+/// hung agent CLI is force-terminated instead of blocking a worker slot forever.
+/// `timeout` sends SIGTERM at the deadline, then SIGKILL 30s later, and exits with
+/// code 124 on timeout — which worker.zig's restart-on-timeout logic detects.
+///
+/// Call this BEFORE appending the binary name. `secs_buf` must outlive the spawn
+/// call (the argv slices point into it), so pass a buffer at spawn-fn scope.
+pub fn appendTimeoutPrefix(
+    args: *std.ArrayList([]const u8),
+    allocator: std.mem.Allocator,
+    timeout_secs: u32,
+    secs_buf: []u8,
+) !void {
+    if (timeout_secs == 0) return;
+    const secs_str = std.fmt.bufPrint(secs_buf, "{d}", .{timeout_secs}) catch return;
+    try args.append(allocator, "timeout");
+    try args.append(allocator, "--signal=TERM");
+    try args.append(allocator, "-k");
+    try args.append(allocator, "30");
+    try args.append(allocator, secs_str);
+}
+
 pub fn buildFilteredEnvMap(allocator: std.mem.Allocator) std.process.Environ.Map {
     var env_map = std.process.Environ.Map.init(allocator);
     var i: usize = 0;
@@ -125,6 +147,10 @@ pub const BackendOptions = struct {
 
     // -- Extra environment variables injected into the child process --
     extra_env: ?[]const [2][]const u8 = null,
+
+    /// Send the child's stderr to /dev/null instead of inheriting it. Used by the
+    /// probe so a backend's internal transport chatter doesn't flood the terminal.
+    silence_stderr: bool = false,
 };
 
 pub const ResultAccumulator = struct {
@@ -147,6 +173,26 @@ pub const ResultAccumulator = struct {
     /// API-only duration (excludes tool execution time)
     duration_api_ms: u32 = 0,
 };
+
+/// Saturating f64 → u32 for numbers parsed from untrusted child stdout.
+/// A malformed value (e.g. "input_tokens":1e300, inf, or NaN) must never
+/// reach `@intFromFloat` directly — that is checked illegal behavior and
+/// would abort the whole daemon. The `!(v > 0)` form also maps NaN to 0.
+fn f64ToU32Sat(v: f64) u32 {
+    if (!(v > 0)) return 0;
+    const max_f: f64 = @floatFromInt(@as(u32, std.math.maxInt(u32)));
+    return if (v >= max_f) std.math.maxInt(u32) else @intFromFloat(v);
+}
+
+/// True if `model` is a Claude-family model name. Non-Claude backends (Codex)
+/// must not receive these — they use their own provider's models.
+pub fn isClaudeModelName(model: []const u8) bool {
+    const names = [_][]const u8{ "opus", "sonnet", "haiku", "fable" };
+    for (names) |n| {
+        if (std.mem.eql(u8, model, n)) return true;
+    }
+    return false;
+}
 
 /// Resolve the effective backend: use role-specific override if non-empty, else project default.
 pub fn resolveBackend(default_backend: []const u8, role_backend: []const u8) types.BackendType {
@@ -180,11 +226,92 @@ fn spawn(backend: types.BackendType, allocator: std.mem.Allocator, io: Io, optio
             .allowed_tools = options.allowed_tools,
             .disallowed_tools = options.disallowed_tools,
             .extra_env = options.extra_env,
+            .silence_stderr = options.silence_stderr,
         }, claude_binary),
         .codex => backend_codex.spawnCodex(allocator, io, options),
         .opencode => backend_opencode.spawnOpenCode(allocator, io, options),
         .pi => backend_pi.spawnPi(allocator, io, options, pi_binary),
     };
+}
+
+pub const ProbeStatus = enum { ok, auth_error, timeout, failed };
+
+/// Wall-clock ceiling for a single probe. The `timeout` wrapper sends TERM at
+/// this mark (then KILL 30s later), so a stuck/overloaded backend can't hang the
+/// health check. Healthy models answer a one-word prompt in a few seconds.
+pub const probe_timeout_secs: u32 = 45;
+
+/// Spawn a minimal real agent call for (backend, model, effort) and confirm it
+/// actually produced a completion — verifying auth, model access, and that the
+/// effort is accepted. Used by `bees doctor --probe`. Does no real work: 1 turn,
+/// tiny budget, bounded by a timeout, stderr silenced, and it goes through the
+/// normal spawn path so env filtering (CLAUDECODE etc.) applies.
+///
+/// A non-zero exit is NOT trusted as success — some backends exit 0 even when
+/// the model call failed. We require a genuine completion event in the output.
+pub fn probeBackend(
+    allocator: std.mem.Allocator,
+    io: Io,
+    bt: types.BackendType,
+    model: []const u8,
+    effort: []const u8,
+    cwd: []const u8,
+    claude_binary: []const u8,
+    pi_binary: []const u8,
+) ProbeStatus {
+    var child = spawn(bt, allocator, io, .{
+        .backend = bt,
+        .prompt = "Reply with exactly: OK",
+        .cwd = cwd,
+        .model = model,
+        .effort = effort,
+        .max_budget_usd = 1.0,
+        .max_turns = 1,
+        .timeout_secs = probe_timeout_secs,
+        .silence_stderr = true,
+    }, claude_binary, pi_binary) catch return .failed;
+
+    var saw_auth = false;
+    var saw_success = false;
+    if (child.stdout) |out| {
+        var buf: [64 * 1024]u8 = undefined;
+        var reader = out.readerStreaming(io, &buf);
+        while (true) {
+            const line = reader.interface.takeDelimiter('\n') catch |e| switch (e) {
+                error.ReadFailed => break,
+                error.StreamTooLong => {
+                    _ = reader.interface.discardDelimiterInclusive('\n') catch break;
+                    continue;
+                },
+            };
+            const l = line orelse break;
+            if (l.len == 0) continue;
+            if (std.mem.indexOf(u8, l, "authentication_error") != null or
+                std.mem.indexOf(u8, l, "\"401\"") != null or
+                std.mem.indexOf(u8, l, "Invalid authentication") != null or
+                std.mem.indexOf(u8, l, "invalid_api_key") != null)
+            {
+                saw_auth = true;
+            }
+            // Require a real completion signal, not just a clean exit.
+            if (bt == .claude) {
+                if (std.mem.indexOf(u8, l, "\"subtype\":\"success\"") != null) saw_success = true;
+            } else {
+                if (std.mem.indexOf(u8, l, "turn.completed") != null or
+                    std.mem.indexOf(u8, l, "agent_message") != null) saw_success = true;
+            }
+        }
+    }
+
+    const term = child.wait(io) catch return .failed;
+    if (saw_auth) return .auth_error;
+    const code: i64 = switch (term) {
+        .exited => |c| c,
+        else => -1,
+    };
+    if (code == 124) return .timeout; // `timeout` wrapper fired
+    if (code == 0 and saw_success) return .ok;
+    return .failed;
 }
 
 /// Dispatch event processing to the appropriate backend normalizer.
@@ -234,22 +361,22 @@ fn claudeProcessEvent(line: []const u8, acc: *ResultAccumulator) types.EventMeta
             acc.stop_reason = sr;
         }
         if (claude.findJsonNumberValue(line, "\"total_cost_usd\"")) |cost| {
-            acc.cost_microdollars = @intFromFloat(@min(@max(cost * 1000000.0, 0.0), @as(f64, @floatFromInt(@as(u32, std.math.maxInt(u32))))));
+            acc.cost_microdollars = f64ToU32Sat(cost * 1000000.0);
         }
         if (claude.findJsonNumberValue(line, "\"duration_api_ms\"")) |v| {
-            acc.duration_api_ms = @intFromFloat(@max(v, 0.0));
+            acc.duration_api_ms = f64ToU32Sat(v);
         }
         if (claude.findJsonNumberValue(line, "\"input_tokens\"")) |v| {
-            acc.input_tokens = @intFromFloat(@max(v, 0.0));
+            acc.input_tokens = f64ToU32Sat(v);
         }
         if (claude.findJsonNumberValue(line, "\"output_tokens\"")) |v| {
-            acc.output_tokens = @intFromFloat(@max(v, 0.0));
+            acc.output_tokens = f64ToU32Sat(v);
         }
         if (claude.findJsonNumberValue(line, "\"cache_creation_input_tokens\"")) |v| {
-            acc.cache_creation_tokens = @intFromFloat(@max(v, 0.0));
+            acc.cache_creation_tokens = f64ToU32Sat(v);
         }
         if (claude.findJsonNumberValue(line, "\"cache_read_input_tokens\"")) |v| {
-            acc.cache_read_tokens = @intFromFloat(@max(v, 0.0));
+            acc.cache_read_tokens = f64ToU32Sat(v);
         }
     }
 
@@ -301,7 +428,7 @@ pub fn runSession(
     {
         var prompt_json_buf: [8192]u8 = undefined;
         const prefix = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"";
-        const suffix = if (options.stdin_data != null) " [+ stdin data]\"}]}}}" else "\"}]}}";
+        const suffix = if (options.stdin_data != null) " [+ stdin data]\"}]}}" else "\"}]}}";
         if (prefix.len < prompt_json_buf.len) {
             @memcpy(prompt_json_buf[0..prefix.len], prefix);
             var pos: usize = prefix.len;
@@ -529,17 +656,25 @@ pub fn runSession(
 // Roles create/close their own tabs via MCP; the daemon manages the process.
 
 const CHROME_PORT: u16 = 9222;
+/// Unique user-data-dir basename identifying bees' single shared Chrome. Used to
+/// launch, detect, and reap the whole process tree by marker.
+const CHROME_DATA_MARKER = "chrome-headless-bees";
+/// Hard ceiling on open tabs in the shared Chrome. Roles reuse the one instance
+/// and its tabs; the between-cycle cleanup closes work tabs and enforces this cap.
+pub const MAX_CHROME_TABS: u32 = 20;
 var chrome_data_dir_buf: [256]u8 = undefined;
 
 fn chromeDataDir() []const u8 {
     const home = std.c.getenv("HOME") orelse "/tmp";
-    const written = std.fmt.bufPrint(&chrome_data_dir_buf, "{s}/.cache/chrome-headless-bees", .{home}) catch
-        return "/tmp/.cache/chrome-headless-bees";
+    const written = std.fmt.bufPrint(&chrome_data_dir_buf, "{s}/.cache/{s}", .{ home, CHROME_DATA_MARKER }) catch
+        return "/tmp/.cache/" ++ CHROME_DATA_MARKER;
     return written;
 }
 
 /// Find a Chrome/Chromium binary. Checks common paths in priority order.
-fn findChromeBinary() ?[]const u8 {
+/// Public so the health check (`bees doctor`) can verify browser availability
+/// for browser-dependent roles using the same detection the daemon relies on.
+pub fn findChromeBinary() ?[]const u8 {
     const candidates = [_][*:0]const u8{
         "/opt/google/chrome/chrome",
         "/usr/bin/google-chrome-stable",
@@ -554,10 +689,27 @@ fn findChromeBinary() ?[]const u8 {
     return null;
 }
 
-/// Spawn a headless Chrome/Chromium instance for MCP-enabled roles.
-/// Returns the child PID, or null if no browser found or it could not be started.
-/// Kills any orphaned Chrome on the same port before spawning.
+/// True if something is listening on the Chrome debug port. Chrome opens it only
+/// once its DevTools server is ready, so this doubles as a readiness check.
+fn chromePortOpen(io: Io) bool {
+    const addr = Io.net.IpAddress.parse("127.0.0.1", CHROME_PORT) catch return false;
+    var stream = Io.net.IpAddress.connect(addr, io, .{ .mode = .stream }) catch return false;
+    stream.close(io);
+    return true;
+}
+
+/// Spawn a headless Chrome/Chromium instance for MCP-enabled roles, enforcing a
+/// single shared instance box-wide. Returns:
+///   - a real pid if we launched it (caller owns it and should killChrome on stop),
+///   - 0 if an instance is already running and we reused it (NOT owned — the
+///     orchestrator's `chrome_pid != 0` guard leaves it alone on shutdown),
+///   - null if no browser was found or launch failed.
+/// Roles share the one instance via tabs (the chrome-devtools MCP connects with
+/// --browserUrl); we never run more than one Chrome at a time.
 pub fn spawnChrome(io: Io) ?std.posix.pid_t {
+    // Already running? Reuse it rather than launching a second instance.
+    if (chromePortOpen(io)) return 0;
+
     // Kill any orphaned Chrome from a previous daemon run
     killOrphanedChrome(io);
 
@@ -599,21 +751,62 @@ pub fn spawnChrome(io: Io) ?std.posix.pid_t {
     return child.id;
 }
 
-/// Gracefully kill Chrome by PID: SIGTERM → 5s wait → SIGKILL.
-pub fn killChrome(pid: std.posix.pid_t, io: Io) void {
-    // Send SIGTERM for graceful shutdown
-    std.posix.kill(pid, std.c.SIG.TERM) catch return;
+pub const ChromeProbe = enum { ok, no_binary, launch_failed, no_devtools };
 
-    // Wait up to 5 seconds for exit
+/// Verify Chrome actually works for browser roles, honoring the single-instance
+/// rule: if a Chrome is already serving on :9222 (the daemon's shared browser),
+/// REUSE it — never launch a second. Only when none is running do we launch the
+/// one shared instance, confirm its DevTools port comes up, then reap it. A TCP
+/// connect is a reliable "it works" signal (the debug port opens only once the
+/// DevTools server is ready). Used by `bees doctor --probe`.
+pub fn probeChrome(io: Io) ChromeProbe {
+    if (findChromeBinary() == null) return .no_binary;
+
+    // Already running? Reuse it — at most one Chrome instance at a time.
+    if (chromePortOpen(io)) return .ok;
+
+    // None running — launch the single shared instance, verify, then reap it.
+    const pid = spawnChrome(io) orelse return .launch_failed;
+    defer killChrome(pid, io);
+    var attempt: u32 = 0;
+    while (attempt < 15) : (attempt += 1) {
+        io.sleep(Io.Duration.fromSeconds(1), .awake) catch {};
+        if (chromePortOpen(io)) return .ok;
+    }
+    return .no_devtools;
+}
+
+/// Kill an entire Chrome process tree by matching its unique user-data-dir
+/// marker — reliable where killing a single pid leaves orphaned children.
+fn killChromeByMarker(io: Io, marker: []const u8) void {
+    const argv = [_][]const u8{ "pkill", "-9", "-f", marker };
+    var child = std.process.spawn(io, .{ .argv = &argv, .stdout = .ignore, .stderr = .ignore }) catch return;
+    _ = child.wait(io) catch {};
+}
+
+/// Stop the shared Chrome we launched: graceful SIGTERM → 5s → SIGKILL on the
+/// browser process, then a marker sweep to reap any orphaned children (killing a
+/// single pid leaves Chrome's zygote/gpu/renderer processes behind).
+/// A pid of 0 (or negative) means "reused, not owned by us" — do nothing, so we
+/// never kill a shared instance another daemon owns.
+pub fn killChrome(pid: std.posix.pid_t, io: Io) void {
+    if (pid <= 0) return;
+
+    std.posix.kill(pid, std.c.SIG.TERM) catch {};
+
     var waited: u32 = 0;
+    var alive = true;
     while (waited < 5) : (waited += 1) {
         io.sleep(Io.Duration.fromSeconds(1), .awake) catch {};
-        // Check if process still exists (signal 0 = probe)
-        std.posix.kill(pid, @enumFromInt(0)) catch return; // Process gone
+        std.posix.kill(pid, @enumFromInt(0)) catch {
+            alive = false;
+            break;
+        };
     }
+    if (alive) std.posix.kill(pid, std.c.SIG.KILL) catch {};
 
-    // Force kill if still alive
-    std.posix.kill(pid, std.c.SIG.KILL) catch {};
+    // Reap any children the browser process left behind.
+    killChromeByMarker(io, CHROME_DATA_MARKER);
 }
 
 /// Kill any Chrome processes listening on the debug port.
@@ -626,7 +819,7 @@ fn killOrphanedChrome(io: Io) void {
 
     // Something is listening — find and kill Chrome processes with our data dir.
     // Use pkill matching the user-data-dir to avoid killing unrelated Chrome.
-    const kill_argv = [_][]const u8{ "pkill", "-f", "chrome-headless-bees" };
+    const kill_argv = [_][]const u8{ "pkill", "-f", CHROME_DATA_MARKER };
     var child = std.process.spawn(io, .{
         .argv = &kill_argv,
         .stdout = .ignore,
@@ -653,9 +846,11 @@ fn cleanupChromeTabs(io: Io) void {
     var tab_buf: [65536]u8 = undefined;
     const tab_json = cdpGet(io, addr, "/json", &tab_buf) orelse return;
 
-    // Scan for tab objects: extract "id" and "url" pairs, close non-blank tabs.
+    // Scan for tab objects: extract "id" and "url" pairs, close non-blank tabs
+    // and enforce the tab ceiling — keep at most MAX_CHROME_TABS (blank) tabs.
     var pos: usize = 0;
     var closed: u32 = 0;
+    var kept: u32 = 0;
     while (pos < tab_json.len) {
         const id_key = std.mem.indexOf(u8, tab_json[pos..], "\"id\":\"") orelse break;
         const id_start = pos + id_key + 6;
@@ -673,7 +868,8 @@ fn cleanupChromeTabs(io: Io) void {
             is_blank = std.mem.eql(u8, url, "about:blank");
         }
 
-        if (!is_blank) {
+        // Close non-blank (work) tabs, and any blank tab beyond the cap.
+        if (!is_blank or kept >= MAX_CHROME_TABS) {
             var path_buf: [128]u8 = undefined;
             const close_path = std.fmt.bufPrint(&path_buf, "/json/close/{s}", .{id}) catch {
                 pos = id_start + id_end_rel;
@@ -682,6 +878,8 @@ fn cleanupChromeTabs(io: Io) void {
             var discard_buf: [1024]u8 = undefined;
             _ = cdpGet(io, addr, close_path, &discard_buf);
             closed += 1;
+        } else {
+            kept += 1;
         }
 
         pos = id_start + id_end_rel;

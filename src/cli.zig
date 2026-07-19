@@ -14,6 +14,7 @@ pub const Command = union(enum) {
     run_qa,
     run_user,
     run_researcher,
+    doctor: struct { role: ?[]const u8 = null, probe: bool = false },
     log: struct { follow: bool = false },
     config: OutputOptions,
     tasks: OutputOptions,
@@ -102,6 +103,13 @@ pub fn parse(args: []const []const u8) !Command {
         if (std.mem.eql(u8, sub, "user")) return .run_user;
         if (std.mem.eql(u8, sub, "researcher")) return .run_researcher;
         return error.UnknownRunSubcommand;
+    }
+
+    // Per-role readiness check (dry run): verify each role's backend, tools, and
+    // environment access before a run. Optional positional role name to scope it.
+    if (std.mem.eql(u8, cmd, "doctor") or std.mem.eql(u8, cmd, "check")) {
+        const role: ?[]const u8 = if (args.len >= 3 and !std.mem.startsWith(u8, args[2], "-")) args[2] else null;
+        return .{ .doctor = .{ .role = role, .probe = hasFlag(args[2..], "--probe") } };
     }
 
     // Bare "strategist" as alias for "run strategist"
@@ -211,4 +219,17 @@ test "parse init skip analysis" {
 test "parse status json" {
     const cmd = try parse(&.{ "bees", "status", "--json" });
     try std.testing.expect(cmd.status.json);
+}
+
+test "parse doctor" {
+    const all = try parse(&.{ "bees", "doctor" });
+    try std.testing.expect(all == .doctor);
+    try std.testing.expect(all.doctor.role == null);
+
+    const one = try parse(&.{ "bees", "doctor", "qa" });
+    try std.testing.expectEqualStrings("qa", one.doctor.role.?);
+
+    // `check` is an alias
+    const alias = try parse(&.{ "bees", "check" });
+    try std.testing.expect(alias == .doctor);
 }

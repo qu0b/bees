@@ -39,6 +39,9 @@ pub const ClaudeOptions = struct {
 
     /// Extra environment variables injected into the child process.
     extra_env: ?[]const [2][]const u8 = null,
+
+    /// Send the child's stderr to /dev/null instead of inheriting it.
+    silence_stderr: bool = false,
 };
 
 pub const SessionResult = struct {
@@ -66,6 +69,11 @@ pub const SessionResult = struct {
 pub fn spawnClaude(allocator: std.mem.Allocator, io: Io, options: ClaudeOptions, binary_name: []const u8) !std.process.Child {
     var args: std.ArrayList([]const u8) = .empty;
     defer args.deinit(allocator);
+
+    // Buffer must outlive the spawn() below — the timeout arg slices into it.
+    var timeout_secs_buf: [16]u8 = undefined;
+    const backend_mod = @import("backend.zig");
+    try backend_mod.appendTimeoutPrefix(&args, allocator, options.timeout_secs, &timeout_secs_buf);
 
     try args.append(allocator, binary_name);
 
@@ -157,7 +165,6 @@ pub fn spawnClaude(allocator: std.mem.Allocator, io: Io, options: ClaudeOptions,
 
     try args.append(allocator, options.prompt);
 
-    const backend_mod = @import("backend.zig");
     var env_map = backend_mod.buildFilteredEnvMap(allocator);
     defer env_map.deinit();
 
@@ -173,7 +180,7 @@ pub fn spawnClaude(allocator: std.mem.Allocator, io: Io, options: ClaudeOptions,
         .cwd = .{ .path = options.cwd },
         .environ_map = &env_map,
         .stdout = .pipe,
-        .stderr = .inherit,
+        .stderr = if (options.silence_stderr) .ignore else .inherit,
         .stdin = if (options.stdin_data != null) .pipe else .ignore,
     });
 

@@ -38,7 +38,38 @@ const DaemonState = struct {
     sre_trigger_count: u32 = 0,
     /// PID of the daemon-owned headless Chrome instance (0 = not running).
     chrome_pid: std.posix.pid_t = 0,
+    /// Count of strategist runs, used to route a fraction of them to Codex.
+    strategist_runs: u32 = 0,
 };
+
+/// Deterministic backend split: returns true for a `fraction` (0.0-1.0) of
+/// callers, keyed by a monotonic `counter`. Uses a window of 4 so the requested
+/// 0.25 / 0.5 / 0.75 splits are exact; other fractions are approximated. The
+/// low positions in each window are chosen, so the split is stable, not random.
+fn useCodex(counter: u32, fraction: f64) bool {
+    if (fraction <= 0.0) return false;
+    if (fraction >= 1.0) return true;
+    const pos: f64 = @floatFromInt(counter % 4);
+    return (pos / 4.0) < fraction;
+}
+
+/// Route a fraction of strategist runs to Codex. Mutates `role_cfg` in place,
+/// counting each strategist run via `state.strategist_runs`.
+fn applyStrategistCodex(
+    cfg: config_mod.Config,
+    role_cfg: *role_mod.RoleConfig,
+    state: *DaemonState,
+    logger: *log_mod.Logger,
+) void {
+    const counter = @atomicRmw(u32, &state.strategist_runs, .Add, 1, .monotonic);
+    if (useCodex(counter, cfg.strategist.codex_fraction)) {
+        // Strategist is a thinking/knowledge role → sol at high reasoning.
+        role_cfg.backend = "codex";
+        role_cfg.model = cfg.codex_thinking.model;
+        role_cfg.effort = cfg.codex_thinking.effort;
+        logger.info("[strategist] using Codex ({s}, effort={s})", .{ role_cfg.model, role_cfg.effort });
+    }
+}
 
 /// Global pointer for signal handler (signals can't capture context).
 var g_daemon_state: ?*DaemonState = null;
@@ -105,11 +136,16 @@ pub fn run(
     var state = DaemonState{};
     installSignalHandlers(&state);
 
-    // Spawn daemon-owned headless Chrome for MCP-enabled roles (QA, user agent).
-    // Kills any orphaned Chrome from previous runs, then starts a fresh instance.
+    // Single shared headless Chrome for MCP-enabled roles (QA, user agent). Reuses
+    // an already-running instance if present (pid 0), else launches one; roles
+    // share it via tabs. At most one Chrome instance runs at a time.
     if (backend.spawnChrome(io)) |pid| {
         state.chrome_pid = pid;
-        logger.info("[daemon] Chrome started (pid={d})", .{pid});
+        if (pid == 0) {
+            logger.info("[daemon] reusing existing shared Chrome on :9222", .{});
+        } else {
+            logger.info("[daemon] Chrome started (pid={d})", .{pid});
+        }
     } else {
         logger.warn("[daemon] Chrome failed to start — MCP-enabled roles will not have browser access", .{});
     }
@@ -157,7 +193,7 @@ pub fn run(
 
     // Always run strategist at startup to refresh stale tasks before spawning workers
     logger.info("[daemon] running startup strategist to refresh tasks", .{});
-    runStrategistWithPrep(cfg, paths, store, logger, io, allocator, seed_uuid);
+    runStrategistWithPrep(cfg, paths, store, logger, io, allocator, seed_uuid, &state);
     tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
 
     var preflight_ok = false;
@@ -319,7 +355,7 @@ pub fn run(
                 }
 
                 // Resolve role config — try roles dir, fall back to hardcoded defaults
-                const role_cfg = roles.get(step.role) orelse role_mod.RoleConfig{ .name = step.role };
+                var role_cfg = roles.get(step.role) orelse role_mod.RoleConfig{ .name = step.role };
 
                 // Build context from role's declared sources (including knowledge tags)
                 const resolved = role_mod.resolveContextSources(role_cfg, allocator);
@@ -340,6 +376,9 @@ pub fn run(
                     continue;
                 };
 
+                // Route a fraction of strategist runs to Codex.
+                if (session_type == .strategist) applyStrategistCodex(cfg, &role_cfg, &state, logger);
+
                 // Run through generic executor
                 executor.runRole(
                     role_cfg,
@@ -352,7 +391,7 @@ pub fn run(
                     allocator,
                     step_ctx,
                     false,
-                    cfg.default_backend,
+                    cfg,
                     seed_uuid,
                 ) catch |e| {
                     logger.err("[daemon] {s} failed: {}", .{ step.role, e });
@@ -402,7 +441,7 @@ pub fn run(
 
             if (!pool.hasActiveTasks()) {
                 logger.info("[daemon] all tasks exhausted, running strategist", .{});
-                runStrategistWithPrep(cfg, paths, store, logger, io, allocator, seed_uuid);
+                runStrategistWithPrep(cfg, paths, store, logger, io, allocator, seed_uuid, &state);
                 tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
                 reloadPool(&pool, store, paths.tasks_file, allocator);
             }
@@ -468,8 +507,19 @@ fn spawnWorker(
     else
         0;
 
+    // Route a configurable fraction of workers to the Codex backend. Codex uses
+    // an OpenAI model, so also swap in the codex model for those workers.
+    var worker_cfg = cfg;
+    if (useCodex(wid, cfg.workers.codex_fraction)) {
+        // Workers are defined-execution roles → terra at ultra-high reasoning.
+        worker_cfg.workers.backend = "codex";
+        worker_cfg.workers.model = cfg.codex_execution.model;
+        worker_cfg.workers.effort = cfg.codex_execution.effort;
+        logger.info("[worker:{d}] using Codex ({s}, effort={s})", .{ wid, worker_cfg.workers.model, worker_cfg.workers.effort });
+    }
+
     _ = io.async(workerTask, .{
-        cfg, paths, store, pool, logger, io, wid, allocator, timeout_secs, state, ctx_blob,
+        worker_cfg, paths, store, pool, logger, io, wid, allocator, timeout_secs, state, ctx_blob,
     });
 }
 
@@ -590,7 +640,7 @@ fn drainSreTriggers(
         allocator,
         sre_context,
         false,
-        cfg.default_backend,
+        cfg,
         null, // SRE runs reactively, seed context may be stale
     ) catch |e| {
         logger.err("[sre] fatal: {}", .{e});
@@ -662,18 +712,22 @@ fn runStrategistWithPrep(
     io: Io,
     allocator: std.mem.Allocator,
     seed_uuid: ?[]const u8,
+    state: *DaemonState,
 ) void {
     prepareForStrategist(cfg, paths, logger, io, allocator);
     writeTaskTrends(cfg, paths, store, logger, allocator);
 
     // Load role config for strategist
     const roles = role_mod.loadRoles(paths, allocator) catch return;
-    const role_cfg = roles.get("strategist") orelse role_mod.RoleConfig{
+    var role_cfg = roles.get("strategist") orelse role_mod.RoleConfig{
         .name = "strategist",
-        .model = "opus",
-        .fallback_model = "sonnet",
+        .model = "fable",
+        .fallback_model = "opus",
         .stores_report = true,
     };
+
+    // Route a fraction of strategist runs to Codex.
+    applyStrategistCodex(cfg, &role_cfg, state, logger);
     const resolved = role_mod.resolveContextSources(role_cfg, allocator);
     const strat_extras = ctx.Extras{ .knowledge_tags = resolved.knowledge_tags };
     const context = if (resolved.sources.len > 0)
@@ -695,7 +749,7 @@ fn runStrategistWithPrep(
         allocator,
         context,
         false,
-        cfg.default_backend,
+        cfg,
         seed_uuid,
     ) catch |e| {
         logger.err("[daemon] strategist failed: {}", .{e});
@@ -732,7 +786,8 @@ fn mapRoleToSessionType(name: []const u8) ?types.SessionType {
     if (std.mem.eql(u8, name, "user")) return .user;
     if (std.mem.eql(u8, name, "researcher")) return .researcher;
     if (std.mem.eql(u8, name, "founder")) return .founder;
-    return null; // Unknown role — custom roles get .user type by default
+    if (std.mem.eql(u8, name, "improver")) return .improver;
+    return null; // Unknown role — caller logs and skips the step
 }
 
 fn syncToSqlite(
@@ -859,9 +914,30 @@ fn persistMergeCycle(store: *store_mod.Store, cycle: u32, logger: *log_mod.Logge
 }
 
 /// Reload the task pool, freeing the old one only on success.
+///
+/// Safe to free the old pool here because workers copy the task strings they
+/// need in a suspend-free select()+dupe sequence (worker.zig) and never touch
+/// the pool again — so no in-flight worker holds a pointer into it.
 fn reloadPool(pool: *tasks_mod.TaskPool, store: *store_mod.Store, tasks_file: []const u8, allocator: std.mem.Allocator) void {
     const new_pool = tasks_mod.TaskPool.loadFromStore(store, allocator) catch
         tasks_mod.TaskPool.load(allocator, tasks_file) catch return;
     pool.deinit(allocator);
     pool.* = new_pool;
+}
+
+test "useCodex splits deterministically by fraction" {
+    // 0.5 → 2 of every 4 (positions 0,1); 0.25 → 1 of 4 (position 0).
+    var half: u32 = 0;
+    var quarter: u32 = 0;
+    var i: u32 = 0;
+    while (i < 4) : (i += 1) {
+        if (useCodex(i, 0.5)) half += 1;
+        if (useCodex(i, 0.25)) quarter += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 2), half);
+    try std.testing.expectEqual(@as(u32, 1), quarter);
+
+    // Boundaries: 0.0 never, 1.0 always.
+    try std.testing.expect(!useCodex(0, 0.0));
+    try std.testing.expect(useCodex(3, 1.0));
 }

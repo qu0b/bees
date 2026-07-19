@@ -128,7 +128,15 @@ pub fn runMerger(
     // For each candidate: one Claude agent session reviews the diff AND
     // performs the merge if it approves. The verdict is determined by
     // whether HEAD moved — no text parsing needed.
+    // Merged candidates are finalized (branch deleted, session marked .merged,
+    // task .accepted) ONLY after the build/test/deploy pipeline confirms the
+    // merged base is good. Finalizing earlier means a pipeline failure — which
+    // rolls base back to saved_head — would leave the source branches already
+    // deleted and the sessions falsely marked merged, silently losing the work.
     var merged_count: u32 = 0;
+    var merged_candidates: std.ArrayList(*WorktreeCandidate) = .empty;
+    defer merged_candidates.deinit(allocator);
+
     for (candidates.items) |*candidate| {
         const pre_head = git.getCurrentHead(allocator, io, paths.root) catch continue;
         defer allocator.free(pre_head);
@@ -139,42 +147,51 @@ pub fn runMerger(
         defer allocator.free(post_head);
 
         if (!std.mem.eql(u8, pre_head, post_head)) {
-            // HEAD moved — agent merged the branch
+            // HEAD moved — agent merged the branch. Defer finalization.
             merged_count += 1;
-            if (candidate.worker_session_id) |wsid| {
-                updateWorkerStatus(store, wsid, .merged) catch {};
-                const txn = store.beginWriteTxn() catch null;
-                if (txn) |t| {
-                    const rh = types.ReviewHeader{ .verdict = .accept, .review_session_id = @truncate(candidate.session_id orelse 0), .reviewed_at = @truncate(fs.timestamp()) };
-                    store.insertReview(t, wsid, rh, "Merged by review agent") catch {};
-                    store_mod.Store.commitTxn(t) catch {};
-                }
-                incrementWorkerTaskStat(store, wsid, .accepted);
-            }
-            cleanupWorktree(allocator, io, paths.root, candidate);
-            logger.info("[merger] merged and cleaned up {s}", .{candidate.branch});
+            merged_candidates.append(allocator, candidate) catch {};
         } else {
-            // HEAD unchanged — agent rejected or failed to merge
+            // HEAD unchanged — agent rejected or failed to merge. Nothing was
+            // merged, so this is safe to finalize immediately.
             logger.info("[merger] {s}: not merged (rejected or failed)", .{candidate.branch});
             writeMarker(allocator, candidate.dir, ".rejected");
             if (candidate.worker_session_id) |wsid| {
                 updateWorkerStatus(store, wsid, .rejected) catch {};
-                const txn = store.beginWriteTxn() catch null;
-                if (txn) |t| {
-                    const rh = types.ReviewHeader{ .verdict = .reject, .review_session_id = @truncate(candidate.session_id orelse 0), .reviewed_at = @truncate(fs.timestamp()) };
-                    store.insertReview(t, wsid, rh, "Rejected by review agent") catch {};
-                    store_mod.Store.commitTxn(t) catch {};
-                }
+                recordReview(store, candidate, wsid, .reject, "Rejected by review agent");
                 incrementWorkerTaskStat(store, wsid, .rejected);
             }
         }
     }
 
-    if (merged_count > 0) {
-        // Build, test, deploy pipeline
-        const pipeline_ok = try runPipeline(cfg, paths, store, logger, io, saved_head, allocator);
-        if (!pipeline_ok) {
-            logger.warn("[merger] pipeline failed, changes rolled back to {s}", .{saved_head[0..@min(saved_head.len, 12)]});
+    // Run the pipeline BEFORE finalizing any merge. A pipeline error is treated
+    // as failure (rolled back) so we never finalize on an unverified base.
+    const pipeline_ok = if (merged_count > 0)
+        (runPipeline(cfg, paths, store, logger, io, saved_head, allocator) catch false)
+    else
+        true;
+    if (merged_count > 0 and !pipeline_ok) {
+        logger.warn("[merger] pipeline failed, changes rolled back to {s}", .{saved_head[0..@min(saved_head.len, 12)]});
+    }
+
+    for (merged_candidates.items) |candidate| {
+        if (pipeline_ok) {
+            if (candidate.worker_session_id) |wsid| {
+                updateWorkerStatus(store, wsid, .merged) catch {};
+                recordReview(store, candidate, wsid, .accept, "Merged by review agent");
+                incrementWorkerTaskStat(store, wsid, .accepted);
+            }
+            cleanupWorktree(allocator, io, paths.root, candidate);
+            logger.info("[merger] merged and cleaned up {s}", .{candidate.branch});
+        } else {
+            // Pipeline failed and base was rolled back — the merge is undone.
+            // KEEP the branch (work is preserved for a retry) and mark rejected.
+            writeMarker(allocator, candidate.dir, ".rejected");
+            if (candidate.worker_session_id) |wsid| {
+                updateWorkerStatus(store, wsid, .rejected) catch {};
+                recordReview(store, candidate, wsid, .reject, "Reverted: post-merge pipeline failed");
+                incrementWorkerTaskStat(store, wsid, .rejected);
+            }
+            logger.info("[merger] {s}: kept branch after pipeline rollback", .{candidate.branch});
         }
     }
 
@@ -319,7 +336,7 @@ fn reviewAndMerge(
     updated_header.has_cost = true;
     updated_header.cost_microdollars = result.cost_microdollars;
     updated_header.finished_at = @truncate(fs.timestamp());
-    updated_header.duration_ms = @intCast(@min((fs.timestamp() - now) * 1000, std.math.maxInt(u32)));
+    updated_header.duration_ms = @intCast(@min((fs.timestamp() -| now) * 1000, std.math.maxInt(u32)));
     updated_header.num_turns = result.num_turns;
     updated_header.has_tokens = (result.input_tokens > 0 or result.output_tokens > 0);
     updated_header.input_tokens = result.input_tokens;
@@ -514,6 +531,28 @@ fn cleanupWorktree(allocator: std.mem.Allocator, io: Io, repo_path: []const u8, 
     git.deleteBranch(allocator, io, repo_path, candidate.branch) catch {};
 }
 
+/// Record a review verdict for a worker session in LMDB. Best-effort.
+fn recordReview(
+    store: *store_mod.Store,
+    candidate: *const WorktreeCandidate,
+    wsid: u64,
+    verdict: types.Verdict,
+    msg: []const u8,
+) void {
+    var txn_opt = store.beginWriteTxn() catch return;
+    const t = txn_opt orelse return;
+    const rh = types.ReviewHeader{
+        .verdict = verdict,
+        .review_session_id = @truncate(candidate.session_id orelse 0),
+        .reviewed_at = @truncate(fs.timestamp()),
+    };
+    store.insertReview(t, wsid, rh, msg) catch {
+        store_mod.Store.abortTxn(t);
+        return;
+    };
+    store_mod.Store.commitTxnConsume(&txn_opt) catch {};
+}
+
 fn writeMarker(allocator: std.mem.Allocator, dir_path: []const u8, name: []const u8) void {
     const path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, name }) catch return;
     defer allocator.free(path);
@@ -529,10 +568,23 @@ fn cleanupOldWorktrees(
     worktree_base: []const u8,
     allocator: std.mem.Allocator,
 ) !void {
-    // 1. Clean worktree directories with failure markers
+    // 1. Clean worktree directories with failure markers.
+    //
+    // A worktree that a live worker is still building has no marker at all yet
+    // (the worker writes .done only on completion). Deleting such a dir destroys
+    // that worker's in-progress work and leaves its session flailing in a removed
+    // cwd. So only remove:
+    //   - dirs with merger-written terminal markers (.rejected/.conflict/
+    //     .build-failed) — the merger already finished processing them; or
+    //   - dirs with no .done that are STALE (older than timeouts.stale_hours),
+    //     i.e. abandoned by a crashed/never-finished worker. A recent no-.done
+    //     dir is presumed to be an actively-running worker and is left alone.
     {
         var dir = fs.openDir(worktree_base) catch return;
         defer fs.closeDir(dir);
+
+        const now: u64 = fs.timestamp();
+        const stale_cutoff = now -| (@as(u64, cfg.timeouts.stale_hours) * 3600);
 
         var it = dir.iterate();
         while (try it.next(io)) |entry| {
@@ -545,13 +597,21 @@ fn cleanupOldWorktrees(
             const has_conflict = hasFile(allocator, wt_dir, ".conflict");
             const has_build_failed = hasFile(allocator, wt_dir, ".build-failed");
             const has_done = hasFile(allocator, wt_dir, ".done");
+            const terminal = has_rejected or has_conflict or has_build_failed;
 
-            if (has_rejected or has_conflict or has_build_failed or !has_done) {
+            // Is this a stale, unfinished worktree (safe to reclaim)?
+            const stale_unfinished = !has_done and blk: {
+                const wt_time = parseWorktreeTimestamp(entry.name) orelse
+                    break :blk false; // unparseable age → be conservative, keep it
+                break :blk wt_time < stale_cutoff;
+            };
+
+            if (terminal or stale_unfinished) {
                 const branch = std.fmt.allocPrint(allocator, "bee/{s}/{s}", .{ cfg.project.name, entry.name }) catch continue;
                 defer allocator.free(branch);
                 git.removeWorktree(allocator, io, paths.root, wt_dir) catch {};
                 git.deleteBranch(allocator, io, paths.root, branch) catch {};
-                logger.info("[merger] cleaned old worktree {s}", .{entry.name});
+                logger.info("[merger] cleaned old worktree {s} (terminal={}, stale={})", .{ entry.name, terminal, stale_unfinished });
             }
         }
     }

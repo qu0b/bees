@@ -15,6 +15,7 @@ pub const SessionType = enum(u4) {
     user = 8,
     researcher = 9,
     founder = 10,
+    improver = 11,
 
     pub fn label(self: SessionType) []const u8 {
         return switch (self) {
@@ -29,6 +30,7 @@ pub const SessionType = enum(u4) {
             .user => "user",
             .researcher => "researcher",
             .founder => "founder",
+            .improver => "improver",
         };
     }
 };
@@ -189,11 +191,12 @@ pub const Role = enum(u2) {
     }
 };
 
-pub const ModelType = enum(u2) {
+pub const ModelType = enum(u3) {
     opus = 0,
     sonnet = 1,
     haiku = 2,
     other = 3,
+    fable = 4,
 
     pub fn label(self: ModelType) []const u8 {
         return switch (self) {
@@ -201,6 +204,7 @@ pub const ModelType = enum(u2) {
             .sonnet => "sonnet",
             .haiku => "haiku",
             .other => "other",
+            .fable => "fable",
         };
     }
 
@@ -208,6 +212,7 @@ pub const ModelType = enum(u2) {
         if (std.mem.eql(u8, s, "opus")) return .opus;
         if (std.mem.eql(u8, s, "haiku")) return .haiku;
         if (std.mem.eql(u8, s, "sonnet")) return .sonnet;
+        if (std.mem.eql(u8, s, "fable")) return .fable;
         return .other;
     }
 };
@@ -411,7 +416,7 @@ pub const SessionHeader = packed struct(u384) {
     result_subtype: ResultSubtype = .unknown,
     stop_reason: StopReason = .unknown,
     duration_api_ms: u32 = 0,
-    _pad: u10 = 0, // Reduced from u11 after SessionType u3→u4
+    _pad: u9 = 0, // Reduced from u10 after ModelType u2→u3 (added .fable)
 
     comptime {
         assert(@sizeOf(SessionHeader) == 48);
