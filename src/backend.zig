@@ -211,24 +211,19 @@ pub const max_argv_prompt_bytes: usize = 100_000;
 
 fn spawn(backend: types.BackendType, allocator: std.mem.Allocator, io: Io, options: BackendOptions, claude_binary: []const u8, pi_binary: []const u8) !std.process.Child {
     var opts = options;
-    if (opts.prompt.len > max_argv_prompt_bytes) {
-        switch (backend) {
-            .claude, .codex => {
-                // Move the oversized prompt to stdin. If a stdin payload already
-                // exists, prepend the prompt so the model sees prompt-then-data.
-                opts.stdin_data = if (options.stdin_data) |sd|
-                    try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ options.prompt, sd })
-                else
-                    options.prompt;
-                opts.prompt = if (backend == .codex)
-                    "-" // codex exec convention: read the prompt from stdin
-                else
-                    "Your full instructions and context are provided via stdin. Read them and proceed.";
-            },
-            // opencode/pi stdin semantics are unverified — keep argv and let a
-            // genuinely oversized prompt fail loudly rather than silently alter it.
-            .opencode, .pi => {},
-        }
+    if (opts.prompt.len > max_argv_prompt_bytes and backend == .claude) {
+        // Move the oversized prompt to stdin — the Claude CLI reads piped stdin
+        // as user input alongside the argv prompt. If a stdin payload already
+        // exists, prepend the prompt so the model sees prompt-then-data.
+        // Codex handles its own overflow inside spawnCodex (it composes the
+        // final prompt from files there, and its stdin marker must be a bare
+        // final argv of exactly "-"). opencode/pi stdin semantics are
+        // unverified — those fail loudly rather than being silently altered.
+        opts.stdin_data = if (options.stdin_data) |sd|
+            try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ options.prompt, sd })
+        else
+            options.prompt;
+        opts.prompt = "Your full instructions and context are provided via stdin. Read them and proceed.";
     }
     return spawnResolved(backend, allocator, io, opts, claude_binary, pi_binary);
 }

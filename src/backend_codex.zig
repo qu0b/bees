@@ -33,7 +33,20 @@ pub fn spawnCodex(allocator: std.mem.Allocator, io: Io, options: backend.Backend
 
     // Codex has no system prompt file flag — prepend/append to prompt text
     const combined = try backend.buildPromptWithFiles(allocator, options.prompt, options.system_prompt_file, options.append_prompt_file);
-    try args.append(allocator, combined);
+
+    // Oversized prompts can't ride argv (execve E2BIG past MAX_ARG_STRLEN).
+    // `codex exec -` reads the prompt from stdin; the marker must be exactly
+    // the bare final positional (no `--`, nothing appended to it).
+    var stdin_payload: ?[]const u8 = options.stdin_data;
+    if (combined.len > backend.max_argv_prompt_bytes) {
+        stdin_payload = if (options.stdin_data) |sd|
+            try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ combined, sd })
+        else
+            combined;
+        try args.append(allocator, "-");
+    } else {
+        try args.append(allocator, combined);
+    }
 
     var env_map = backend.buildFilteredEnvMap(allocator);
     defer env_map.deinit();
@@ -44,10 +57,10 @@ pub fn spawnCodex(allocator: std.mem.Allocator, io: Io, options: backend.Backend
         .environ_map = &env_map,
         .stdout = .pipe,
         .stderr = if (options.silence_stderr) .ignore else .inherit,
-        .stdin = if (options.stdin_data != null) .pipe else .ignore,
+        .stdin = if (stdin_payload != null) .pipe else .ignore,
     });
 
-    backend.writeStdinAndClose(&child, io, options.stdin_data);
+    backend.writeStdinAndClose(&child, io, stdin_payload);
     return child;
 }
 
