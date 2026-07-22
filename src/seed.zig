@@ -452,13 +452,15 @@ fn writeSeedJsonl(
     ) catch return false;
     out.append(allocator, '\n') catch {};
 
-    // Line 3: assistant acknowledgment
+    // Line 3: assistant acknowledgment. The message id MUST be `msg_`-prefixed:
+    // the CLI forwards it to the API as diagnostics.previous_message_id, which
+    // validates the format (400 otherwise, killing every seed-forked session).
     out.appendSlice(allocator,
         \\{"parentUuid":"
     ) catch return false;
     out.appendSlice(allocator, &msg1_uuid) catch return false;
     out.appendSlice(allocator,
-        \\","isSidechain":false,"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I've reviewed the project source code and understand the codebase structure, architecture, and implementation details. I'm ready to work on tasks."}],"model":"claude-sonnet-4-5-20241022","id":"synth_msg_001","stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":25}},"requestId":"synth_req_001","uuid":"
+        \\","isSidechain":false,"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"I've reviewed the project source code and understand the codebase structure, architecture, and implementation details. I'm ready to work on tasks."}],"model":"claude-sonnet-4-5-20241022","id":"msg_01BeesSeedSynthetic00001","stop_reason":"end_turn","usage":{"input_tokens":0,"output_tokens":25}},"requestId":"synth_req_001","uuid":"
     ) catch return false;
     out.appendSlice(allocator, &msg2_uuid) catch return false;
     out.appendSlice(allocator,
