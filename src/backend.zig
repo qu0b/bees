@@ -201,7 +201,39 @@ pub fn resolveBackend(default_backend: []const u8, role_backend: []const u8) typ
 }
 
 /// Dispatch spawn to the appropriate backend.
+/// Max bytes of prompt passed as a single argv string. Linux caps each argv
+/// string at MAX_ARG_STRLEN (32 pages = 128 KiB); exceeding it makes execve fail
+/// E2BIG, surfacing as error.SystemResources with no syscall visible in the
+/// parent. Prompts above this are delivered via stdin instead (both the Claude
+/// and Codex CLIs read piped stdin as user input). Margin below 128 KiB left
+/// for the rest of argv.
+pub const max_argv_prompt_bytes: usize = 100_000;
+
 fn spawn(backend: types.BackendType, allocator: std.mem.Allocator, io: Io, options: BackendOptions, claude_binary: []const u8, pi_binary: []const u8) !std.process.Child {
+    var opts = options;
+    if (opts.prompt.len > max_argv_prompt_bytes) {
+        switch (backend) {
+            .claude, .codex => {
+                // Move the oversized prompt to stdin. If a stdin payload already
+                // exists, prepend the prompt so the model sees prompt-then-data.
+                opts.stdin_data = if (options.stdin_data) |sd|
+                    try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ options.prompt, sd })
+                else
+                    options.prompt;
+                opts.prompt = if (backend == .codex)
+                    "-" // codex exec convention: read the prompt from stdin
+                else
+                    "Your full instructions and context are provided via stdin. Read them and proceed.";
+            },
+            // opencode/pi stdin semantics are unverified — keep argv and let a
+            // genuinely oversized prompt fail loudly rather than silently alter it.
+            .opencode, .pi => {},
+        }
+    }
+    return spawnResolved(backend, allocator, io, opts, claude_binary, pi_binary);
+}
+
+fn spawnResolved(backend: types.BackendType, allocator: std.mem.Allocator, io: Io, options: BackendOptions, claude_binary: []const u8, pi_binary: []const u8) !std.process.Child {
     return switch (backend) {
         .claude => claude.spawnClaude(allocator, io, .{
             .prompt = options.prompt,
