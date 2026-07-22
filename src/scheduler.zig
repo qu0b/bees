@@ -32,6 +32,12 @@ fn writeDaemonUnit(allocator: std.mem.Allocator, systemd_dir: []const u8, projec
     const file = try fs.createFile(filename, .{});
     defer fs.closeFile(file);
 
+    // Bake the invoking shell's PATH into the unit: systemd user units get a
+    // bare default PATH (/usr/bin:/bin), so agent CLIs installed in ~/.local/bin,
+    // ~/.bun/bin, nvm, etc. would be FileNotFound at spawn time. Capturing the
+    // PATH from `bees start` reproduces the environment the user tested with.
+    const path_env = if (std.c.getenv("PATH")) |p| std.mem.sliceTo(p, 0) else "/usr/local/bin:/usr/bin:/bin";
+
     try fs.filePrint(file,
         \\[Unit]
         \\Description={s}
@@ -40,9 +46,11 @@ fn writeDaemonUnit(allocator: std.mem.Allocator, systemd_dir: []const u8, projec
         \\[Service]
         \\Type=simple
         \\WorkingDirectory={s}
+        \\Environment="PATH={s}"
         \\ExecStart={s}
         \\Restart=always
         \\RestartSec=30
+        \\TimeoutStopSec=30
         \\
         \\[Install]
         \\WantedBy=default.target
@@ -50,6 +58,7 @@ fn writeDaemonUnit(allocator: std.mem.Allocator, systemd_dir: []const u8, projec
     , .{
         opts.description,
         opts.working_directory,
+        path_env,
         opts.exec_start,
     });
 }
