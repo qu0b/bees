@@ -97,6 +97,59 @@ pub fn sleep_secs(io: Io, secs: u64) void {
     io.sleep(Io.Duration.fromSeconds(@intCast(secs)), .awake) catch {};
 }
 
+/// Sleep that wakes early on shutdown. Long uninterruptible sleeps (300s
+/// cooldown, quiet hours) made the daemon ignore SIGTERM for minutes, so every
+/// `systemctl stop` escalated to the 30s cgroup KILL even when idle.
+fn sleepInterruptible(io: Io, state: *DaemonState, secs: u64) void {
+    var left = secs;
+    while (left > 0 and @atomicLoad(u32, &state.shutdown_requested, .acquire) == 0) {
+        const chunk = @min(left, 2);
+        sleep_secs(io, chunk);
+        left -= chunk;
+    }
+}
+
+/// Green thread armed at startup: when shutdown is requested, give in-flight
+/// agent sessions a short grace period, then SIGTERM (and finally SIGKILL) the
+/// registered agent child processes. This is what makes shutdown finish inside
+/// systemd's TimeoutStopSec: sessions run minutes-to-hours and nothing else
+/// ever signals them — and because this runs concurrently, it also unblocks a
+/// shutdown that arrives while a session occupies the main loop.
+fn shutdownWatchdog(io: Io, state: *DaemonState, logger: *log_mod.Logger) void {
+    while (@atomicLoad(u32, &state.shutdown_requested, .acquire) == 0) {
+        sleep_secs(io, 1);
+    }
+    // Keep signaling every second, not one-shot: sessions spawned AFTER a
+    // signaling round (e.g. by startup code that was mid-sequence when the
+    // signal arrived) must also be caught, or the drain times out and systemd
+    // KILLs the cgroup anyway. Repeat-signaling an already-dying pid is
+    // harmless; grace 0-6s, TERM 6-14s, KILL beyond.
+    var t: u32 = 0;
+    var logged_term = false;
+    var logged_kill = false;
+    while (t < 60) : (t += 1) {
+        sleep_secs(io, 1);
+        // No children left → done. (Startup/refill are gated on the shutdown
+        // flag, so no new agents can appear after this point; exiting promptly
+        // matters because lingering green threads block process exit — the io
+        // runtime joins all async tasks before the process can terminate.)
+        if (!backend.hasActiveChildren()) return;
+        if (t >= 14) {
+            const n = backend.signalActiveChildren(.kill);
+            if (n > 0 and !logged_kill) {
+                logger.warn("[daemon] shutdown: SIGKILL to {d} unresponsive agent process(es)", .{n});
+                logged_kill = true;
+            }
+        } else if (t >= 6) {
+            const n = backend.signalActiveChildren(.term);
+            if (n > 0 and !logged_term) {
+                logger.warn("[daemon] shutdown: SIGTERM to {d} in-flight agent process(es)", .{n});
+                logged_term = true;
+            }
+        }
+    }
+}
+
 /// Returns true if current UTC time is within the configured quiet window.
 /// During quiet hours the daemon suppresses new work to conserve usage quota.
 fn isQuietHour(daemon: config_mod.Config.Daemon) bool {
@@ -135,6 +188,13 @@ pub fn run(
 
     var state = DaemonState{};
     installSignalHandlers(&state);
+    // Concurrent shutdown watchdog: signals in-flight agent children after a
+    // grace period so stops complete inside systemd's TimeoutStopSec. The
+    // future is canceled on exit — the io runtime joins every async task before
+    // the process can terminate, so an immortal green thread turns a clean
+    // "shutdown complete" into a hang that systemd resolves with SIGKILL.
+    var watchdog_future = io.async(shutdownWatchdog, .{ io, &state, logger });
+    defer _ = watchdog_future.cancel(io);
 
     // Single shared headless Chrome for MCP-enabled roles (QA, user agent). Reuses
     // an already-running instance if present (pid 0), else launches one; roles
@@ -150,9 +210,15 @@ pub fn run(
         logger.warn("[daemon] Chrome failed to start — MCP-enabled roles will not have browser access", .{});
     }
 
-    // Start REST API server as a background green thread
+    // Start REST API server as a background green thread. Canceled on exit for
+    // the same reason as the watchdog: its accept loop never returns on its
+    // own and would block process termination.
+    var api_future: ?Io.Future(void) = null;
+    defer if (api_future) |*f| {
+        _ = f.cancel(io);
+    };
     if (cfg.api.enabled) {
-        _ = io.async(api.startApiServer, .{
+        api_future = io.async(api.startApiServer, .{
             store, cfg, paths, logger, io, allocator, cfg.api.port,
         });
         logger.info("[daemon] API server started on port {d}", .{cfg.api.port});
@@ -175,8 +241,8 @@ pub fn run(
             cfg.daemon.quiet_start_utc.?,                        cfg.daemon.quiet_end_utc.?,
             if (cfg.daemon.quiet_weekdays_only) "yes" else "no",
         });
-        while (isQuietHour(cfg.daemon)) {
-            sleep_secs(io, 300);
+        while (isQuietHour(cfg.daemon) and @atomicLoad(u32, &state.shutdown_requested, .acquire) == 0) {
+            sleepInterruptible(io, &state, 300);
         }
         logger.info("[daemon] quiet hours ended, resuming", .{});
     }
@@ -191,10 +257,22 @@ pub fn run(
         logger.info("[daemon] seed session disabled or failed, using standard prompts", .{});
     }
 
-    // Always run strategist at startup to refresh stale tasks before spawning workers
-    logger.info("[daemon] running startup strategist to refresh tasks", .{});
-    runStrategistWithPrep(cfg, paths, store, logger, io, allocator, seed_uuid, &state);
-    tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
+    // Run the startup strategist only when the task pool is empty. Running it
+    // unconditionally burned a full strategist session (minutes + quota) on
+    // every restart even when tasks.json was fresh — the scheduled strategist
+    // (every N merge cycles) keeps tasks current once the daemon is running.
+    {
+        const startup_pool = tasks_mod.TaskPool.loadFromStore(store, allocator) catch
+            tasks_mod.TaskPool.load(allocator, paths.tasks_file) catch null;
+        const have_tasks = if (startup_pool) |sp| sp.hasActiveTasks() else false;
+        if (have_tasks) {
+            logger.info("[daemon] active tasks present, skipping startup strategist", .{});
+        } else if (@atomicLoad(u32, &state.shutdown_requested, .acquire) == 0) {
+            logger.info("[daemon] no active tasks, running startup strategist", .{});
+            runStrategistWithPrep(cfg, paths, store, logger, io, allocator, seed_uuid, &state);
+            tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
+        }
+    }
 
     var preflight_ok = false;
 
@@ -234,8 +312,10 @@ pub fn run(
             logger.warn("[daemon] no active tasks after startup strategist, waiting for SRE/manual intervention", .{});
         }
 
-        // Spawn initial workers as green threads
-        if (pool.hasActiveTasks()) {
+        // Spawn initial workers as green threads — unless a shutdown request
+        // arrived during the startup sequence (spawning after the signal used
+        // to guarantee a drain timeout + systemd KILL).
+        if (pool.hasActiveTasks() and @atomicLoad(u32, &state.shutdown_requested, .acquire) == 0) {
             const spawn_count = @min(cfg.workers.count, MAX_WORKERS);
             for (0..spawn_count) |_| {
                 spawnWorker(cfg, paths, store, pool, logger, io, allocator, &state, context_blob);
@@ -249,7 +329,7 @@ pub fn run(
     var was_quiet = false;
     var consecutive_empty_merges: u32 = 0;
     while (@atomicLoad(u32, &state.shutdown_requested, .acquire) == 0) {
-        sleep_secs(io, 10);
+        sleepInterruptible(io, &state, 10);
 
         // Graceful shutdown: stop spawning, wait for running workers to drain
         if (@atomicLoad(u32, &state.shutdown_requested, .acquire) != 0) break;
@@ -260,7 +340,7 @@ pub fn run(
                 logger.info("[daemon] entering quiet hours, pausing new work", .{});
                 was_quiet = true;
             }
-            sleep_secs(io, 300);
+            sleepInterruptible(io, &state, 300);
             continue;
         }
         if (was_quiet) {
@@ -305,6 +385,7 @@ pub fn run(
                 // stays stopped for operator attention.
                 if (cfg.daemon.max_sterile_cycles > 0 and consecutive_empty_merges >= cfg.daemon.max_sterile_cycles) {
                     logger.err("[daemon] circuit breaker TRIPPED after {d} sterile cycles — halting. Investigate (bees sessions / bees log), then restart with `bees start`.", .{consecutive_empty_merges});
+                    gracefulDrain(&state, logger, io, allocator);
                     return .halt;
                 }
             } else {
@@ -415,9 +496,10 @@ pub fn run(
             // Sync LMDB → SQLite for dashboard
             syncToSqlite(paths, store, logger, allocator);
 
-            // Cooldown
+            // Cooldown (interruptible — a stop during cooldown used to be
+            // ignored for up to cooldown_secs and always ended in a KILL)
             logger.info("[daemon] cooling down for {d}s", .{cfg.daemon.cooldown_secs});
-            sleep_secs(io, @as(u64, cfg.daemon.cooldown_secs));
+            sleepInterruptible(io, &state, @as(u64, cfg.daemon.cooldown_secs));
 
             // Sync tasks.json into LMDB and reload from store
             tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
@@ -454,8 +536,9 @@ pub fn run(
                 reloadPool(&pool, store, paths.tasks_file, allocator);
             }
 
-            // Refill workers (only if there's work to do)
-            if (pool.hasActiveTasks()) {
+            // Refill workers (only if there's work to do and no shutdown is in
+            // progress — the cooldown sleep above returns early on shutdown)
+            if (pool.hasActiveTasks() and @atomicLoad(u32, &state.shutdown_requested, .acquire) == 0) {
                 const current_active = @atomicLoad(u32, &state.active_count, .acquire);
                 const need = @min(cfg.workers.count, MAX_WORKERS) -| current_active;
                 if (need > 0) {
@@ -470,21 +553,36 @@ pub fn run(
         }
     }
 
-    // Graceful shutdown: wait for running workers to finish
-    logger.info("[daemon] shutdown requested, waiting for {d} active workers to finish...", .{
-        @atomicLoad(u32, &state.active_count, .acquire),
-    });
-    var shutdown_wait: u32 = 0;
-    const shutdown_timeout: u32 = 300; // 5 minutes max wait
-    while (@atomicLoad(u32, &state.active_count, .acquire) > 0 and shutdown_wait < shutdown_timeout) {
-        sleep_secs(io, 5);
-        shutdown_wait += 5;
+    gracefulDrain(&state, logger, io, allocator);
+    logger.info("[daemon] shutdown complete", .{});
+    return .shutdown;
+}
+
+/// Drain in-flight workers and release Chrome — the common tail of every way
+/// the daemon can end (shutdown, circuit-breaker halt). The watchdog TERMs
+/// agent children ~8s after shutdown_requested is set, so this drain completes
+/// in seconds rather than racing systemd's stop timeout.
+fn gracefulDrain(state: *DaemonState, logger: *log_mod.Logger, io: Io, allocator: std.mem.Allocator) void {
+    // Ensure the watchdog fires even when we get here without a signal
+    // (circuit-breaker halt sets no flag).
+    @atomicStore(u32, &state.shutdown_requested, 1, .release);
+
+    const active = @atomicLoad(u32, &state.active_count, .acquire);
+    if (active > 0) {
+        logger.info("[daemon] draining {d} active worker(s)...", .{active});
+    }
+    var waited: u32 = 0;
+    const drain_timeout: u32 = 25; // watchdog TERMs at ~8s, KILLs at ~16s
+    while (@atomicLoad(u32, &state.active_count, .acquire) > 0 and waited < drain_timeout) {
+        sleep_secs(io, 1);
+        waited += 1;
     }
     if (@atomicLoad(u32, &state.active_count, .acquire) > 0) {
-        logger.warn("[daemon] shutdown timeout, {d} workers still active", .{
+        logger.warn("[daemon] drain timeout, {d} worker task(s) still active", .{
             @atomicLoad(u32, &state.active_count, .acquire),
         });
     }
+
     // Kill daemon-owned Chrome; for a merely-reused instance (pid 0), sweep it
     // only if we are the last bees daemon standing.
     if (state.chrome_pid != 0) {
@@ -493,9 +591,6 @@ pub fn run(
     } else if (backend.stopSharedChromeIfOrphaned(allocator, io)) {
         logger.info("[daemon] stopped shared Chrome (last daemon out)", .{});
     }
-
-    logger.info("[daemon] shutdown complete", .{});
-    return .shutdown;
 }
 
 /// Spawn a single worker as an async green thread.

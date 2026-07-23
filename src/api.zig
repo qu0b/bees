@@ -49,9 +49,14 @@ fn runServer(
     logger.info("[api] HTTP server listening on {s}:{d}", .{ bind_addr, port });
 
     while (true) {
-        var stream = server.accept(io) catch |e| {
-            logger.warn("[api] accept error: {}", .{e});
-            continue;
+        var stream = server.accept(io) catch |e| switch (e) {
+            // Daemon shutdown cancels this task; swallowing Canceled here spins
+            // the loop forever and blocks process exit (systemd then SIGKILLs).
+            error.Canceled => return,
+            else => {
+                logger.warn("[api] accept error: {}", .{e});
+                continue;
+            },
         };
 
         handleConnection(stream, store, cfg, paths, logger, io, allocator, &sql_db);

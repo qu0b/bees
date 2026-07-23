@@ -174,6 +174,56 @@ pub const ResultAccumulator = struct {
     duration_api_ms: u32 = 0,
 };
 
+// ── Active agent child registry ──────────────────────────────────────────
+// Every agent CLI process spawned by runSession registers its pid here so the
+// daemon's shutdown watchdog can signal in-flight agents. Without this, no one
+// ever signals the children: sessions run minutes-to-hours, the drain never
+// completes inside systemd's TimeoutStopSec window, and every stop ends in a
+// cgroup SIGKILL with sessions left as stale "running" rows.
+
+var active_children: [2 * 64]std.posix.pid_t = [_]std.posix.pid_t{0} ** (2 * 64);
+
+fn registerChild(pid: std.posix.pid_t) void {
+    if (pid <= 0) return;
+    for (&active_children) |*slot| {
+        if (@cmpxchgStrong(std.posix.pid_t, slot, 0, pid, .acq_rel, .monotonic) == null) return;
+    }
+    // Registry full — the child simply won't receive a shutdown signal.
+}
+
+fn unregisterChild(pid: std.posix.pid_t) void {
+    if (pid <= 0) return;
+    for (&active_children) |*slot| {
+        if (@cmpxchgStrong(std.posix.pid_t, slot, pid, 0, .acq_rel, .monotonic) == null) return;
+    }
+}
+
+pub fn hasActiveChildren() bool {
+    for (&active_children) |*slot| {
+        if (@atomicLoad(std.posix.pid_t, slot, .acquire) != 0) return true;
+    }
+    return false;
+}
+
+pub const ChildSignal = enum { term, kill };
+
+/// Signal every registered agent child. Returns how many were signaled.
+/// TERM lets the CLIs shut down cleanly (flush transcripts, mark sessions);
+/// KILL is the follow-up for stragglers.
+pub fn signalActiveChildren(sig: ChildSignal) u32 {
+    var n: u32 = 0;
+    for (&active_children) |*slot| {
+        const pid = @atomicLoad(std.posix.pid_t, slot, .acquire);
+        if (pid == 0) continue;
+        switch (sig) {
+            .term => std.posix.kill(pid, std.c.SIG.TERM) catch continue,
+            .kill => std.posix.kill(pid, std.c.SIG.KILL) catch continue,
+        }
+        n += 1;
+    }
+    return n;
+}
+
 /// Saturating f64 → u32 for numbers parsed from untrusted child stdout.
 /// A malformed value (e.g. "input_tokens":1e300, inf, or NaN) must never
 /// reach `@intFromFloat` directly — that is checked illegal behavior and
@@ -435,6 +485,11 @@ pub fn runSession(
     assert(options.cwd.len > 0);
 
     var child = try spawn(options.backend, allocator, io, options, claude_binary, pi_binary);
+    // Register for the daemon's shutdown watchdog; always unregister on exit.
+    // Capture the pid locally — wait() may clear child.id before the defer runs.
+    const child_pid: std.posix.pid_t = child.id orelse 0;
+    if (child_pid > 0) registerChild(child_pid);
+    defer if (child_pid > 0) unregisterChild(child_pid);
 
     // Set up stdout writer for streaming mode
     var stream_buf: [8192]u8 = undefined;
