@@ -23,7 +23,7 @@ const backend = @import("backend.zig");
 const seed_mod = @import("seed.zig");
 
 /// Returned by `run` to tell the caller how the daemon loop ended.
-pub const DaemonAction = enum { shutdown, reload };
+pub const DaemonAction = enum { shutdown, reload, halt };
 
 /// Shared daemon state — accessed via atomics for cross-green-thread safety.
 const DaemonState = struct {
@@ -298,6 +298,14 @@ pub fn run(
                 consecutive_empty_merges += 1;
                 if (consecutive_empty_merges >= 3) {
                     logger.err("[daemon] circuit breaker: {d} consecutive cycles with 0 accepted merges", .{consecutive_empty_merges});
+                }
+                // Halt outright on systemic failure: every cycle burns agent
+                // budget on work that never lands. Detect-and-log-only cost a
+                // 5h sterile run (24 cycles) once; now the daemon stops and
+                // stays stopped for operator attention.
+                if (cfg.daemon.max_sterile_cycles > 0 and consecutive_empty_merges >= cfg.daemon.max_sterile_cycles) {
+                    logger.err("[daemon] circuit breaker TRIPPED after {d} sterile cycles — halting. Investigate (bees sessions / bees log), then restart with `bees start`.", .{consecutive_empty_merges});
+                    return .halt;
                 }
             } else {
                 consecutive_empty_merges = 0;

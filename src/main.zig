@@ -19,6 +19,7 @@ const fs = @import("fs.zig");
 const ctx_mod = @import("context.zig");
 const roles_default = @import("roles_default.zig");
 const workflow_mod = @import("workflow.zig");
+const seed_mod = @import("seed.zig");
 const knowledge = @import("knowledge.zig");
 const sqlite = @import("db/sqlite.zig");
 const db_query = @import("db/query.zig");
@@ -793,10 +794,10 @@ fn cmdDoctor(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, role_filter: 
         var futures: [cap]Fut = undefined;
         var sync_status = [_]?backend.ProbeStatus{null} ** cap;
         for (combos.items[0..n], 0..) |c, idx| {
-            if (io.concurrent(backend.probeBackend, .{ arena, io, c.bt, c.model, c.effort, cwd, cfg.claude_binary, cfg.pi_binary })) |f| {
+            if (io.concurrent(backend.probeBackend, .{ arena, io, c.bt, c.model, c.effort, cwd, cfg.claude_binary, cfg.pi_binary, @as(?[]const u8, null) })) |f| {
                 futures[idx] = f;
             } else |_| {
-                sync_status[idx] = backend.probeBackend(arena, io, c.bt, c.model, c.effort, cwd, cfg.claude_binary, cfg.pi_binary);
+                sync_status[idx] = backend.probeBackend(arena, io, c.bt, c.model, c.effort, cwd, cfg.claude_binary, cfg.pi_binary, null);
             }
         }
         // Await in a stable order and report as each resolves.
@@ -807,6 +808,41 @@ fn cmdDoctor(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, role_filter: 
         }
         if (combos.items.len > cap) {
             try stdout.print("  … {d} more not probed (cap {d})\n", .{ combos.items.len - cap, cap });
+        }
+
+        // Seed-fork probe: exercises the cross-role cache-lineage path (claude
+        // --resume <seed> --fork-session), which can break independently of bare
+        // model calls — a CLI update once 400'd every seed-forked session while
+        // plain probes passed. Builds the real seed, then forks one turn from it.
+        if (cfg.cache.shared_context) {
+            try stdout.print("\nSeed session (context cache lineage)\n", .{});
+            try stdout.flush();
+            if (store_mod.Store.open(paths.db_dir)) |store_val| {
+                var store = store_val;
+                defer store.close();
+                const seed_result = seed_mod.buildSeed(paths.root, cfg.project.name, cfg.cache, &store, arena, io);
+                if (seed_result.uuid) |uuid| {
+                    switch (backend.probeBackend(arena, io, .claude, "sonnet", "low", cwd, cfg.claude_binary, cfg.pi_binary, uuid)) {
+                        .ok => try stdout.print("  ✓ seed built and a forked session responded (cache lineage intact)\n", .{}),
+                        .auth_error => {
+                            try stdout.print("  ✗ seed fork — authentication failed\n", .{});
+                            blockers += 1;
+                        },
+                        .timeout => {
+                            try stdout.print("  ✗ seed fork — no response within {d}s\n", .{backend.probe_timeout_secs});
+                            blockers += 1;
+                        },
+                        .failed => {
+                            try stdout.print("  ✗ seed fork FAILED — seed-forked roles (qa/user/review/researcher) will all die; check the seed JSONL format vs the current Claude CLI\n", .{});
+                            blockers += 1;
+                        },
+                    }
+                } else {
+                    try stdout.print("  · seed not built (no files selected) — skipped\n", .{});
+                }
+            } else |_| {
+                try stdout.print("  · could not open project db — skipped\n", .{});
+            }
         }
 
         // Browser roles: actually launch headless Chrome and confirm the DevTools
@@ -1335,6 +1371,15 @@ fn cmdDaemon(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     // to the OS. The process arena never reclaims pages, causing unbounded
     // growth in a long-running daemon (every worker/merger/QA session leaks).
     const action = try orchestrator.run(cfg, paths, &store, &logger, io, std.heap.c_allocator);
+
+    if (action == .halt) {
+        // Circuit breaker tripped: exit with code 64, which the generated unit
+        // lists in RestartPreventExitStatus — the service stays stopped (failed)
+        // for operator attention instead of restarting into the same churn.
+        try stdout.print("bees daemon halted by circuit breaker (sterile merge cycles). See `bees log`.\n", .{});
+        try stdout.flush();
+        std.process.exit(64);
+    }
 
     if (action == .reload) {
         // Self-hosted hot reload: replace the running binary and re-exec

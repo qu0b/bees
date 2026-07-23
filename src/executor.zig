@@ -232,4 +232,9 @@ pub fn runRole(
         @as(f64, @floatFromInt(result.cost_microdollars)) / 1000000.0,
         result.num_turns,
     });
+    // Surface session failures in the journal (a session can exit 0 while
+    // carrying an API error). See worker.zig — same lesson.
+    if (result.is_error and result.result_text.len > 0) {
+        logger.err("[{s}] session error: {s}", .{ role_name, result.result_text[0..@min(result.result_text.len, 300)] });
+    }
 }

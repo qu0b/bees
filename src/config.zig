@@ -125,6 +125,11 @@ pub const Config = struct {
         /// When true, daemon re-execs itself after merging source code changes.
         /// Only useful when bees is building itself.
         self_hosted: bool = false,
+        /// Circuit breaker: halt the daemon after this many consecutive merge
+        /// cycles with zero accepted merges (systemic failure — burning money on
+        /// work that never lands). The unit stays stopped for operator attention
+        /// (exit code 64, not restarted by systemd). 0 disables the halt.
+        max_sterile_cycles: u32 = 12,
     };
 
     pub const Git = struct {

@@ -421,6 +421,12 @@ fn runWorkerImpl(
             stop,
             result.tool_errors,
         });
+        // Surface the failure text in the journal — a session can exit 0 while
+        // carrying an API error (e.g. "API Error: 400 ..."). Burying it in LMDB
+        // cost a 5h sterile run to diagnose once; never again.
+        if (result.is_error and result.result_text.len > 0) {
+            logger.err("[worker:{d}] session error: {s}", .{ worker_id, result.result_text[0..@min(result.result_text.len, 300)] });
+        }
     }
 
     return .{ .session_id = session_id, .tool_errors = result.tool_errors };

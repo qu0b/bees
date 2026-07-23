@@ -285,6 +285,10 @@ pub fn probeBackend(
     cwd: []const u8,
     claude_binary: []const u8,
     pi_binary: []const u8,
+    /// When set (claude only), fork a session from this seed uuid — probing the
+    /// cross-role cache-lineage path, which can break independently of bare
+    /// model calls (e.g. the 2026-07-22 previous_message_id API 400).
+    resume_session_id: ?[]const u8,
 ) ProbeStatus {
     var child = spawn(bt, allocator, io, .{
         .backend = bt,
@@ -292,10 +296,14 @@ pub fn probeBackend(
         .cwd = cwd,
         .model = model,
         .effort = effort,
-        .max_budget_usd = 1.0,
+        // A seed fork ingests the full context blob (up to ~200K tokens), which
+        // alone exceeds $1 — a bare model call needs only pennies.
+        .max_budget_usd = if (resume_session_id != null) 5.0 else 1.0,
         .max_turns = 1,
         .timeout_secs = probe_timeout_secs,
         .silence_stderr = true,
+        .resume_session_id = resume_session_id,
+        .fork_session = resume_session_id != null,
     }, claude_binary, pi_binary) catch return .failed;
 
     var saw_auth = false;

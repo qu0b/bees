@@ -51,6 +51,7 @@ fn writeDaemonUnit(allocator: std.mem.Allocator, systemd_dir: []const u8, projec
         \\Restart=always
         \\RestartSec=30
         \\TimeoutStopSec=30
+        \\RestartPreventExitStatus=64
         \\
         \\[Install]
         \\WantedBy=default.target

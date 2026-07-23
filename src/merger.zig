@@ -141,7 +141,7 @@ pub fn runMerger(
         const pre_head = git.getCurrentHead(allocator, io, paths.root) catch continue;
         defer allocator.free(pre_head);
 
-        reviewAndMerge(cfg, paths, store, logger, io, candidate, allocator, seed_uuid);
+        const outcome = reviewAndMerge(cfg, paths, store, logger, io, candidate, allocator, seed_uuid);
 
         const post_head = git.getCurrentHead(allocator, io, paths.root) catch continue;
         defer allocator.free(post_head);
@@ -150,16 +150,25 @@ pub fn runMerger(
             // HEAD moved — agent merged the branch. Defer finalization.
             merged_count += 1;
             merged_candidates.append(allocator, candidate) catch {};
-        } else {
-            // HEAD unchanged — agent rejected or failed to merge. Nothing was
-            // merged, so this is safe to finalize immediately.
-            logger.info("[merger] {s}: not merged (rejected or failed)", .{candidate.branch});
-            writeMarker(allocator, candidate.dir, ".rejected");
-            if (candidate.worker_session_id) |wsid| {
-                updateWorkerStatus(store, wsid, .rejected) catch {};
-                recordReview(store, candidate, wsid, .reject, "Rejected by review agent");
-                incrementWorkerTaskStat(store, wsid, .rejected);
-            }
+        } else switch (outcome) {
+            .reviewed, .empty_diff => {
+                // The agent ran and chose not to merge (or there was nothing to
+                // merge). A real verdict — safe to finalize as rejected.
+                logger.info("[merger] {s}: not merged (rejected)", .{candidate.branch});
+                writeMarker(allocator, candidate.dir, ".rejected");
+                if (candidate.worker_session_id) |wsid| {
+                    updateWorkerStatus(store, wsid, .rejected) catch {};
+                    recordReview(store, candidate, wsid, .reject, "Rejected by review agent");
+                    incrementWorkerTaskStat(store, wsid, .rejected);
+                }
+            },
+            .review_failed => {
+                // The review machinery broke — NOT a verdict on the work. Leave
+                // the candidate pending so the next merger scan retries it,
+                // instead of terminally discarding a worker's output. (The old
+                // behavior turned one broken gate into 68 rejected sessions.)
+                logger.warn("[merger] {s}: review failed, keeping candidate for retry", .{candidate.branch});
+            },
         }
     }
 
@@ -201,6 +210,19 @@ pub fn runMerger(
     logger.info("[merger] done. merged={d}/{d}", .{ merged_count, candidates.items.len });
 }
 
+/// Outcome of a review attempt. Distinguishes "the review agent ran and made a
+/// call" from "the review machinery itself broke" — conflating them (the old
+/// behavior) terminally rejected good work whenever the gate crashed.
+const ReviewOutcome = enum {
+    /// The review session ran to completion; the HEAD-moved check is the verdict.
+    reviewed,
+    /// The branch has no diff against base — nothing to merge.
+    empty_diff,
+    /// The review never happened (diff/spawn failure or session error). The
+    /// candidate must stay pending for a retry, NOT be marked rejected.
+    review_failed,
+};
+
 /// Combined review + merge agent. The agent reviews the diff, and if it
 /// approves, merges the branch itself. Verdict is determined by whether
 /// HEAD moved — no text parsing needed.
@@ -213,16 +235,16 @@ fn reviewAndMerge(
     candidate: *WorktreeCandidate,
     allocator: std.mem.Allocator,
     seed_uuid: ?[]const u8,
-) void {
+) ReviewOutcome {
     const diff = git.getDiff(allocator, io, paths.root, candidate.branch, cfg.project.base_branch) catch |e| {
         logger.err("[merger] diff failed for {s}: {}", .{ candidate.branch, e });
-        return;
+        return .review_failed;
     };
     defer allocator.free(diff);
 
     if (diff.len == 0) {
         logger.info("[merger] {s}: empty diff, skipping", .{candidate.branch});
-        return;
+        return .empty_diff;
     }
 
     const merger_model = types.ModelType.fromString(cfg.merger.model);
@@ -252,10 +274,10 @@ fn reviewAndMerge(
         .cache_read_tokens = 0,
     };
 
-    const session_id = store.createSession(header, "", candidate.branch, "") catch return;
+    const session_id = store.createSession(header, "", candidate.branch, "") catch return .review_failed;
     candidate.session_id = session_id;
 
-    const review_prompt_path = std.fs.path.join(allocator, &.{ paths.bees_dir, "roles", "review", "prompt.md" }) catch return;
+    const review_prompt_path = std.fs.path.join(allocator, &.{ paths.bees_dir, "roles", "review", "prompt.md" }) catch return .review_failed;
     defer allocator.free(review_prompt_path);
 
     // Cap diff to avoid blowing the context window
@@ -298,11 +320,11 @@ fn reviewAndMerge(
         \\```diff
         \\{s}
         \\```
-    , .{ candidate.branch, task_context, candidate.branch, diff_preview }) catch return;
+    , .{ candidate.branch, task_context, candidate.branch, diff_preview }) catch return .review_failed;
     defer allocator.free(review_body);
     prompt_parts.appendSlice(allocator, review_body) catch {};
 
-    const review_prompt = prompt_parts.toOwnedSlice(allocator) catch return;
+    const review_prompt = prompt_parts.toOwnedSlice(allocator) catch return .review_failed;
     defer allocator.free(review_prompt);
 
     logger.info("[merger] reviewing {s}", .{candidate.branch});
@@ -322,7 +344,7 @@ fn reviewAndMerge(
         .db_dir = paths.db_dir,
     }, session_id, allocator, cfg.claude_binary, cfg.pi_binary) catch |e| {
         logger.err("[merger] review session failed for {s}: {}", .{ candidate.branch, e });
-        return;
+        return .review_failed;
     };
     defer {
         if (result.result_text.len > 0) allocator.free(result.result_text);
@@ -344,6 +366,15 @@ fn reviewAndMerge(
     updated_header.cache_creation_tokens = result.cache_creation_tokens;
     updated_header.cache_read_tokens = result.cache_read_tokens;
     store.updateSessionStatus(session_id, .running, @truncate(now), updated_header) catch {};
+
+    if (result.is_error) {
+        // The gate itself broke (e.g. an API error) — this is NOT a verdict.
+        if (result.result_text.len > 0) {
+            logger.err("[merger] review error for {s}: {s}", .{ candidate.branch, result.result_text[0..@min(result.result_text.len, 300)] });
+        }
+        return .review_failed;
+    }
+    return .reviewed;
 }
 
 /// Increment the task stat for a worker session's task.
