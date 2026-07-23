@@ -353,8 +353,12 @@ fn runCommand(cmd: cli.Command, arena: std.mem.Allocator, io: Io, stdout: *Io.Wr
         .version => try stdout.print("bees v{s}\n", .{version}),
         .help => try printUsage(stdout),
         .init => |opts| try cmdInit(arena, io, stdout, opts.skip_analysis),
-        .start => try cmdStart(arena, io, stdout),
+        .start => |opts| try cmdStart(arena, io, stdout, opts.force),
         .stop => try cmdStop(arena, io, stdout),
+        .restart => |opts| {
+            try cmdStop(arena, io, stdout);
+            try cmdStart(arena, io, stdout, opts.force);
+        },
         .daemon => try cmdDaemon(arena, io, stdout),
         .status => |opts| try cmdStatus(arena, stdout, opts.json),
         .run_worker => |opts| try cmdRunWorker(arena, io, stdout, opts.id),
@@ -1312,25 +1316,123 @@ fn addToGitignore(arena: std.mem.Allocator, cwd: []const u8) !void {
     try fs.writeFile(file, content.items);
 }
 
-fn cmdStart(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
+fn cmdStart(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, force: bool) !void {
     const project = try loadProject(arena);
     const cfg = project[0];
     const paths = project[1];
+    const cwd = try getCwd(arena);
+
+    // ---- Preflight: the cheap checks that decide whether the swarm can run at
+    // all. Refuse to start into guaranteed failure (the old behavior burned a
+    // 5h run on a missing PATH); --force overrides.
+    var blockers: u32 = 0;
+    if (!commandPresent(arena, io, cwd, cfg.claude_binary)) {
+        try stdout.print("  ✗ '{s}' not found on PATH — every agent runs through it\n", .{cfg.claude_binary});
+        blockers += 1;
+    }
+    if ((cfg.workers.codex_fraction > 0 or cfg.strategist.codex_fraction > 0) and !commandPresent(arena, io, cwd, "codex")) {
+        try stdout.print("  ✗ 'codex' not found but codex_fraction routes runs to it\n", .{});
+        blockers += 1;
+    }
+    if (!gitIdentitySet(arena, io, cwd)) {
+        try stdout.print("  ✗ git commit identity not set — worker commits will fail\n", .{});
+        blockers += 1;
+    }
+    if (!gitRefExists(arena, io, cwd, cfg.project.base_branch)) {
+        try stdout.print("  ✗ base branch '{s}' has no commits — workers can't branch from it\n", .{cfg.project.base_branch});
+        blockers += 1;
+    }
+    if (blockers > 0) {
+        if (!force) {
+            try stdout.print("\n{d} blocker(s). Fix them (see `bees doctor`), or start anyway with `bees start --force`.\n", .{blockers});
+            stdout.flush() catch {};
+            std.process.exit(1);
+        }
+        try stdout.print("  (continuing despite {d} blocker(s) — --force)\n", .{blockers});
+    }
+
+    const was_active = std.mem.eql(u8, scheduler.unitState(cfg, io, arena), "active");
 
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_path = fs.readLinkAbsolute("/proc/self/exe", &exe_buf) catch "bees";
-
     try scheduler.generateAndInstall(cfg, exe_path, paths.root, arena);
-    try scheduler.start(cfg, io, arena);
-    try stdout.print("Bees daemon started for {s}\n", .{cfg.project.name});
+
+    var ctl_err = scheduler.CtlError{};
+    scheduler.start(cfg, io, arena, &ctl_err) catch {
+        try stdout.print("Failed to start ({s}): {s}\n", .{ ctl_err.what, ctl_err.detail });
+        stdout.flush() catch {};
+        std.process.exit(1);
+    };
+
+    if (was_active) {
+        // enable --now on an active unit is a no-op; apply the (possibly
+        // regenerated) unit and current binary by restarting.
+        const service = try scheduler.serviceName(cfg, arena);
+        const r = scheduler.runCtl(arena, io, &.{ "systemctl", "--user", "restart", service }) catch null;
+        if (r) |res| {
+            arena.free(res.stdout);
+            arena.free(res.stderr);
+        }
+        try stdout.print("Daemon was already running — restarted with current config/binary.\n", .{});
+    }
+
+    // ---- Verify it actually came up (don't claim success on faith). The old
+    // command printed "started" even when systemctl never ran.
+    var waited: u32 = 0;
+    var state: []const u8 = "unknown";
+    while (waited < 10) : (waited += 1) {
+        state = scheduler.unitState(cfg, io, arena);
+        if (!std.mem.eql(u8, state, "activating")) break;
+        sleepSecs(io, 1);
+    }
+    if (std.mem.eql(u8, state, "active")) {
+        try stdout.print("Bees daemon running for {s} ({s})\n", .{ cfg.project.name, state });
+        try stdout.print("  Follow:  bees log --follow\n  Status:  bees status\n  Stop:    bees stop\n", .{});
+    } else {
+        try stdout.print("Daemon did not come up (state: {s}). Recent journal:\n", .{state});
+        const service = try scheduler.serviceName(cfg, arena);
+        if (scheduler.runCtl(arena, io, &.{ "journalctl", "--user", "-u", service, "-n", "10", "--no-pager" })) |jr| {
+            defer arena.free(jr.stderr);
+            defer arena.free(jr.stdout);
+            try stdout.print("{s}\n", .{jr.stdout});
+        } else |_| {}
+        stdout.flush() catch {};
+        std.process.exit(1);
+    }
+}
+
+fn sleepSecs(io: Io, secs: i64) void {
+    io.sleep(Io.Duration.fromSeconds(secs), .awake) catch {};
 }
 
 fn cmdStop(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     const project = try loadProject(arena);
     const cfg = project[0];
 
-    try scheduler.stop(cfg, io, arena);
-    try stdout.print("Bees daemon stopped for {s}\n", .{cfg.project.name});
+    const before = scheduler.unitState(cfg, io, arena);
+    const was_running = std.mem.eql(u8, before, "active") or std.mem.eql(u8, before, "activating");
+
+    var ctl_err = scheduler.CtlError{};
+    scheduler.stop(cfg, io, arena, &ctl_err) catch {
+        try stdout.print("Failed to stop ({s}): {s}\n", .{ ctl_err.what, ctl_err.detail });
+        stdout.flush() catch {};
+        std.process.exit(1);
+    };
+
+    if (!was_running) {
+        try stdout.print("Bees daemon for {s} was not running (state: {s}); unit disabled and reset.\n", .{ cfg.project.name, before });
+    } else {
+        // Report HOW it stopped — a "timeout" Result means the daemon didn't
+        // exit within TimeoutStopSec and systemd KILLed the cgroup (normal when
+        // agent sessions are mid-flight, but worth knowing).
+        const result = scheduler.unitResult(cfg, io, arena);
+        if (std.mem.eql(u8, result, "timeout")) {
+            try stdout.print("Bees daemon stopped for {s} (sessions were mid-flight; systemd killed the process group after 30s)\n", .{cfg.project.name});
+        } else {
+            try stdout.print("Bees daemon stopped for {s}\n", .{cfg.project.name});
+        }
+    }
+    scheduler.resetFailed(cfg, io, arena);
 
     // Last one out turns off the lights: a daemon that merely REUSED the shared
     // Chrome leaves it running on shutdown (by design — another project may use
@@ -2657,8 +2759,9 @@ fn printUsage(stdout: *Io.Writer) !void {
         \\Commands:
         \\  init [--skip-analysis]   Initialize bees in current project
         \\  daemon                   Run continuous orchestrator (workers + merger + SRE)
-        \\  start                    Install and enable systemd service
-        \\  stop                     Disable systemd service
+        \\  start [--force]          Preflight, install + start the daemon, verify it's up
+        \\  stop                     Stop the daemon (reports how it stopped; cleans up Chrome)
+        \\  restart [--force]        Stop then start
         \\  status [--json]          Show project status
         \\  run worker [--id N]      Run workers (one-shot)
         \\  run merger               Run merger (one-shot)

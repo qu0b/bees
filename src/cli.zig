@@ -3,8 +3,9 @@ const types = @import("types.zig");
 
 pub const Command = union(enum) {
     init: struct { skip_analysis: bool = false },
-    start,
+    start: struct { force: bool = false },
     stop,
+    restart: struct { force: bool = false },
     daemon,
     status: OutputOptions,
     run_worker: struct { id: ?u32 = null },
@@ -52,8 +53,13 @@ pub fn parse(args: []const []const u8) !Command {
     if (std.mem.eql(u8, cmd, "init")) {
         return .{ .init = .{ .skip_analysis = hasFlag(args[2..], "--skip-analysis") } };
     }
-    if (std.mem.eql(u8, cmd, "start")) return .start;
+    if (std.mem.eql(u8, cmd, "start")) {
+        return .{ .start = .{ .force = hasFlag(args[2..], "--force") } };
+    }
     if (std.mem.eql(u8, cmd, "stop")) return .stop;
+    if (std.mem.eql(u8, cmd, "restart")) {
+        return .{ .restart = .{ .force = hasFlag(args[2..], "--force") } };
+    }
     if (std.mem.eql(u8, cmd, "daemon")) return .daemon;
     if (std.mem.eql(u8, cmd, "version")) return .version;
     if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) return .help;
@@ -219,6 +225,15 @@ test "parse init skip analysis" {
 test "parse status json" {
     const cmd = try parse(&.{ "bees", "status", "--json" });
     try std.testing.expect(cmd.status.json);
+}
+
+test "parse start/restart with force" {
+    const s = try parse(&.{ "bees", "start" });
+    try std.testing.expect(s == .start and !s.start.force);
+    const sf = try parse(&.{ "bees", "start", "--force" });
+    try std.testing.expect(sf.start.force);
+    const r = try parse(&.{ "bees", "restart" });
+    try std.testing.expect(r == .restart and !r.restart.force);
 }
 
 test "parse doctor" {
