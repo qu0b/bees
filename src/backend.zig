@@ -819,6 +819,48 @@ fn killChromeByMarker(io: Io, marker: []const u8) void {
     _ = child.wait(io) catch {};
 }
 
+/// Last-one-out cleanup for the shared Chrome. The single-instance rule means a
+/// daemon that REUSED a running Chrome (pid 0, "not owned") must not kill it on
+/// shutdown — so without this, the last bees daemon to stop left Chrome (and its
+/// zygote/gpu/renderer tree) running forever. Called from `bees stop` and the
+/// daemon's reused-Chrome shutdown path: if no other bees daemon is running,
+/// sweep the shared instance (graceful TERM, then KILL stragglers).
+/// Returns true if a sweep was performed.
+pub fn stopSharedChromeIfOrphaned(allocator: std.mem.Allocator, io: Io) bool {
+    if (!chromePortOpen(io)) return false;
+
+    // Another project's daemon may still be using the shared instance. Exclude
+    // our own pid — when called from a daemon's shutdown path, the shutting-down
+    // daemon itself matches the pattern.
+    if (otherBeesDaemonRunning(allocator, io)) return false;
+
+    const term_argv = [_][]const u8{ "pkill", "-TERM", "-f", CHROME_DATA_MARKER };
+    var term_child = std.process.spawn(io, .{ .argv = &term_argv, .stdout = .ignore, .stderr = .ignore }) catch return false;
+    _ = term_child.wait(io) catch {};
+    io.sleep(Io.Duration.fromSeconds(2), .awake) catch {};
+    killChromeByMarker(io, CHROME_DATA_MARKER);
+    return true;
+}
+
+/// True if a `bees daemon` process other than the calling process is running.
+fn otherBeesDaemonRunning(allocator: std.mem.Allocator, io: Io) bool {
+    const result = std.process.run(allocator, io, .{
+        .argv = &.{ "pgrep", "-f", "bees daemon" },
+        .stdout_limit = .limited(64 * 1024),
+        .stderr_limit = .limited(4 * 1024),
+    }) catch return false;
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    const own_pid = std.c.getpid();
+    var it = std.mem.tokenizeScalar(u8, result.stdout, '\n');
+    while (it.next()) |line| {
+        const pid = std.fmt.parseInt(i32, std.mem.trim(u8, line, &std.ascii.whitespace), 10) catch continue;
+        if (pid != own_pid) return true;
+    }
+    return false;
+}
+
 /// Stop the shared Chrome we launched: graceful SIGTERM → 5s → SIGKILL on the
 /// browser process, then a marker sweep to reap any orphaned children (killing a
 /// single pid leaves Chrome's zygote/gpu/renderer processes behind).

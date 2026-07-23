@@ -485,10 +485,13 @@ pub fn run(
             @atomicLoad(u32, &state.active_count, .acquire),
         });
     }
-    // Kill daemon-owned Chrome
+    // Kill daemon-owned Chrome; for a merely-reused instance (pid 0), sweep it
+    // only if we are the last bees daemon standing.
     if (state.chrome_pid != 0) {
         logger.info("[daemon] stopping Chrome (pid={d})", .{state.chrome_pid});
         backend.killChrome(state.chrome_pid, io);
+    } else if (backend.stopSharedChromeIfOrphaned(allocator, io)) {
+        logger.info("[daemon] stopped shared Chrome (last daemon out)", .{});
     }
 
     logger.info("[daemon] shutdown complete", .{});

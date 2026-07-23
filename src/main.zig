@@ -1331,6 +1331,13 @@ fn cmdStop(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
 
     try scheduler.stop(cfg, io, arena);
     try stdout.print("Bees daemon stopped for {s}\n", .{cfg.project.name});
+
+    // Last one out turns off the lights: a daemon that merely REUSED the shared
+    // Chrome leaves it running on shutdown (by design — another project may use
+    // it). If no bees daemon remains, sweep the shared instance now.
+    if (backend.stopSharedChromeIfOrphaned(arena, io)) {
+        try stdout.print("Stopped shared Chrome (no bees daemon left using it)\n", .{});
+    }
 }
 
 fn cmdDaemon(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
