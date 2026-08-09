@@ -30,10 +30,14 @@ const GatewayState = struct {
     model: []const u8 = "",
     /// Injected into every child env. The ANTHROPIC_DEFAULT_*_MODEL entries
     /// remap alias model names ("haiku"/"sonnet"/"opus") that reach the Claude
-    /// CLI outside the spawn() override (e.g. seed file selection).
-    env: [6][2][]const u8 = undefined,
+    /// CLI outside the spawn() override (e.g. seed file selection). The last
+    /// slot is the optional context-window override; `env_len` says how many
+    /// entries are live.
+    env: [7][2][]const u8 = undefined,
+    env_len: usize = 0,
 };
 var gateway: GatewayState = .{};
+var gateway_ctx_buf: [16]u8 = undefined;
 
 /// Activate gateway mode from config. Reads the API key from the environment
 /// (never from config.json); fails fast when the key env var is unset so the
@@ -67,8 +71,19 @@ pub fn configureGatewayWithKey(gw: config_mod.Config.Gateway, api_key: []const u
             .{ "ANTHROPIC_DEFAULT_SONNET_MODEL", gw.model },
             .{ "ANTHROPIC_DEFAULT_OPUS_MODEL", gw.model },
             .{ "ANTHROPIC_SMALL_FAST_MODEL", gw.model },
+            .{ "", "" }, // context window, filled below when configured
         },
+        .env_len = 6,
     };
+    // Teach the CLI the model's real context window. Without this it assumes
+    // 200k for an unrecognized gateway model and refuses to send a larger
+    // prompt ("Prompt is too long"), even though the server accepts far more.
+    if (gw.context_tokens > 0) {
+        if (std.fmt.bufPrint(&gateway_ctx_buf, "{d}", .{gw.context_tokens})) |s| {
+            gateway.env[6] = .{ "CLAUDE_CODE_MAX_CONTEXT_TOKENS", s };
+            gateway.env_len = 7;
+        } else |_| {}
+    }
 }
 
 pub fn gatewayActive() bool {
@@ -186,7 +201,7 @@ pub fn buildFilteredEnvMap(allocator: std.mem.Allocator) std.process.Environ.Map
     // Gateway mode: route every child to the configured endpoint/model,
     // deliberately overriding any inherited ANTHROPIC_* variables.
     if (gateway.active) {
-        for (gateway.env) |pair| env_map.put(pair[0], pair[1]) catch {};
+        for (gateway.env[0..gateway.env_len]) |pair| env_map.put(pair[0], pair[1]) catch {};
     }
     return env_map;
 }
@@ -1476,16 +1491,24 @@ test "gateway mode forces claude backend and injects endpoint env" {
     try std.testing.expectEqualStrings("starflinger-anthropic", env_map.get("ANTHROPIC_DEFAULT_OPUS_MODEL").?);
     try std.testing.expectEqualStrings("starflinger-anthropic", env_map.get("ANTHROPIC_SMALL_FAST_MODEL").?);
 
-    // Bearer endpoints (vLLM /v1/messages) get ANTHROPIC_AUTH_TOKEN instead.
+    // No context override configured → leave the CLI's own assumption alone.
+    try std.testing.expect(env_map.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS") == null);
+
+    // Bearer endpoints (vLLM /v1/messages) get ANTHROPIC_AUTH_TOKEN instead,
+    // and a declared window is passed through so the CLI stops assuming 200k
+    // and rejecting large prompts with "Prompt is too long".
     configureGatewayWithKey(.{
         .enabled = true,
         .base_url = "http://10.20.212.92:8002",
         .model = "starflinger",
         .bearer = true,
+        .context_tokens = 600_000,
     }, "tok");
     var bearer_env = buildFilteredEnvMap(std.testing.allocator);
     defer bearer_env.deinit();
     try std.testing.expectEqualStrings("tok", bearer_env.get("ANTHROPIC_AUTH_TOKEN").?);
+    try std.testing.expect(bearer_env.get("ANTHROPIC_API_KEY") == null);
+    try std.testing.expectEqualStrings("600000", bearer_env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS").?);
 }
 
 test "configureGateway is a no-op when disabled and fails fast on missing key" {

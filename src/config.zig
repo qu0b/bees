@@ -213,6 +213,12 @@ pub const Config = struct {
         /// instead of `x-api-key` (ANTHROPIC_API_KEY). Needed for endpoints
         /// like vLLM's native /v1/messages that only accept Bearer auth.
         bearer: bool = false,
+        /// The model's real context window in tokens. The agent CLI does not
+        /// recognize gateway model names, so it assumes 200k and rejects a
+        /// larger prompt with "Prompt is too long" before the request is even
+        /// sent — even when the server advertises far more (vLLM
+        /// max_model_len). 0 = leave the CLI's assumption alone.
+        context_tokens: u32 = 0,
         /// The gateway model is text-only (no vision). Browser tooling stays
         /// available — DOM/a11y snapshots, console, network, evaluate_script
         /// are textual — but image-producing tools (chrome-devtools
