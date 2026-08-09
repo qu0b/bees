@@ -10,6 +10,7 @@ const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 const ctx_mod = @import("context.zig");
 const seed_mod = @import("seed.zig");
+const role_mod = @import("role.zig");
 
 const WorktreeCandidate = struct {
     branch: []const u8,
@@ -32,6 +33,15 @@ pub fn runMerger(
     assert(cfg.project.base_branch.len > 0);
 
     logger.info("[merger] starting scan", .{});
+
+    // The review and fix agents are configured by .bees/roles/{review,fix}/.
+    // Without this the whole role config (model, budget, prompt, sandbox) was
+    // dead and both agents ran unsandboxed on cfg.merger.* settings.
+    var roles: ?role_mod.RoleSet = role_mod.loadRoles(paths, allocator) catch |e| blk: {
+        logger.warn("[merger] role load failed ({}), using cfg.merger defaults", .{e});
+        break :blk null;
+    };
+    defer if (roles) |*r| r.deinit();
 
     // Ensure clean working tree before merging. QA, strategist, and build
     // commands run in the main repo and can leave uncommitted changes that
@@ -121,9 +131,14 @@ pub fn runMerger(
 
     logger.info("[merger] found {d} candidates", .{candidates.items.len});
 
-    // Save HEAD before any merges for rollback
+    // Fallback rollback point. The real rollback base is captured at the first
+    // actual merge (see rollback_base below) — reviews are long agent sessions,
+    // and resetting to a scan-time HEAD would erase any operator/CI commit that
+    // landed on the base branch mid-scan (2026-08-08: it did exactly that).
     const saved_head = try git.getCurrentHead(allocator, io, paths.root);
     defer allocator.free(saved_head);
+    var rollback_base: ?[]const u8 = null;
+    defer if (rollback_base) |rb| allocator.free(rb);
 
     // For each candidate: one Claude agent session reviews the diff AND
     // performs the merge if it approves. The verdict is determined by
@@ -141,13 +156,28 @@ pub fn runMerger(
         const pre_head = git.getCurrentHead(allocator, io, paths.root) catch continue;
         defer allocator.free(pre_head);
 
-        const outcome = reviewAndMerge(cfg, paths, store, logger, io, candidate, allocator, seed_uuid);
+        const outcome = reviewAndMerge(cfg, paths, store, logger, io, candidate, allocator, seed_uuid, roles);
 
         const post_head = git.getCurrentHead(allocator, io, paths.root) catch continue;
         defer allocator.free(post_head);
 
-        if (!std.mem.eql(u8, pre_head, post_head)) {
-            // HEAD moved — agent merged the branch. Defer finalization.
+        // The merge verdict must be attributed to the BRANCH — merged iff its
+        // tip became an ancestor of HEAD during the review. A bare "HEAD moved"
+        // check misreads an operator commit landing mid-review as a merge
+        // (2026-08-08: false merge → pipeline ran on a skeleton-less base →
+        // rollback erased the operator's commit).
+        const was_merged = blk: {
+            const tip = git.revParse(allocator, io, paths.root, candidate.branch) catch
+                break :blk !std.mem.eql(u8, pre_head, post_head); // fallback: old heuristic
+            defer allocator.free(tip);
+            break :blk git.isAncestor(allocator, io, paths.root, tip, post_head) and
+                !git.isAncestor(allocator, io, paths.root, tip, pre_head);
+        };
+
+        if (was_merged) {
+            // First real merge fixes the rollback point: everything on the base
+            // before it (including mid-scan external commits) must survive.
+            if (rollback_base == null) rollback_base = allocator.dupe(u8, pre_head) catch null;
             merged_count += 1;
             merged_candidates.append(allocator, candidate) catch {};
         } else switch (outcome) {
@@ -174,12 +204,13 @@ pub fn runMerger(
 
     // Run the pipeline BEFORE finalizing any merge. A pipeline error is treated
     // as failure (rolled back) so we never finalize on an unverified base.
+    const rb = rollback_base orelse saved_head;
     const pipeline_ok = if (merged_count > 0)
-        (runPipeline(cfg, paths, store, logger, io, saved_head, allocator) catch false)
+        (runPipeline(cfg, paths, store, logger, io, rb, allocator, roles) catch false)
     else
         true;
     if (merged_count > 0 and !pipeline_ok) {
-        logger.warn("[merger] pipeline failed, changes rolled back to {s}", .{saved_head[0..@min(saved_head.len, 12)]});
+        logger.warn("[merger] pipeline failed, changes rolled back to {s}", .{rb[0..@min(rb.len, 12)]});
     }
 
     for (merged_candidates.items) |candidate| {
@@ -193,14 +224,14 @@ pub fn runMerger(
             logger.info("[merger] merged and cleaned up {s}", .{candidate.branch});
         } else {
             // Pipeline failed and base was rolled back — the merge is undone.
-            // KEEP the branch (work is preserved for a retry) and mark rejected.
-            writeMarker(allocator, candidate.dir, ".rejected");
+            // Leave the candidate UNMARKED (like review_failed) so the next
+            // scan retries it. A terminal marker here let cleanupOldWorktrees
+            // delete the worktree AND branch in this same scan, destroying the
+            // only copy of the work (2026-08-08: recovered via git fsck).
             if (candidate.worker_session_id) |wsid| {
-                updateWorkerStatus(store, wsid, .rejected) catch {};
-                recordReview(store, candidate, wsid, .reject, "Reverted: post-merge pipeline failed");
-                incrementWorkerTaskStat(store, wsid, .rejected);
+                recordReview(store, candidate, wsid, .reject, "Merge undone: post-merge pipeline failed; kept for retry");
             }
-            logger.info("[merger] {s}: kept branch after pipeline rollback", .{candidate.branch});
+            logger.warn("[merger] {s}: merge undone by pipeline rollback, keeping candidate for retry", .{candidate.branch});
         }
     }
 
@@ -223,6 +254,43 @@ const ReviewOutcome = enum {
     review_failed,
 };
 
+/// Effective settings for one merger-owned agent (review / fix), resolved from
+/// its .bees/roles/<name>/config.json with cfg.merger.* as the fallback.
+const RoleOpts = struct {
+    model: []const u8,
+    effort: []const u8,
+    budget: f64,
+    /// 0 → caller's default.
+    max_turns: u32 = 0,
+    /// null → no sandbox flags (legacy --dangerously-skip-permissions).
+    perms: ?role_mod.security_profiles.ToolPermissions,
+    /// "" → caller's default prompt path.
+    prompt_path: []const u8,
+};
+
+fn roleOpts(
+    roles: ?role_mod.RoleSet,
+    name: []const u8,
+    m: config_mod.Config.Merger,
+    fallback_perms: ?role_mod.security_profiles.ToolPermissions,
+) RoleOpts {
+    const rc = (if (roles) |r| r.get(name) else null) orelse return .{
+        .model = m.model,
+        .effort = m.effort,
+        .budget = m.max_budget_usd,
+        .perms = null,
+        .prompt_path = "",
+    };
+    return .{
+        .model = rc.model,
+        .effort = rc.effort,
+        .budget = rc.max_budget_usd,
+        .max_turns = rc.max_turns,
+        .perms = rc.resolvePermissions() orelse fallback_perms,
+        .prompt_path = rc.prompt_path,
+    };
+}
+
 /// Combined review + merge agent. The agent reviews the diff, and if it
 /// approves, merges the branch itself. Verdict is determined by whether
 /// HEAD moved — no text parsing needed.
@@ -235,7 +303,13 @@ fn reviewAndMerge(
     candidate: *WorktreeCandidate,
     allocator: std.mem.Allocator,
     seed_uuid: ?[]const u8,
+    roles: ?role_mod.RoleSet,
 ) ReviewOutcome {
+    // The review agent performs the merge itself, so its fallback sandbox is the
+    // merge-capable `merger` profile, not the session-type default (`readonly`,
+    // which would forbid `git merge` and make every review a rejection).
+    const opts = roleOpts(roles, "review", cfg.merger, role_mod.security_profiles.getProfile("merger"));
+
     const diff = git.getDiff(allocator, io, paths.root, candidate.branch, cfg.project.base_branch) catch |e| {
         logger.err("[merger] diff failed for {s}: {}", .{ candidate.branch, e });
         return .review_failed;
@@ -247,7 +321,7 @@ fn reviewAndMerge(
         return .empty_diff;
     }
 
-    const merger_model = types.ModelType.fromString(cfg.merger.model);
+    const merger_model = types.ModelType.fromString(opts.model);
     const now: u64 = fs.timestamp();
     const review_bt = backend.resolveBackend(cfg.default_backend, cfg.merger.backend);
     const header = types.SessionHeader{
@@ -277,8 +351,9 @@ fn reviewAndMerge(
     const session_id = store.createSession(header, "", candidate.branch, "") catch return .review_failed;
     candidate.session_id = session_id;
 
-    const review_prompt_path = std.fs.path.join(allocator, &.{ paths.bees_dir, "roles", "review", "prompt.md" }) catch return .review_failed;
-    defer allocator.free(review_prompt_path);
+    const default_review_prompt = std.fs.path.join(allocator, &.{ paths.bees_dir, "roles", "review", "prompt.md" }) catch return .review_failed;
+    defer allocator.free(default_review_prompt);
+    const review_prompt_path = if (opts.prompt_path.len > 0) opts.prompt_path else default_review_prompt;
 
     // Cap diff to avoid blowing the context window
     const diff_preview = if (diff.len > 50000) diff[0..50000] else diff;
@@ -336,12 +411,18 @@ fn reviewAndMerge(
         .append_prompt_file = if (use_seed) null else review_prompt_path,
         .resume_session_id = seed_uuid,
         .fork_session = use_seed,
-        .model = cfg.merger.model,
+        .model = opts.model,
         .fallback_model = cfg.merger.fallback_model,
-        .effort = cfg.merger.effort,
-        .max_budget_usd = cfg.merger.max_budget_usd,
-        .max_turns = 20,
+        .effort = opts.effort,
+        .max_budget_usd = opts.budget,
+        // Reviews of large branches need room to read, verify, and merge — a
+        // 20-turn cap made every big-diff review die error_max_turns and loop
+        // through keep-for-retry forever (2026-08-08, 3× $10 on one branch).
+        .max_turns = if (opts.max_turns > 0) opts.max_turns else 60,
         .db_dir = paths.db_dir,
+        .permission_mode = if (opts.perms) |p| p.permission_mode else null,
+        .allowed_tools = if (opts.perms) |p| if (p.allowed_tools.len > 0) p.allowed_tools else null else null,
+        .disallowed_tools = if (opts.perms) |p| if (p.disallowed_tools.len > 0) p.disallowed_tools else null else null,
     }, session_id, allocator, cfg.claude_binary, cfg.pi_binary) catch |e| {
         logger.err("[merger] review session failed for {s}: {}", .{ candidate.branch, e });
         return .review_failed;
@@ -413,13 +494,14 @@ fn runPipeline(
     io: Io,
     saved_head: []const u8,
     allocator: std.mem.Allocator,
+    roles: ?role_mod.RoleSet,
 ) !bool {
     if (cfg.build.command) |build_cmd| {
-        if (!try runBuildStep(cfg, paths, store, logger, io, "build", build_cmd, saved_head, allocator)) return false;
+        if (!try runBuildStep(cfg, paths, store, logger, io, "build", build_cmd, saved_head, allocator, roles)) return false;
     }
 
     if (cfg.build.test_command) |test_cmd| {
-        if (!try runBuildStep(cfg, paths, store, logger, io, "test", test_cmd, saved_head, allocator)) return false;
+        if (!try runBuildStep(cfg, paths, store, logger, io, "test", test_cmd, saved_head, allocator, roles)) return false;
     }
 
     if (cfg.smoke_test.enabled) {
@@ -456,6 +538,7 @@ fn runBuildStep(
     command: []const u8,
     saved_head: []const u8,
     allocator: std.mem.Allocator,
+    roles: ?role_mod.RoleSet,
 ) !bool {
     logger.info("[merger] running {s}: {s}", .{ step_name, command });
     const result = try runShellCommand(allocator, io, command, paths.root);
@@ -466,7 +549,8 @@ fn runBuildStep(
 
     logger.warn("[merger] {s} failed, attempting AI fix", .{step_name});
 
-    const fix_model = types.ModelType.fromString(cfg.merger.model);
+    const opts = roleOpts(roles, "fix", cfg.merger, role_mod.security_profiles.getDefaultForSessionType(.fix));
+    const fix_model = types.ModelType.fromString(opts.model);
     const now: u64 = fs.timestamp();
     const header = types.SessionHeader{
         .type = .fix,
@@ -494,8 +578,9 @@ fn runBuildStep(
 
     const session_id = try store.createSession(header, "", "", paths.root);
 
-    const fix_prompt_path = try std.fs.path.join(allocator, &.{ paths.bees_dir, "roles", "fix", "prompt.md" });
-    defer allocator.free(fix_prompt_path);
+    const default_fix_prompt = try std.fs.path.join(allocator, &.{ paths.bees_dir, "roles", "fix", "prompt.md" });
+    defer allocator.free(default_fix_prompt);
+    const fix_prompt_path = if (opts.prompt_path.len > 0) opts.prompt_path else default_fix_prompt;
 
     const error_context = try std.fmt.allocPrint(allocator, "The {s} command `{s}` failed with:\n{s}\n{s}\nFix the issue.", .{ step_name, command, result.stdout, result.stderr });
     defer allocator.free(error_context);
@@ -505,11 +590,14 @@ fn runBuildStep(
         .prompt = error_context,
         .cwd = paths.root,
         .append_prompt_file = fix_prompt_path,
-        .model = cfg.merger.model,
+        .model = opts.model,
         .fallback_model = cfg.merger.fallback_model,
-        .effort = cfg.merger.effort,
-        .max_budget_usd = cfg.merger.max_budget_usd,
+        .effort = opts.effort,
+        .max_budget_usd = opts.budget,
         .db_dir = paths.db_dir,
+        .permission_mode = if (opts.perms) |p| p.permission_mode else null,
+        .allowed_tools = if (opts.perms) |p| if (p.allowed_tools.len > 0) p.allowed_tools else null else null,
+        .disallowed_tools = if (opts.perms) |p| if (p.disallowed_tools.len > 0) p.disallowed_tools else null else null,
     }, session_id, allocator, cfg.claude_binary, cfg.pi_binary) catch {
         logger.err("[merger] AI fix failed", .{});
         git.resetHard(allocator, io, paths.root, saved_head) catch {};
@@ -772,6 +860,37 @@ fn updateWorkerStatus(store: *store_mod.Store, worker_session_id: u64, new_statu
     var updated_header = session.header;
     updated_header.status = new_status;
     try store.updateSessionStatus(worker_session_id, .done, old_started_at, updated_header);
+}
+
+test "roleOpts honors role config.json and sandboxes review with a merge-capable profile" {
+    const alloc = std.testing.allocator;
+    const m = config_mod.Config.Merger{ .model = "opus", .effort = "low", .max_budget_usd = 30.0 };
+
+    var set = role_mod.RoleSet{ .roles = std.StringHashMap(role_mod.RoleConfig).init(alloc), .allocator = alloc };
+    defer set.roles.deinit();
+    try set.roles.put("fix", .{ .name = "fix", .model = "sonnet", .effort = "high", .max_budget_usd = 5.0, .security_profile = "worker", .prompt_path = "/p/fix.md" });
+    try set.roles.put("review", .{ .name = "review", .model = "sonnet", .effort = "high", .max_budget_usd = 7.0, .prompt_path = "/p/review.md" });
+
+    // Declared profile wins, and the role's budget/model/prompt replace cfg.merger.*.
+    const f = roleOpts(set, "fix", m, role_mod.security_profiles.getDefaultForSessionType(.fix));
+    try std.testing.expectEqualStrings("sonnet", f.model);
+    try std.testing.expectEqualStrings("/p/fix.md", f.prompt_path);
+    try std.testing.expect(f.budget == 5.0);
+    try std.testing.expect(f.perms != null);
+
+    // No declared profile → fallback must still allow `git merge`.
+    const r = roleOpts(set, "review", m, role_mod.security_profiles.getProfile("merger"));
+    try std.testing.expect(r.budget == 7.0);
+    const perms = r.perms orelse return error.TestUnexpectedResult;
+    for (perms.allowed_tools) |t| {
+        if (std.mem.eql(u8, t, "Bash(git *)")) break;
+    } else return error.TestUnexpectedResult;
+
+    // Unknown role → cfg.merger defaults and no sandbox flags.
+    const none = roleOpts(set, "ghost", m, null);
+    try std.testing.expectEqualStrings("opus", none.model);
+    try std.testing.expectEqualStrings("", none.prompt_path);
+    try std.testing.expect(none.perms == null);
 }
 
 /// Parse a unix timestamp from a worktree directory name like "worker-3-20260315-163045".

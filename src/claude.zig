@@ -53,6 +53,11 @@ pub const SessionResult = struct {
     result_text: []const u8,
     claude_session_id: []const u8 = "",
     cost_microdollars: u32 = 0,
+    /// True only when the backend emitted a terminal result event carrying
+    /// authoritative spend. False means `cost_microdollars` is a partial or
+    /// absent figure (killed/timed-out agent) and must not be shown or summed
+    /// as if it were $0.00.
+    cost_known: bool = false,
     input_tokens: u32 = 0,
     output_tokens: u32 = 0,
     cache_creation_tokens: u32 = 0,
@@ -205,7 +210,6 @@ pub fn parseEventMeta(line: []const u8) types.EventMeta {
         .is_error = false,
         .role = .none,
         .duration_secs = 0,
-        .cost_cents = 0,
         .num_turns = 0,
     };
 
@@ -217,9 +221,6 @@ pub fn parseEventMeta(line: []const u8) types.EventMeta {
         meta.event_type = .init_event;
     } else if (std.mem.eql(u8, type_val, "result")) {
         meta.event_type = .result;
-        if (findJsonNumberValue(line, "\"total_cost_usd\"")) |cost| {
-            meta.cost_cents = @intFromFloat(@min(@max(cost * 100.0, 0.0), 65535.0));
-        }
         if (findJsonNumberValue(line, "\"duration_ms\"")) |dur| {
             meta.duration_secs = @intFromFloat(@min(dur / 1000.0, 65535.0));
         }
@@ -301,6 +302,69 @@ pub fn findJsonStringValue(json: []const u8, key: []const u8) ?[]const u8 {
         return json[start..pos];
     }
     return null;
+}
+
+/// Decode a raw JSON string body (the bytes between the quotes, as returned by
+/// findJsonStringValue) into real bytes. `findJsonStringValue` only *skips* escape
+/// pairs, so its result still carries the two-byte `\` `n` sequence wherever the
+/// agent wrote a newline — line-oriented consumers (knowledge.extractUpdates,
+/// stored reports) see a single unreadable blob unless this runs first.
+/// Unknown escapes pass through literally; \uXXXX is encoded as UTF-8 (surrogate
+/// pairs combined, lone surrogates emitted as U+FFFD).
+pub fn jsonUnescapeAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.ensureTotalCapacity(allocator, raw.len);
+    var i: usize = 0;
+    while (i < raw.len) {
+        if (raw[i] != '\\' or i + 1 >= raw.len) {
+            out.appendAssumeCapacity(raw[i]);
+            i += 1;
+            continue;
+        }
+        const c = raw[i + 1];
+        i += 2;
+        switch (c) {
+            'n' => out.appendAssumeCapacity('\n'),
+            't' => out.appendAssumeCapacity('\t'),
+            'r' => out.appendAssumeCapacity('\r'),
+            'b' => out.appendAssumeCapacity(8),
+            'f' => out.appendAssumeCapacity(12),
+            '"', '\\', '/' => out.appendAssumeCapacity(c),
+            'u' => {
+                if (i + 4 > raw.len) {
+                    try out.appendSlice(allocator, "\\u");
+                    continue;
+                }
+                var cp: u21 = std.fmt.parseInt(u16, raw[i .. i + 4], 16) catch {
+                    try out.appendSlice(allocator, raw[i - 2 .. i + 4]);
+                    i += 4;
+                    continue;
+                };
+                i += 4;
+                if (cp >= 0xD800 and cp <= 0xDBFF and i + 6 <= raw.len and
+                    raw[i] == '\\' and raw[i + 1] == 'u')
+                {
+                    if (std.fmt.parseInt(u16, raw[i + 2 .. i + 6], 16)) |lo| {
+                        if (lo >= 0xDC00 and lo <= 0xDFFF) {
+                            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                            i += 6;
+                        }
+                    } else |_| {}
+                }
+                if (cp >= 0xD800 and cp <= 0xDFFF) cp = 0xFFFD; // lone surrogate
+                var buf: [4]u8 = undefined;
+                const n = std.unicode.utf8Encode(cp, &buf) catch
+                    std.unicode.utf8Encode(0xFFFD, &buf) catch unreachable;
+                try out.appendSlice(allocator, buf[0..n]);
+            },
+            else => {
+                out.appendAssumeCapacity('\\');
+                try out.append(allocator, c);
+            },
+        }
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 pub fn findJsonNumberValue(json: []const u8, key: []const u8) ?f64 {
@@ -439,7 +503,7 @@ pub fn streamEvent(s: *Io.Writer, meta: types.EventMeta, line: []const u8) void 
             }
             s.flush() catch {};
         },
-        .init_event, .tool_result => {},
+        .init_event, .tool_result, .tool_progress => {},
     }
 }
 
@@ -470,7 +534,6 @@ test "parseEventMeta user tool_result" {
 test "parseEventMeta result" {
     const meta = parseEventMeta("{\"type\":\"result\",\"subtype\":\"success\",\"total_cost_usd\":2.34,\"duration_ms\":45000,\"num_turns\":12}");
     try std.testing.expectEqual(types.EventType.result, meta.event_type);
-    try std.testing.expectEqual(@as(u16, 234), meta.cost_cents);
     try std.testing.expectEqual(@as(u16, 45), meta.duration_secs);
     try std.testing.expectEqual(@as(u8, 12), meta.num_turns);
     try std.testing.expectEqual(false, meta.is_error);
@@ -490,6 +553,37 @@ test "findJsonStringValue" {
     const val = findJsonStringValue("{\"type\":\"init\",\"name\":\"test\"}", "\"type\"");
     try std.testing.expect(val != null);
     try std.testing.expectEqualStrings("init", val.?);
+}
+
+test "jsonUnescapeAlloc decodes escapes findJsonStringValue leaves raw" {
+    const a = std.testing.allocator;
+    const line = "{\"type\":\"result\",\"result\":\"line1\\nline2\\t\\\"q\\\"\\u00e9\\\\z\"}";
+    const raw = findJsonStringValue(line, "\"result\"").?;
+    // Raw slice still holds the two-byte escape sequences — this is why a
+    // line-oriented consumer sees one blob without decoding.
+    try std.testing.expect(std.mem.indexOfScalar(u8, raw, '\n') == null);
+
+    const decoded = try jsonUnescapeAlloc(a, raw);
+    defer a.free(decoded);
+    try std.testing.expectEqualStrings("line1\nline2\t\"q\"\xC3\xA9\\z", decoded);
+}
+
+test "jsonUnescapeAlloc surrogate pair and malformed escapes" {
+    const a = std.testing.allocator;
+    // U+1F41D (bee) as a surrogate pair.
+    const pair = try jsonUnescapeAlloc(a, "\\ud83d\\udc1d");
+    defer a.free(pair);
+    try std.testing.expectEqualStrings("\u{1F41D}", pair);
+
+    // Lone high surrogate → U+FFFD; unknown escape passes through literally.
+    const lone = try jsonUnescapeAlloc(a, "\\ud83d\\qx");
+    defer a.free(lone);
+    try std.testing.expectEqualStrings("\u{FFFD}\\qx", lone);
+
+    // Truncated \u at end of input is emitted verbatim, not read out of bounds.
+    const trunc = try jsonUnescapeAlloc(a, "ab\\u12");
+    defer a.free(trunc);
+    try std.testing.expectEqualStrings("ab\\u12", trunc);
 }
 
 test "findJsonNumberValue" {

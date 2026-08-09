@@ -391,6 +391,10 @@ fn loadProject(arena: std.mem.Allocator) !struct { config_mod.Config, config_mod
     const root = try config_mod.findProjectRoot(arena, cwd) orelse return error.NotABeesProject;
     const paths = try config_mod.ProjectPaths.init(arena, root);
     const cfg = try config_mod.load(arena, paths.config_file);
+    // Gateway mode routes every agent through one endpoint — activate it here,
+    // the single load point for all project commands, so no spawn path can miss it.
+    try backend.configureGateway(cfg.gateway);
+    backend.configureToolTimeouts(cfg.timeouts);
     return .{ cfg, paths };
 }
 
@@ -763,7 +767,7 @@ fn cmdDoctor(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, role_filter: 
         }
         matched = true;
         const rc = roles.get(name) orelse role_mod.RoleConfig{ .name = name };
-        try checkRole(arena, io, stdout, cfg, name, rc, chrome, &blockers, &warnings, &browser_needed);
+        try checkRole(arena, io, stdout, cfg, paths, name, rc, chrome, &blockers, &warnings, &browser_needed);
     }
     if (role_filter) |rf| {
         if (!matched) try stdout.print("\nNo role '{s}' runs in this workflow.\n", .{rf});
@@ -852,6 +856,9 @@ fn cmdDoctor(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, role_filter: 
         // Browser roles: actually launch headless Chrome and confirm the DevTools
         // endpoint comes up — not just that the binary exists on disk.
         if (browser_needed) {
+            if (backend.gatewayTextOnly()) {
+                try stdout.print("\n(gateway model is text-only: browser is driven textually, screenshots disallowed)\n", .{});
+            }
             try stdout.print("\nBrowser (headless Chrome + DevTools)\n", .{});
             try stdout.flush();
             switch (backend.probeChrome(io)) {
@@ -896,6 +903,7 @@ fn checkRole(
     io: Io,
     stdout: *Io.Writer,
     cfg: config_mod.Config,
+    paths: config_mod.ProjectPaths,
     name: []const u8,
     rc: role_mod.RoleConfig,
     chrome: ?[]const u8,
@@ -930,11 +938,18 @@ fn checkRole(
     }
 
     // Browser dependency: a role needs a browser when it has an MCP config or
-    // plugins (which resolve to servers like chrome-devtools).
+    // plugins (which resolve to servers like chrome-devtools). This holds in
+    // text-only gateway mode too — the browser is driven textually there.
     const needs_browser = rc.mcp_config != null or rc.plugins.len > 0;
     if (needs_browser) {
         browser_needed.* = true;
-        if (chrome != null) {
+        // A configured-but-missing MCP file is worse than none: the agent is told
+        // to drive a browser, the backend gets no server, and the failure is silent.
+        const mcp_missing = if (rc.mcp_config) |p| !fs.access(resolveProjectPath(arena, paths.root, p)) else false;
+        if (mcp_missing) {
+            try stdout.print("  ✗ mcp_config '{s}' does not exist\n", .{rc.mcp_config.?});
+            blockers.* += 1;
+        } else if (chrome != null) {
             try stdout.print("  ✓ browser MCP configured and Chrome available\n", .{});
         } else {
             try stdout.print("  ✗ browser MCP configured but no Chrome/Chromium found\n", .{});
@@ -944,6 +959,38 @@ fn checkRole(
         try stdout.print("  ⚠ no browser MCP configured — the user agent can't navigate the live app\n", .{});
         warnings.* += 1;
     }
+
+    // File-backed context sources inject nothing when their file is missing or
+    // empty, and resolveContextSources skips unknown names — both vanish silently.
+    for (rc.sources) |s| {
+        const file = if (std.mem.eql(u8, s, "mission"))
+            "MISSION.md"
+        else if (std.mem.eql(u8, s, "operator_feedback"))
+            "feedback.json"
+        else
+            continue;
+        const path = std.fs.path.join(arena, &.{ paths.bees_dir, file }) catch continue;
+        const len = if (fs.readFileAlloc(arena, path, 64 * 1024)) |c| std.mem.trim(u8, c, &std.ascii.whitespace).len else |_| 0;
+        if (len == 0) {
+            try stdout.print("  ⚠ source '{s}' declared but .bees/{s} is missing or empty — nothing is injected\n", .{ s, file });
+            warnings.* += 1;
+        }
+    }
+}
+
+/// Resolve a config-declared path: absolute as-is, otherwise project-root-relative
+/// (config paths are written relative to the project root, not the caller's cwd).
+fn resolveProjectPath(arena: std.mem.Allocator, root: []const u8, p: []const u8) []const u8 {
+    if (std.fs.path.isAbsolute(p)) return p;
+    return std.fs.path.join(arena, &.{ root, p }) catch p;
+}
+
+test "resolveProjectPath joins relative config paths against the project root" {
+    const a = std.testing.allocator;
+    const rel = resolveProjectPath(a, "/srv/proj", ".bees/mcp/chrome-devtools.json");
+    defer a.free(rel);
+    try std.testing.expectEqualStrings("/srv/proj/.bees/mcp/chrome-devtools.json", rel);
+    try std.testing.expectEqualStrings("/etc/mcp.json", resolveProjectPath(a, "/srv/proj", "/etc/mcp.json"));
 }
 
 /// A (backend, model, effort) an agent session runs under.
@@ -953,7 +1000,10 @@ const RoleCombo = struct { bt: types.BackendType, model: []const u8, effort: []c
 /// strategist route a fraction of runs to Codex, so those use two.
 fn roleCombos(cfg: config_mod.Config, name: []const u8, rc: role_mod.RoleConfig, out: *[2]RoleCombo) usize {
     const base_bt = backend.resolveBackend(cfg.default_backend, rc.backend);
-    out[0] = .{ .bt = base_bt, .model = rc.model, .effort = rc.effort };
+    out[0] = .{ .bt = base_bt, .model = backend.gatewayEffectiveModel(rc.model), .effort = rc.effort };
+    // Gateway mode: one claude combo per role (its effective gateway model) —
+    // no codex routing.
+    if (backend.gatewayActive()) return 1;
     if (std.mem.eql(u8, name, "worker") and cfg.workers.codex_fraction > 0 and base_bt != .codex) {
         out[1] = .{ .bt = .codex, .model = cfg.codex_execution.model, .effort = cfg.codex_execution.effort };
         return 2;
@@ -1330,7 +1380,7 @@ fn cmdStart(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, force: bool) !
         try stdout.print("  ✗ '{s}' not found on PATH — every agent runs through it\n", .{cfg.claude_binary});
         blockers += 1;
     }
-    if ((cfg.workers.codex_fraction > 0 or cfg.strategist.codex_fraction > 0) and !commandPresent(arena, io, cwd, "codex")) {
+    if (!backend.gatewayActive() and (cfg.workers.codex_fraction > 0 or cfg.strategist.codex_fraction > 0) and !commandPresent(arena, io, cwd, "codex")) {
         try stdout.print("  ✗ 'codex' not found but codex_fraction routes runs to it\n", .{});
         blockers += 1;
     }
@@ -1551,31 +1601,16 @@ fn cmdStatus(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
     const now: u64 = fs.timestamp();
     const day_start = now - @mod(now, 86400);
 
-    // Try SQLite first
-    const sqlite_path = try std.fs.path.join(arena, &.{ paths.db_dir, "data.sqlite" });
-    var sql_db = sqlite.Db.openReadOnly(sqlite_path) catch null;
-    defer if (sql_db) |*db| db.close();
-
-    var stats = db_query.DailyStats{};
-    if (sql_db) |*db| {
-        stats = db_query.getDailyStats(db, day_start) catch db_query.DailyStats{};
-    }
-
-    // Fall through to LMDB when SQLite is missing OR returned all zeros
-    if (stats.total == 0) lmdb_fallback: {
-        var store = store_mod.Store.open(paths.db_dir) catch {
-            if (sql_db == null) {
-                try stdout.print("No database found. Run `bees run worker` first.\n", .{});
-                return;
-            }
-            break :lmdb_fallback;
-        };
-        defer store.close();
-        const txn = store.beginReadTxn() catch break :lmdb_fallback;
-        defer store_mod.Store.abortTxn(txn);
-        const lmdb_stats = store.getDailyStats(txn, day_start) catch break :lmdb_fallback;
-        stats = lmdb_stats;
-    }
+    // LMDB only: SQLite lags behind syncAll, so a stale non-zero count there
+    // would silently suppress the fresher numbers.
+    var store = store_mod.Store.open(paths.db_dir) catch {
+        try stdout.print("No database found. Run `bees run worker` first.\n", .{});
+        return;
+    };
+    defer store.close();
+    const txn = try store.beginReadTxn();
+    defer store_mod.Store.abortTxn(txn);
+    const stats = try store.getDailyStats(txn, day_start);
 
     if (json) {
         try stdout.print("{{\"project\":", .{});
@@ -1645,6 +1680,24 @@ fn cmdRunMerger(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     try stdout.print("Merger run complete\n", .{});
 }
 
+/// Build a role's context from its declared sources, exactly as the daemon does
+/// (orchestrator.zig) minus changed_files, which only exists in a merge cycle.
+/// Manual `bees run <role>` must see the same context the daemon assembles, or
+/// a daemon bug is unreproducible by hand. Arena-allocated — no frees needed.
+fn buildRoleContext(
+    role_cfg: role_mod.RoleConfig,
+    store: *store_mod.Store,
+    paths: config_mod.ProjectPaths,
+    arena: std.mem.Allocator,
+) ?[]const u8 {
+    const resolved = role_mod.resolveContextSources(role_cfg, arena);
+    if (resolved.sources.len == 0) return null;
+    return ctx_mod.build(store, paths, resolved.sources, .{
+        .worker_summary = ctx_mod.buildWorkerSummary(store, null, arena),
+        .knowledge_tags = resolved.knowledge_tags,
+    }, arena);
+}
+
 fn cmdRunStrategist(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     const project = try loadProject(arena);
     const cfg = project[0];
@@ -1704,11 +1757,6 @@ fn cmdRunStrategist(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void 
         }
     }
 
-    // Build context from all sources via the context module
-    const context = ctx_mod.build(&store, paths, &.{
-        .user_profiles, .operator_feedback, .report_user, .report_qa, .report_sre, .task_trends,
-    }, .{}, arena);
-
     try stdout.print("Running strategist...\n", .{});
     try stdout.flush();
 
@@ -1727,6 +1775,10 @@ fn cmdRunStrategist(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void 
         .stores_report = true,
     };
 
+    // Context comes from the role's declared sources, never a hardcoded list —
+    // a list here silently omits sources the role config actually declares.
+    const step_ctx = buildRoleContext(role_cfg, &store, paths, arena);
+
     try executor.runRole(
         role_cfg,
         .strategist,
@@ -1736,7 +1788,7 @@ fn cmdRunStrategist(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void 
         &logger,
         io,
         arena,
-        context,
+        step_ctx,
         true,
         cfg,
         null,
@@ -1866,6 +1918,8 @@ fn cmdRunQa(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         .stores_report = true,
     };
 
+    const step_ctx = buildRoleContext(role_cfg, &store, paths, arena);
+
     try executor.runRole(
         role_cfg,
         .qa,
@@ -1875,7 +1929,7 @@ fn cmdRunQa(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         &logger,
         io,
         arena,
-        null,
+        step_ctx,
         true,
         cfg,
         null,
@@ -1913,15 +1967,7 @@ fn cmdRunResearcher(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void 
         .stores_report = true,
     };
 
-    // Build context with knowledge for the researcher
-    const resolved = role_mod.resolveContextSources(role_cfg, arena);
-    const step_ctx = if (resolved.sources.len > 0)
-        ctx_mod.build(&store, paths, resolved.sources, ctx_mod.Extras{
-            .knowledge_tags = resolved.knowledge_tags,
-        }, arena)
-    else
-        null;
-    defer if (step_ctx) |sc| arena.free(sc);
+    const step_ctx = buildRoleContext(role_cfg, &store, paths, arena);
 
     try executor.runRole(
         role_cfg,
@@ -1972,6 +2018,8 @@ fn cmdRunUser(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         .stores_report = true,
     };
 
+    const step_ctx = buildRoleContext(role_cfg, &store, paths, arena);
+
     try executor.runRole(
         role_cfg,
         .user,
@@ -1981,7 +2029,7 @@ fn cmdRunUser(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         &logger,
         io,
         arena,
-        null,
+        step_ctx,
         true,
         cfg,
         null,
@@ -2026,6 +2074,13 @@ fn cmdConfig(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
     } else {
         try stdout.print("Project: {s}\n", .{cfg.project.name});
         try stdout.print("Base branch: {s}\n", .{cfg.project.base_branch});
+        if (cfg.gateway.enabled) {
+            try stdout.print("Gateway: {s} — default model {s}{s}; per-role explicit model ids pass through\n", .{
+                cfg.gateway.base_url,
+                cfg.gateway.model,
+                if (cfg.gateway.text_only) " (text-only: screenshots disallowed, browser driven textually)" else "",
+            });
+        }
         try stdout.print("Workers: {d} (model={s}, effort={s}, budget=${d:.0})\n", .{ cfg.workers.count, cfg.workers.model, cfg.workers.effort, cfg.workers.max_budget_usd });
         try stdout.print("Merger: model={s}, effort={s}, budget=${d:.0}\n", .{ cfg.merger.model, cfg.merger.effort, cfg.merger.max_budget_usd });
         if (cfg.build.command) |cmd| try stdout.print("Build: {s}\n", .{cmd});
@@ -2121,7 +2176,7 @@ fn cmdTasksSync(arena: std.mem.Allocator, stdout: *Io.Writer, file: ?[]const u8)
     defer store.close();
 
     const tasks_path = file orelse paths.tasks_file;
-    try tasks_mod.syncFromFile(&store, tasks_path, arena);
+    try tasks_mod.syncFromFile(&store, tasks_path, .template, arena);
 
     // Clean up any stale running sessions
     const cleaned = store.cleanupStaleSessions();
@@ -2536,20 +2591,8 @@ fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?type
     const project = try loadProject(arena);
     const paths = project[1];
 
-    // Try SQLite first for JSON output
-    if (json) {
-        const sqlite_path = try std.fs.path.join(arena, &.{ paths.db_dir, "data.sqlite" });
-        var sql_db = sqlite.Db.openReadOnly(sqlite_path) catch null;
-        defer if (sql_db) |*db| db.close();
-
-        if (sql_db) |*db| {
-            try db_query.writeSessionsJson(db, stdout, session_type, limit);
-            try stdout.print("\n", .{});
-            return;
-        }
-    }
-
-    // LMDB fallback (or text mode which needs custom formatting)
+    // LMDB is the authoritative live store; SQLite only catches up on syncAll,
+    // so serving --json from it made the same id report different numbers.
     var store = store_mod.Store.open(paths.db_dir) catch {
         try stdout.print("No database found\n", .{});
         return;
@@ -2566,7 +2609,7 @@ fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?type
         try stdout.print("  {s:-<6} {s:-<10} {s:-<10} {s:-<8} {s:-<10} {s:-<30}\n", .{ "", "", "", "", "", "" });
     }
 
-    var iter = try store.iterSessions(txn);
+    var iter = try store.iterSessionsDesc(txn);
     defer iter.close();
     var printed: u32 = 0;
     var first_json = true;
@@ -2579,10 +2622,18 @@ fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?type
         if (json) {
             if (!first_json) try stdout.print(",", .{});
             first_json = false;
-            try stdout.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"task\":", .{
-                entry.id,                       entry.view.header.type.label(),                        entry.view.header.status.label(),
-                entry.view.header.commit_count, @as(u64, entry.view.header.cost_microdollars) / 10000,
+            try stdout.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"backend\":\"{s}\",\"worker_id\":{d},\"commits\":{d},", .{
+                entry.id,                          entry.view.header.type.label(),
+                entry.view.header.status.label(),  entry.view.header.backend.label(),
+                entry.view.header.worker_id,       entry.view.header.commit_count,
             });
+            // null, not 0 — a killed agent's real spend was never reported, and
+            // printing $0.00 makes an expensive failing role look like the cheapest.
+            if (entry.view.header.has_cost) {
+                try stdout.print("\"cost_cents\":{d},\"task\":", .{@as(u64, entry.view.header.cost_microdollars) / 10000});
+            } else {
+                try stdout.print("\"cost_cents\":null,\"task\":", .{});
+            }
             try writeJsonStr(stdout, entry.view.task);
             try stdout.print(",\"branch\":", .{});
             try writeJsonStr(stdout, entry.view.branch);
@@ -2606,9 +2657,16 @@ fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?type
             }
             try stdout.print("}}", .{});
         } else {
-            try stdout.print("  {d:<6} {s:<10} {s:<10} {d:<8} ${d:<9.2} {s:<30}\n", .{
-                entry.id,                       entry.view.header.type.label(),                                           entry.view.header.status.label(),
-                entry.view.header.commit_count, @as(f64, @floatFromInt(entry.view.header.cost_microdollars)) / 1000000.0, entry.view.task,
+            var cost_buf: [16]u8 = undefined;
+            const cost_str = if (entry.view.header.has_cost)
+                std.fmt.bufPrint(&cost_buf, "${d:.2}", .{
+                    @as(f64, @floatFromInt(entry.view.header.cost_microdollars)) / 1000000.0,
+                }) catch "?"
+            else
+                "-"; // spend unknown (no terminal result event), not zero
+            try stdout.print("  {d:<6} {s:<10} {s:<10} {d:<8} {s:<10} {s:<30}\n", .{
+                entry.id,                       entry.view.header.type.label(), entry.view.header.status.label(),
+                entry.view.header.commit_count, cost_str,                       entry.view.task,
             });
         }
         printed += 1;
@@ -2637,10 +2695,17 @@ fn cmdSession(arena: std.mem.Allocator, stdout: *Io.Writer, id: u64, json: bool)
     };
 
     if (json) {
-        try stdout.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},\"cost_cents\":{d},\"cost_microdollars\":{d},\"task\":", .{
-            id,                          session.header.type.label(),                        session.header.status.label(),
-            session.header.commit_count, @as(u64, session.header.cost_microdollars) / 10000, session.header.cost_microdollars,
+        try stdout.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"commits\":{d},", .{
+            id,                          session.header.type.label(), session.header.status.label(),
+            session.header.commit_count,
         });
+        if (session.header.has_cost) {
+            try stdout.print("\"cost_cents\":{d},\"cost_microdollars\":{d},\"task\":", .{
+                @as(u64, session.header.cost_microdollars) / 10000, session.header.cost_microdollars,
+            });
+        } else {
+            try stdout.print("\"cost_cents\":null,\"cost_microdollars\":null,\"task\":", .{});
+        }
         try writeJsonStr(stdout, session.task);
         try stdout.print(",\"branch\":", .{});
         try writeJsonStr(stdout, session.branch);
@@ -2660,8 +2725,15 @@ fn cmdSession(arena: std.mem.Allocator, stdout: *Io.Writer, id: u64, json: bool)
         try stdout.print(",\"events\":[", .{});
     } else {
         try stdout.print("Session #{d} | {s} | {s}\n", .{ id, session.header.type.label(), session.branch });
-        try stdout.print("Status: {s} | Cost: ${d:.2} | Commits: {d} | Turns: {d}\n", .{
-            session.header.status.label(), @as(f64, @floatFromInt(session.header.cost_microdollars)) / 1000000.0,
+        var cost_buf: [16]u8 = undefined;
+        const cost_str = if (session.header.has_cost)
+            std.fmt.bufPrint(&cost_buf, "${d:.2}", .{
+                @as(f64, @floatFromInt(session.header.cost_microdollars)) / 1000000.0,
+            }) catch "?"
+        else
+            "unknown";
+        try stdout.print("Status: {s} | Cost: {s} | Commits: {d} | Turns: {d}\n", .{
+            session.header.status.label(), cost_str,
             session.header.commit_count,   session.header.num_turns,
         });
         if (session.task.len > 0) try stdout.print("Task: {s}\n\nEvents:\n", .{session.task});
@@ -2683,11 +2755,11 @@ fn cmdSession(arena: std.mem.Allocator, stdout: *Io.Writer, id: u64, json: bool)
             }
             if (ev.header.event_type == .result) {
                 if (claude.findJsonNumberValue(ev.raw_json, "\"total_cost_usd\"")) |cost| {
-                    const cents: u64 = @intFromFloat(@max(cost * 100.0, 0.0));
+                    const cents: u64 = backend.f64ToU64Sat(cost * 100.0);
                     try stdout.print(",\"cost_cents\":{d}", .{cents});
                 }
                 if (claude.findJsonNumberValue(ev.raw_json, "\"duration_ms\"")) |dur| {
-                    const ms: u64 = @intFromFloat(@max(dur, 0.0));
+                    const ms: u64 = backend.f64ToU64Sat(dur);
                     try stdout.print(",\"duration_ms\":{d}", .{ms});
                 }
             }
@@ -2819,6 +2891,7 @@ fn printError(stdout: *Io.Writer, e: anyerror) !void {
         error.UnknownCommand => "Unknown command. Run `bees help` for usage.",
         error.InvalidWorkerId => "Invalid worker ID. Must be a number.",
         error.NotABeesProject => "Not a bees project. Run `bees init` first.",
+        error.GatewayKeyMissing => "gateway.enabled is set but the API key env var (gateway.api_key_env, default LITELLM_API_KEY) is not in the environment.",
         else => "An error occurred",
     };
     try stdout.print("Error: {s} ({s})\n", .{ msg, @errorName(e) });

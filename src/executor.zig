@@ -172,7 +172,8 @@ pub fn runRole(
         .type = session_type,
         .status = if (result.is_error) .err else .done,
         .has_exit_code = true,
-        .has_cost = true,
+        // See worker.zig: honest only when a terminal result event was seen.
+        .has_cost = result.cost_known,
         .model = model,
         .has_tokens = has_tokens,
         .has_duration = true,
@@ -216,13 +217,17 @@ pub fn runRole(
     if (result.result_text.len > 0) {
         const kb_updates = knowledge.extractUpdates(result.result_text, allocator);
         if (kb_updates.len > 0) {
-            const kb_dir = std.fs.path.join(allocator, &.{ paths.bees_dir, "knowledge" }) catch "";
-            defer if (kb_dir.len > 0) allocator.free(kb_dir);
-            if (kb_dir.len > 0) {
-                knowledge.applyUpdates(store, kb_dir, kb_updates, role_name, allocator) catch |e| {
-                    logger.warn("[{s}] knowledge update failed: {}", .{ role_name, e });
-                };
-                logger.info("[{s}] applied {d} knowledge updates", .{ role_name, kb_updates.len });
+            const applied = knowledge.applyUpdates(store, paths.knowledge_dir, kb_updates, role_name, allocator) catch |e| blk: {
+                logger.err("[{s}] knowledge update failed: {}", .{ role_name, e });
+                break :blk 0;
+            };
+            // Report what was WRITTEN, not what was parsed — a silently dropped
+            // page used to be logged as success, which is how an empty KB stayed
+            // invisible.
+            if (applied < kb_updates.len) {
+                logger.warn("[{s}] knowledge: only {d}/{d} updates written", .{ role_name, applied, kb_updates.len });
+            } else {
+                logger.info("[{s}] applied {d} knowledge updates", .{ role_name, applied });
             }
         }
     }

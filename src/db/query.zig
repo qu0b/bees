@@ -218,7 +218,7 @@ pub fn getDailyStats(db: *sqlite.Db, day_start_ts: u64) !DailyStats {
         \\  SUM(CASE WHEN status = 4 THEN 1 ELSE 0 END),
         \\  SUM(CASE WHEN status = 5 THEN 1 ELSE 0 END),
         \\  SUM(CASE WHEN status = 6 THEN 1 ELSE 0 END),
-        \\  COALESCE(SUM(cost_microdollars / 10000), 0)
+        \\  COALESCE(SUM(cost_microdollars), 0) / 10000
         \\FROM sessions WHERE started_at >= ?
     ++ "\x00",
     );
@@ -309,6 +309,21 @@ pub fn getMeta(db: *sqlite.Db, key: []const u8) ?[]const u8 {
 // ============================================================================
 // JSON helpers
 // ============================================================================
+
+test "getDailyStats sums microdollars before converting to cents" {
+    var db = try sqlite.Db.open(":memory:");
+    defer db.close();
+    try db.execMulti(
+        \\CREATE TABLE sessions (id INTEGER PRIMARY KEY, status INTEGER,
+        \\  cost_microdollars INTEGER, started_at INTEGER);
+        \\INSERT INTO sessions VALUES (1,1,15000,2000),(2,1,15000,2000),(3,1,15000,2000);
+    );
+
+    // 45000 micros = 4 cents; per-row division would truncate to 3.
+    const stats = try getDailyStats(&db, 1000);
+    try std.testing.expectEqual(@as(u32, 3), stats.total);
+    try std.testing.expectEqual(@as(u64, 4), stats.total_cost_cents);
+}
 
 fn writeJsonStr(w: *Io.Writer, s: []const u8) !void {
     try w.writeAll("\"");

@@ -18,6 +18,7 @@ const backend_mod = @import("backend.zig");
 
 /// Binary file extensions to always exclude from context.
 const binary_extensions = [_][]const u8{
+    // zig fmt: off
     ".png", ".jpg", ".jpeg", ".gif", ".ico", ".bmp", ".svg", ".webp",
     ".woff", ".woff2", ".ttf", ".eot", ".otf",
     ".pdf", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z",
@@ -25,6 +26,7 @@ const binary_extensions = [_][]const u8{
     ".wasm", ".pyc", ".o", ".a", ".so", ".dylib", ".dll",
     ".mp3", ".mp4", ".wav", ".avi", ".mov",
     ".sqlite", ".db", ".lmdb",
+    // zig fmt: on
 };
 
 /// Result of the seed build process.
@@ -87,7 +89,18 @@ pub fn buildContextBlob(
 ) ?[]const u8 {
     var buf: std.ArrayList(u8) = .empty;
 
-    buf.appendSlice(allocator, "Here is the project source code for context. Review it carefully to understand the codebase.\n\n") catch return null;
+    // Framing matters: this blob is a cached prefix shared by every role, so it is a
+    // snapshot taken when the cycle began, not the working tree. Telling the agent to
+    // "review it carefully" front-loads reading it and invites editing against stale
+    // content — point at it as an index instead and push re-reads to the point of use.
+    buf.appendSlice(allocator,
+        \\Below is a snapshot of the project's source files, taken at the start of this cycle.
+        \\Use it to orient — to see how the codebase is laid out and where things live — rather
+        \\than reading it end to end. It may be out of date: re-read any file with the Read tool
+        \\before you reason about its current contents or edit it.
+        \\
+        \\
+    ) catch return null;
 
     for (file_paths) |rel_path| {
         // Check budget before reading
@@ -329,15 +342,17 @@ fn askHaikuForFiles(
 
     const result = std.process.run(allocator, io, .{
         .argv = &.{
+            // zig fmt: off
             "claude", "-p",
             "--model", "haiku",
-            "--effort",  "low",
+            "--effort", "low",
             "--max-turns", "1",
             "--max-budget-usd", "0.50",
             "--no-session-persistence",
             "--output-format", "text",
             "--permission-mode", "plan",
             prompt,
+            // zig fmt: on
         },
         .cwd = .{ .path = project_root },
         .environ_map = &env_map,

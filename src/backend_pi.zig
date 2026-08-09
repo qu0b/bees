@@ -96,7 +96,6 @@ pub fn processEvent(line: []const u8, acc: *backend.ResultAccumulator) types.Eve
         .is_error = false,
         .role = .none,
         .duration_secs = 0,
-        .cost_cents = 0,
         .num_turns = 0,
     };
 

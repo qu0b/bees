@@ -31,7 +31,10 @@ pub fn getProfile(name: []const u8) ?ToolPermissions {
     if (std.mem.eql(u8, name, "strategist")) return strategist;
     if (std.mem.eql(u8, name, "user")) return user_agent;
     if (std.mem.eql(u8, name, "researcher")) return researcher;
-    if (std.mem.eql(u8, name, "review")) return readonly;
+    // The review agent performs the merge itself when it approves (see
+    // merger.reviewAndMerge) — a readonly review profile made every ACCEPT
+    // silently record as "rejected" because `git merge` was denied.
+    if (std.mem.eql(u8, name, "review")) return merger;
     if (std.mem.eql(u8, name, "founder")) return founder_profile;
     if (std.mem.eql(u8, name, "improver")) return improver_profile;
     if (std.mem.eql(u8, name, "readonly")) return readonly;
@@ -54,7 +57,7 @@ pub fn getDefaultForSessionType(session_type: types.SessionType) ?ToolPermission
         .researcher => researcher,
         .founder => founder_profile,
         .improver => improver_profile,
-        .review => readonly,
+        .review => merger,
     };
 }
 
@@ -439,6 +442,23 @@ test "qa profile denies Edit" {
         if (std.mem.eql(u8, t, "Edit")) return; // found
     }
     return error.TestUnexpectedResult;
+}
+
+test "strategist grants the bare ORIENT commands its prompt uses" {
+    // .bees/roles/strategist/prompt.md ORIENT step runs `git log …`, `bees status`,
+    // `bees tasks`. Allow patterns match on the leading token, so `cd … && bees …`
+    // or `git -C … log` would be denied silently. Guard both directions: the bare
+    // forms stay granted, and nobody "fixes" a denial by widening the sandbox.
+    const s = getProfile("strategist").?;
+    var has_git_log = false;
+    var has_bees = false;
+    for (s.allowed_tools) |t| {
+        if (std.mem.eql(u8, t, "Bash(git log *)")) has_git_log = true;
+        if (std.mem.eql(u8, t, "Bash(bees *)")) has_bees = true;
+        if (std.mem.eql(u8, t, "Bash(cd *)")) return error.TestUnexpectedResult;
+        if (std.mem.eql(u8, t, "Bash(git -C *)")) return error.TestUnexpectedResult;
+    }
+    try std.testing.expect(has_git_log and has_bees);
 }
 
 test "no profile allows the sh interpreter escape" {

@@ -8,6 +8,7 @@ const log_mod = @import("log.zig");
 const fs = @import("fs.zig");
 const git = @import("git.zig");
 const claude = @import("claude.zig");
+const backend_mod = @import("backend.zig");
 const tasks_mod = @import("tasks.zig");
 const sqlite = @import("db/sqlite.zig");
 const query = @import("db/query.zig");
@@ -160,13 +161,13 @@ fn route(
     sql_db: *?sqlite.Db,
 ) !void {
     if (std.mem.eql(u8, method, "GET")) {
-        if (std.mem.eql(u8, path, "/api/status")) return handleStatus(w, store, cfg, paths, sql_db);
-        if (std.mem.eql(u8, path, "/api/sessions")) return handleSessions(w, store, null, sql_db);
+        if (std.mem.eql(u8, path, "/api/status")) return handleStatus(w, store, cfg, paths);
+        if (std.mem.eql(u8, path, "/api/sessions")) return handleSessions(w, store, null);
         if (std.mem.eql(u8, path, "/api/tasks")) return handleTasks(w, store, sql_db);
         if (std.mem.eql(u8, path, "/api/config")) return handleConfig(w, paths);
         if (std.mem.eql(u8, path, "/api/log")) return handleLog(w, paths, allocator);
-        if (std.mem.eql(u8, path, "/api/workers")) return handleSessions(w, store, .worker, sql_db);
-        if (std.mem.eql(u8, path, "/api/analytics")) return handleSessions(w, store, null, sql_db);
+        if (std.mem.eql(u8, path, "/api/workers")) return handleSessions(w, store, .worker);
+        if (std.mem.eql(u8, path, "/api/analytics")) return handleSessions(w, store, null);
         if (std.mem.eql(u8, path, "/api/branches")) return handleBranches(w, paths, io, allocator);
         if (std.mem.eql(u8, path, "/api/vision")) return handleVisionGet(w, store);
         if (std.mem.startsWith(u8, path, "/api/reports/")) return handleReportGet(w, store, path);
@@ -181,7 +182,7 @@ fn route(
             }
             const id = std.fmt.parseInt(u64, rest, 10) catch
                 return writeResponse(w, 400, "application/json", "{\"error\":\"Invalid session ID\"}");
-            return handleSession(w, store, id, sql_db);
+            return handleSession(w, store, id);
         }
 
         return writeResponse(w, 404, "application/json", "{\"error\":\"Not found\"}");
@@ -205,28 +206,15 @@ fn route(
 
 // === Endpoint handlers ===
 
-fn handleStatus(w: *Io.Writer, store: *store_mod.Store, cfg: config_mod.Config, paths: config_mod.ProjectPaths, sql_db: *?sqlite.Db) !void {
+/// Session reads go to LMDB, never the SQLite replica. The replica lags behind
+/// `syncAll`, and it does not carry `has_cost`, so its rollup sums unreported
+/// spend as if it were zero. `bees status`/`bees sessions` read LMDB for the same
+/// reason — serving SQLite here would make the dashboard and the CLI disagree
+/// about the same session id.
+fn handleStatus(w: *Io.Writer, store: *store_mod.Store, cfg: config_mod.Config, paths: config_mod.ProjectPaths) !void {
     const now = fs.timestamp();
     const day_start = now - @mod(now, 86400);
 
-    // Try SQLite first, fall back to LMDB
-    if (sql_db.*) |*db| {
-        const stats = query.getDailyStats(db, day_start) catch query.DailyStats{};
-        try writeResponseHeader(w, 200, "application/json");
-        try w.print("{{\"status\":{{\"project\":", .{});
-        try writeJsonStr(w, cfg.project.name);
-        try w.print(",\"path\":", .{});
-        try writeJsonStr(w, paths.root);
-        try w.print(",\"workers\":{d},\"today\":{{\"total\":{d},\"accepted\":{d},\"rejected\":{d},\"conflicts\":{d},\"build_failures\":{d},\"cost_cents\":{d}}}}},\"sessions\":", .{
-            cfg.workers.count, stats.total, stats.accepted, stats.rejected,
-            stats.conflicts, stats.build_failures, stats.total_cost_cents,
-        });
-        try query.writeSessionsJson(db, w, null, 100);
-        try w.writeAll("}}");
-        return;
-    }
-
-    // LMDB fallback
     const txn = try store.beginReadTxn();
     defer store_mod.Store.abortTxn(txn);
     const stats = try store.getDailyStats(txn, day_start);
@@ -243,35 +231,14 @@ fn handleStatus(w: *Io.Writer, store: *store_mod.Store, cfg: config_mod.Config, 
     try w.writeAll("}}");
 }
 
-fn handleSessions(w: *Io.Writer, store: *store_mod.Store, type_filter: ?types.SessionType, sql_db: *?sqlite.Db) !void {
-    if (sql_db.*) |*db| {
-        try writeResponseHeader(w, 200, "application/json");
-        try query.writeSessionsJson(db, w, type_filter, 200);
-        return;
-    }
-    // LMDB fallback
+fn handleSessions(w: *Io.Writer, store: *store_mod.Store, type_filter: ?types.SessionType) !void {
     const txn = try store.beginReadTxn();
     defer store_mod.Store.abortTxn(txn);
     try writeResponseHeader(w, 200, "application/json");
     try writeSessionsArray(w, store, txn, type_filter);
 }
 
-fn handleSession(w: *Io.Writer, store: *store_mod.Store, id: u64, sql_db: *?sqlite.Db) !void {
-    if (sql_db.*) |*db| {
-        // Check existence before committing to response header
-        var exists_stmt = db.prepare("SELECT 1 FROM sessions WHERE id = ?\x00") catch
-            return writeResponse(w, 500, "application/json", "{\"error\":\"Query failed\"}");
-        defer exists_stmt.finalize();
-        sqlite.bindInt(exists_stmt.handle, 1, @intCast(id));
-        const exists = exists_stmt.step() catch false;
-        if (!exists) return writeResponse(w, 404, "application/json", "{\"error\":\"Session not found\"}");
-
-        try writeResponseHeader(w, 200, "application/json");
-        _ = query.writeSessionJson(db, w, id) catch {};
-        return;
-    }
-
-    // LMDB fallback
+fn handleSession(w: *Io.Writer, store: *store_mod.Store, id: u64) !void {
     const txn = try store.beginReadTxn();
     defer store_mod.Store.abortTxn(txn);
 
@@ -332,11 +299,11 @@ fn handleSession(w: *Io.Writer, store: *store_mod.Store, id: u64, sql_db: *?sqli
         }
         if (ev.header.event_type == .result) {
             if (claude.findJsonNumberValue(ev.raw_json, "\"total_cost_usd\"")) |cost| {
-                const cents: u64 = @intFromFloat(@max(cost * 100.0, 0.0));
+                const cents: u64 = backend_mod.f64ToU64Sat(cost * 100.0);
                 try w.print(",\"cost_cents\":{d}", .{cents});
             }
             if (claude.findJsonNumberValue(ev.raw_json, "\"duration_ms\"")) |dur| {
-                const ms: u64 = @intFromFloat(@max(dur, 0.0));
+                const ms: u64 = backend_mod.f64ToU64Sat(dur);
                 try w.print(",\"duration_ms\":{d}", .{ms});
             }
         }

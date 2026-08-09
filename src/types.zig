@@ -74,6 +74,11 @@ pub const EventType = enum(u3) {
     tool_use = 2,
     tool_result = 3,
     result = 4,
+    /// Liveness heartbeat emitted while a tool call is still running. NOT
+    /// progress: a hung tool emits these forever (2026-08-09: 986 of them over
+    /// 8h while one Bash call never returned). Kept distinct from `.result` so
+    /// the stall watchdog and cost accounting can ignore it.
+    tool_progress = 5,
 
     pub fn fromJsonString(s: []const u8) EventType {
         return switch (s.len) {
@@ -82,8 +87,15 @@ pub const EventType = enum(u3) {
             7 => if (std.mem.eql(u8, s, "message")) .message else .result,
             8 => if (std.mem.eql(u8, s, "tool_use")) .tool_use else .result,
             11 => if (std.mem.eql(u8, s, "tool_result")) .tool_result else .result,
+            13 => if (std.mem.eql(u8, s, "tool_progress")) .tool_progress else .result,
             else => .result,
         };
+    }
+
+    /// True when this event means the agent actually advanced. Drives the stall
+    /// watchdog — heartbeats must never count.
+    pub fn isProgress(self: EventType) bool {
+        return self != .tool_progress;
     }
 
     pub fn label(self: EventType) []const u8 {
@@ -93,9 +105,23 @@ pub const EventType = enum(u3) {
             .tool_use => "tool_use",
             .tool_result => "tool_result",
             .result => "result",
+            .tool_progress => "tool_progress",
         };
     }
 };
+
+test "tool_progress is its own event type and never counts as progress" {
+    // Regression (2026-08-09): "tool_progress" fell through to `.result`, so a
+    // wedged tool's heartbeats were stored as results, marked the session as
+    // having a terminal result, and hid an 8h hang.
+    try std.testing.expectEqual(EventType.tool_progress, EventType.fromJsonString("tool_progress"));
+    try std.testing.expect(!EventType.tool_progress.isProgress());
+    for ([_]EventType{ .init_event, .message, .tool_use, .tool_result, .result }) |t| {
+        try std.testing.expect(t.isProgress());
+    }
+    // Unknown types still fall back to `.result`.
+    try std.testing.expectEqual(EventType.result, EventType.fromJsonString("something_else"));
+}
 
 pub const ToolName = enum(u4) {
     none = 0,
@@ -393,7 +419,13 @@ pub const SessionHeader = packed struct(u384) {
     status: SessionStatus,
     has_exit_code: bool,
     has_cost: bool,
-    model: ModelType,
+    // Bits 9..10 are the frozen pre-2026-07 ModelType(u2) slot. When .fable
+    // widened ModelType to u3 the field grew in place and shifted every
+    // subsequent field (worker_id..cache_read_tokens) up one bit, silently
+    // misreading every record written before then. The slot stays 2 bits wide
+    // forever; `model` now lives in the tail pad. Old records still carry their
+    // model value here — see getModel().
+    model_legacy: u2 = 0,
     has_tokens: bool,
     has_duration: bool,
     has_diff_summary: bool,
@@ -416,11 +448,33 @@ pub const SessionHeader = packed struct(u384) {
     result_subtype: ResultSubtype = .unknown,
     stop_reason: StopReason = .unknown,
     duration_api_ms: u32 = 0,
-    _pad: u9 = 0, // Reduced from u10 after ModelType u2→u3 (added .fable)
+    // Written here (tail pad) instead of bits 9..10 so widening ModelType never
+    // moves another field again. Zero (= .opus) in every pre-2026-07 record.
+    model: ModelType = .opus,
+    _pad: u7 = 0,
+
+    /// Model of this session, valid for records written before and after the
+    /// move out of bits 9..10. Exact, not a heuristic: writers always leave
+    /// model_legacy zero, so a non-.opus `model` can only come from a new
+    /// record, and a non-zero `model_legacy` only from an old one.
+    pub fn getModel(self: SessionHeader) ModelType {
+        if (self.model != .opus) return self.model;
+        return @enumFromInt(@as(u3, self.model_legacy));
+    }
 
     comptime {
         assert(@sizeOf(SessionHeader) == 48);
         assert(@bitSizeOf(SessionHeader) == 384);
+        // On-disk bit offsets — frozen. Records carry no version tag, so moving
+        // any of these silently misreads every existing session.
+        assert(@bitOffsetOf(SessionHeader, "worker_id") == 17);
+        assert(@bitOffsetOf(SessionHeader, "commit_count") == 33);
+        assert(@bitOffsetOf(SessionHeader, "started_at") == 65);
+        assert(@bitOffsetOf(SessionHeader, "cost_microdollars") == 177);
+        assert(@bitOffsetOf(SessionHeader, "result_subtype") == 337);
+        // getModel()'s legacy fallback is only correct while both slots stay put.
+        assert(@bitOffsetOf(SessionHeader, "model_legacy") == 9);
+        assert(@bitOffsetOf(SessionHeader, "model") == 374);
         // Ensure started_at and finished_at can hold timestamps until year ~10889.
         assert(@bitSizeOf(@TypeOf(@as(SessionHeader, undefined).started_at)) == 40);
         assert(@bitSizeOf(@TypeOf(@as(SessionHeader, undefined).finished_at)) == 40);
@@ -492,6 +546,11 @@ pub const TaskHeader = packed struct(u128) {
     origin: TaskOrigin,
     _reserved: u12 = 0,
 
+    /// Exhausted: tried enough times with no accepted result.
+    pub fn isExhausted(self: TaskHeader) bool {
+        return self.total_runs >= 3 and self.accepted == 0 and self.empty >= 3;
+    }
+
     comptime {
         assert(@sizeOf(TaskHeader) == 16);
         assert(@bitSizeOf(TaskHeader) == 128);
@@ -522,9 +581,8 @@ pub const EventMeta = packed struct(u64) {
     role: Role,
     _reserved: u6 = 0,
     duration_secs: u16,
-    cost_cents: u16,
     num_turns: u8,
-    _pad: u8 = 0,
+    _pad: u24 = 0,
 
     comptime {
         assert(@sizeOf(EventMeta) == 8);
@@ -660,6 +718,38 @@ test "packed struct sizes" {
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(ReviewHeader));
     try std.testing.expectEqual(@as(usize, 16), @sizeOf(TaskHeader));
     try std.testing.expectEqual(@as(usize, 8), @sizeOf(EventMeta));
+}
+
+test "SessionHeader decodes pre-2026-07 records" {
+    // Byte image produced by the original layout (ModelType u2 at bits 9..10):
+    // sre/done, model=sonnet, worker_id=0, commits=0, turns=17,
+    // started_at=1775436913, cost_microdollars=322805, input_tokens=11.
+    var bits: u384 = 0;
+    bits |= @as(u384, @intFromEnum(SessionType.sre));
+    bits |= @as(u384, @intFromEnum(SessionStatus.done)) << 4;
+    bits |= @as(u384, 1) << 8; // has_cost
+    bits |= @as(u384, 1) << 9; // legacy model = sonnet
+    bits |= @as(u384, 17) << 41; // num_turns
+    bits |= @as(u384, 1775436913) << 65; // started_at
+    bits |= @as(u384, 322805) << 177; // cost_microdollars
+    bits |= @as(u384, 11) << 209; // input_tokens
+
+    const h: SessionHeader = @bitCast(bits);
+    try std.testing.expectEqual(SessionType.sre, h.type);
+    try std.testing.expectEqual(ModelType.sonnet, h.getModel());
+    try std.testing.expectEqual(@as(u8, 0), h.commit_count);
+    try std.testing.expectEqual(@as(u8, 17), h.num_turns);
+    try std.testing.expectEqual(@as(u40, 1775436913), h.started_at);
+    try std.testing.expectEqual(@as(u32, 322805), h.cost_microdollars);
+    try std.testing.expectEqual(@as(u32, 11), h.input_tokens);
+}
+
+test "SessionHeader getModel reads new records" {
+    var h: SessionHeader = @bitCast(@as(u384, 0));
+    h.model = .fable;
+    try std.testing.expectEqual(ModelType.fable, h.getModel());
+    h.model = .opus;
+    try std.testing.expectEqual(ModelType.opus, h.getModel());
 }
 
 test "SessionKey round-trip" {

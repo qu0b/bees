@@ -193,7 +193,7 @@ pub fn resolveContextSources(role: RoleConfig, allocator: std.mem.Allocator) Res
 
 /// Validate all roles and their references. Returns error messages.
 pub fn validate(set: *const RoleSet, allocator: std.mem.Allocator) []const []const u8 {
-    var errors = std.ArrayList([]const u8).init(allocator);
+    var errors: std.ArrayList([]const u8) = .empty;
 
     var it = set.roles.iterator();
     while (it.next()) |entry| {
@@ -201,6 +201,12 @@ pub fn validate(set: *const RoleSet, allocator: std.mem.Allocator) []const []con
         // Check prompt exists
         if (role.prompt_path.len == 0) {
             const msg = std.fmt.allocPrint(allocator, "role '{s}': no prompt.md found", .{role.name}) catch continue;
+            errors.append(allocator, msg) catch continue;
+        }
+        // Workers are the only role that writes product code — an empty
+        // sources list silently cuts them off from the knowledge base.
+        if (std.mem.eql(u8, role.name, "worker") and role.sources.len == 0) {
+            const msg = std.fmt.allocPrint(allocator, "role 'worker': no sources declared — knowledge base will not be injected", .{}) catch continue;
             errors.append(allocator, msg) catch continue;
         }
         // Check report sources reference existing roles
@@ -240,4 +246,26 @@ test "resolveContextSources maps the mission north-star source" {
     try std.testing.expectEqual(context.Source.user_profiles, resolved.sources[1]);
     // No knowledge requested → knowledge stays inactive.
     try std.testing.expect(resolved.knowledge_tags == null);
+}
+
+test "validate flags unknown workflow roles and unknown report sources" {
+    const alloc = std.testing.allocator;
+    const workflow = @import("workflow.zig");
+    const wf = workflow.defaultWorkflow();
+    const errs = workflow.validate(&wf, &.{"worker"}, alloc);
+    defer {
+        for (errs) |e| alloc.free(e);
+        alloc.free(errs);
+    }
+    try std.testing.expect(errs.len > 0);
+
+    var set = RoleSet{ .roles = std.StringHashMap(RoleConfig).init(alloc), .allocator = alloc };
+    defer set.roles.deinit();
+    try set.roles.put("a", .{ .name = "a", .prompt_path = "p.md", .sources = &.{"report:ghost"} });
+    const rerrs = validate(&set, alloc);
+    defer {
+        for (rerrs) |e| alloc.free(e);
+        alloc.free(rerrs);
+    }
+    try std.testing.expectEqual(@as(usize, 1), rerrs.len);
 }

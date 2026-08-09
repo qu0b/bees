@@ -30,6 +30,7 @@ pub const Config = struct {
     timeouts: Timeouts = .{},
     cache: Cache = .{},
     funding: Funding = .{},
+    gateway: Gateway = .{},
 
     pub const Project = struct {
         name: []const u8,
@@ -157,7 +158,18 @@ pub const Config = struct {
     };
 
     pub const Timeouts = struct {
-        max_idle_secs: u32 = 600,
+        /// Stall watchdog: SIGTERM (then SIGKILL) an agent process that has
+        /// produced no PROGRESS event for this long. Heartbeats don't count —
+        /// this measures advancement, not liveness. Generous on purpose: a
+        /// single reasoning turn can legitimately run for minutes; what this
+        /// catches is the wedged-tool hang that stalls the whole daemon.
+        /// 0 disables the watchdog.
+        max_idle_secs: u32 = 1800,
+        /// Per-Bash-call ceilings handed to the agent CLI. Sized against real
+        /// build times here (a cold `cargo build`/`zig build` runs minutes);
+        /// too low kills legitimate work.
+        bash_default_ms: u32 = 300_000,
+        bash_max_ms: u32 = 900_000,
         stale_hours: u32 = 24,
         cleanup_hours: u32 = 72,
     };
@@ -179,6 +191,33 @@ pub const Config = struct {
         model: []const u8,
         /// Reasoning effort passed to codex as `model_reasoning_effort`.
         effort: []const u8 = "high",
+    };
+
+    /// Anthropic-compatible gateway mode: run EVERY agent through one endpoint
+    /// (e.g. LiteLLM at https://ai.starflinger.eu). When enabled, all roles are
+    /// forced onto the Claude backend (codex_fraction routing is disabled).
+    /// Per-role models still apply: a Claude alias (opus/sonnet/haiku/fable)
+    /// defaults to `model` below, while an explicit id in a role's config.json
+    /// (e.g. "openrouter/deepseek/deepseek-chat") passes through, letting each
+    /// role pick any model the gateway serves.
+    pub const Gateway = struct {
+        enabled: bool = false,
+        /// Endpoint injected as ANTHROPIC_BASE_URL into every agent session.
+        base_url: []const u8 = "",
+        /// Default model for roles whose model is a Claude alias name.
+        model: []const u8 = "",
+        /// Env var holding the gateway API key. The key itself never lives in
+        /// config.json — it is read from the daemon's environment at startup.
+        api_key_env: []const u8 = "LITELLM_API_KEY",
+        /// Send the key as `Authorization: Bearer` (ANTHROPIC_AUTH_TOKEN)
+        /// instead of `x-api-key` (ANTHROPIC_API_KEY). Needed for endpoints
+        /// like vLLM's native /v1/messages that only accept Bearer auth.
+        bearer: bool = false,
+        /// The gateway model is text-only (no vision). Browser tooling stays
+        /// available — DOM/a11y snapshots, console, network, evaluate_script
+        /// are textual — but image-producing tools (chrome-devtools
+        /// take_screenshot) are disallowed at spawn.
+        text_only: bool = true,
     };
 
     pub const Funding = struct {
@@ -212,6 +251,14 @@ pub const Config = struct {
         // Budgets must be finite and positive, else the cost cap is meaningless.
         if (!(self.workers.max_budget_usd > 0) or !std.math.isFinite(self.workers.max_budget_usd)) {
             return error.InvalidBudget;
+        }
+
+        // Gateway mode routes every session to one endpoint/model — a missing
+        // URL or model would silently fall back to nothing usable.
+        if (self.gateway.enabled) {
+            if (!std.mem.startsWith(u8, self.gateway.base_url, "http")) return error.InvalidGatewayUrl;
+            if (self.gateway.model.len == 0) return error.InvalidGatewayModel;
+            if (self.gateway.api_key_env.len == 0) return error.InvalidGatewayKeyEnv;
         }
     }
 };
@@ -299,4 +346,27 @@ test "validate accepts a sane config and rejects dangerous ones" {
     try std.testing.expectError(error.InvalidWorkerCount, (Config{ .project = .{ .name = "ok" }, .workers = .{ .count = 0 } }).validate());
     try std.testing.expectError(error.InvalidMergeThreshold, (Config{ .project = .{ .name = "ok" }, .merger = .{ .merge_threshold = 0 } }).validate());
     try std.testing.expectError(error.InvalidBaseBranch, (Config{ .project = .{ .name = "ok", .base_branch = "-x" } }).validate());
+}
+
+test "gateway config defaults off and validates when enabled" {
+    const off = Config{ .project = .{ .name = "ok" } };
+    try std.testing.expect(!off.gateway.enabled);
+    try off.validate();
+
+    // Enabled with a full endpoint/model passes.
+    try (Config{ .project = .{ .name = "ok" }, .gateway = .{
+        .enabled = true,
+        .base_url = "https://ai.starflinger.eu",
+        .model = "starflinger-anthropic",
+    } }).validate();
+
+    // Enabled but missing pieces fails fast.
+    try std.testing.expectError(error.InvalidGatewayUrl, (Config{ .project = .{ .name = "ok" }, .gateway = .{
+        .enabled = true,
+        .model = "starflinger-anthropic",
+    } }).validate());
+    try std.testing.expectError(error.InvalidGatewayModel, (Config{ .project = .{ .name = "ok" }, .gateway = .{
+        .enabled = true,
+        .base_url = "https://ai.starflinger.eu",
+    } }).validate());
 }

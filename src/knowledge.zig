@@ -17,6 +17,7 @@ const assert = std.debug.assert;
 const store_mod = @import("store.zig");
 const config_mod = @import("config.zig");
 const fs = @import("fs.zig");
+const claude = @import("claude.zig");
 
 const index_key = "kb:index";
 const max_index_size = 64 * 1024;
@@ -201,17 +202,17 @@ pub fn extractUpdates(result_text: []const u8, allocator: std.mem.Allocator) []c
             }
         }
 
-        // Content extends to next "### " or next "## " (end of knowledge section)
+        // Content extends to the next "### CREATE|UPDATE|APPEND" directive line.
+        // A bare "## "/"### " heading inside a page body must NOT terminate it —
+        // .create/.update write with .truncate = true, so a false terminator
+        // silently destroys everything after the first body heading.
         const content_end = blk: {
-            const search_pos = content_start;
-            while (search_pos < section.len) {
-                if (std.mem.indexOfPos(u8, section, search_pos, "\n### ")) |next_dir| {
-                    break :blk next_dir;
-                }
-                if (std.mem.indexOfPos(u8, section, search_pos, "\n## ")) |next_sec| {
-                    break :blk next_sec;
-                }
-                break :blk section.len;
+            var scan = content_start;
+            while (std.mem.indexOfPos(u8, section, scan, "\n### ")) |cand| {
+                const eol = std.mem.indexOfPos(u8, section, cand + 1, "\n") orelse section.len;
+                const line = std.mem.trim(u8, section[cand + 5 .. eol], &std.ascii.whitespace);
+                if (parseDirective(line) != null) break :blk cand;
+                scan = eol;
             }
             break :blk section.len;
         };
@@ -241,14 +242,21 @@ pub fn extractUpdates(result_text: []const u8, allocator: std.mem.Allocator) []c
 }
 
 /// Apply knowledge updates: write files, update LMDB index, append to log.
+/// Returns the number of pages actually written — callers must not report the
+/// parsed count as success.
 pub fn applyUpdates(
     store: *store_mod.Store,
     knowledge_dir: []const u8,
     updates: []const Update,
     role_name: []const u8,
     allocator: std.mem.Allocator,
-) !void {
-    if (updates.len == 0) return;
+) !usize {
+    if (updates.len == 0) return 0;
+
+    // Fail fast if the knowledge root cannot exist. Top-level pages (no directory
+    // component) get no per-parent makePath below, so without this a missing
+    // .bees/knowledge/ silently swallowed them.
+    try fs.makePath(knowledge_dir);
 
     // Load current index from LMDB (need a read txn to get existing state)
     var current_index: std.ArrayList(PageMeta) = .empty;
@@ -266,6 +274,7 @@ pub fn applyUpdates(
     const now = fs.timestamp();
 
     // Apply each update
+    var written: usize = 0;
     for (updates) |upd| {
         const file_path = std.fs.path.join(allocator, &.{ knowledge_dir, upd.path }) catch continue;
         defer allocator.free(file_path);
@@ -321,6 +330,7 @@ pub fn applyUpdates(
             .size = content_size,
             .summary = allocator.dupe(u8, summary) catch "",
         }, allocator);
+        written += 1;
     }
 
     // Write updated index to LMDB
@@ -348,6 +358,8 @@ pub fn applyUpdates(
 
     // Regenerate _index.md
     regenerateHumanIndex(knowledge_dir, current_index.items, allocator);
+
+    return written;
 }
 
 // ============================================================
@@ -727,6 +739,32 @@ test "extractUpdates: well-formed CREATE directive still parses" {
     try std.testing.expectEqual(@as(usize, 1), updates.len);
     try std.testing.expectEqual(UpdateOp.create, updates[0].op);
     try std.testing.expectEqualStrings("decisions/foo.md", updates[0].path);
+    try std.testing.expectEqualStrings("The body text.", updates[0].content);
+}
+
+test "extractUpdates: H2/H3 headings inside a page body are preserved" {
+    // A "## " heading in the body used to terminate the block, and .create/.update
+    // write with .truncate = true — so the rest of the page was destroyed silently.
+    const out = "## Knowledge Updates\n\n### CREATE decisions/foo.md\n---\n# Title\n\nIntro line.\n\n## Details\n\nKept.\n";
+    const updates = extractUpdates(out, std.testing.allocator);
+    defer freeUpdatesForTest(std.testing.allocator, updates);
+    try std.testing.expectEqual(@as(usize, 1), updates.len);
+    try std.testing.expectEqualStrings("# Title\n\nIntro line.\n\n## Details\n\nKept.", updates[0].content);
+}
+
+test "extractUpdates works on JSON-decoded result text" {
+    // The stream-json `result` field arrives escaped; extractUpdates is
+    // line-oriented, so it can only see directives after jsonUnescapeAlloc.
+    const raw = "## Knowledge Updates\\n\\n### CREATE decisions/foo.md\\n---\\nThe body text.";
+    const escaped = extractUpdates(raw, std.testing.allocator);
+    defer freeUpdatesForTest(std.testing.allocator, escaped);
+    try std.testing.expectEqual(@as(usize, 0), escaped.len);
+
+    const decoded = try claude.jsonUnescapeAlloc(std.testing.allocator, raw);
+    defer std.testing.allocator.free(decoded);
+    const updates = extractUpdates(decoded, std.testing.allocator);
+    defer freeUpdatesForTest(std.testing.allocator, updates);
+    try std.testing.expectEqual(@as(usize, 1), updates.len);
     try std.testing.expectEqualStrings("The body text.", updates[0].content);
 }
 

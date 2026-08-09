@@ -222,9 +222,7 @@ fn appendKnowledge(
     allocator: std.mem.Allocator,
 ) void {
     const index = knowledge.loadIndex(store, txn, allocator) orelse return;
-    const kb_dir = std.fs.path.join(allocator, &.{ paths.bees_dir, "knowledge" }) catch return;
-    defer allocator.free(kb_dir);
-    const ctx = knowledge.buildContext(kb_dir, index, tags, budget, allocator) orelse return;
+    const ctx = knowledge.buildContext(paths.knowledge_dir, index, tags, budget, allocator) orelse return;
     parts.appendSlice(allocator, ctx) catch {};
 }
 

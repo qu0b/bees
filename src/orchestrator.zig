@@ -62,7 +62,7 @@ fn applyStrategistCodex(
     logger: *log_mod.Logger,
 ) void {
     const counter = @atomicRmw(u32, &state.strategist_runs, .Add, 1, .monotonic);
-    if (useCodex(counter, cfg.strategist.codex_fraction)) {
+    if (!backend.gatewayActive() and useCodex(counter, cfg.strategist.codex_fraction)) {
         // Strategist is a thinking/knowledge role → sol at high reasoning.
         role_cfg.backend = "codex";
         role_cfg.model = cfg.codex_thinking.model;
@@ -106,6 +106,32 @@ fn sleepInterruptible(io: Io, state: *DaemonState, secs: u64) void {
         const chunk = @min(left, 2);
         sleep_secs(io, chunk);
         left -= chunk;
+    }
+}
+
+/// Green thread armed at startup: kills agent sessions that have stopped making
+/// progress. The cycle is sequential, so ONE wedged session stalls the whole
+/// swarm — on 2026-08-09 a single hung LSP call held the daemon for 8h18m while
+/// emitting heartbeats that made the session look busy. Nothing else can catch
+/// this: the external `timeout` wrapper breaks the CLI under io_uring, budgets
+/// only bound spend, and non-worker roles carry no timeout at all.
+fn stallWatchdog(io: Io, state: *DaemonState, logger: *log_mod.Logger, idle_limit_secs: u32) void {
+    if (idle_limit_secs == 0) return;
+    while (@atomicLoad(u32, &state.shutdown_requested, .acquire) == 0) {
+        sleep_secs(io, 15);
+        var hits: [8]backend.StalledChild = undefined;
+        const n = backend.reapStalledChildren(idle_limit_secs, &hits);
+        for (hits[0..n]) |h| {
+            if (h.escalated) {
+                logger.err("[watchdog] session {d} (pid {d}) ignored SIGTERM after {d}s idle — SIGKILL", .{
+                    h.session_id, h.pid, h.idle_secs,
+                });
+            } else {
+                logger.warn("[watchdog] session {d} (pid {d}) made no progress for {d}s (limit {d}s) — SIGTERM", .{
+                    h.session_id, h.pid, h.idle_secs, idle_limit_secs,
+                });
+            }
+        }
     }
 }
 
@@ -196,9 +222,21 @@ pub fn run(
     var watchdog_future = io.async(shutdownWatchdog, .{ io, &state, logger });
     defer _ = watchdog_future.cancel(io);
 
+    // Concurrent stall watchdog — same cancel-on-exit rule as above.
+    var stall_future = io.async(stallWatchdog, .{ io, &state, logger, cfg.timeouts.max_idle_secs });
+    defer _ = stall_future.cancel(io);
+    if (cfg.timeouts.max_idle_secs > 0) {
+        logger.info("[daemon] stall watchdog armed: {d}s without progress → SIGTERM", .{cfg.timeouts.max_idle_secs});
+    } else {
+        logger.warn("[daemon] stall watchdog DISABLED (timeouts.max_idle_secs = 0)", .{});
+    }
+
     // Single shared headless Chrome for MCP-enabled roles (QA, user agent). Reuses
     // an already-running instance if present (pid 0), else launches one; roles
     // share it via tabs. At most one Chrome instance runs at a time.
+    if (backend.gatewayTextOnly()) {
+        logger.info("[daemon] gateway model is text-only — browser stays on for textual driving, screenshots disallowed", .{});
+    }
     if (backend.spawnChrome(io)) |pid| {
         state.chrome_pid = pid;
         if (pid == 0) {
@@ -224,6 +262,10 @@ pub fn run(
         logger.info("[daemon] API server started on port {d}", .{cfg.api.port});
     }
 
+    // Report workflow/role drift once at startup — steps naming a role that
+    // does not exist are silently dropped otherwise.
+    validateConfigAtStartup(paths, logger, allocator);
+
     // Mark any stale "running" sessions as "error" from previous daemon crash
     cleanupStaleSessions(store, logger);
 
@@ -231,7 +273,7 @@ pub fn run(
     var merge_cycle: u32 = loadMergeCycle(store);
 
     // Bootstrap: sync tasks.json into LMDB
-    tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch |e| {
+    tasks_mod.syncFromFile(store, paths.tasks_file, .template, allocator) catch |e| {
         logger.warn("[daemon] initial task sync failed: {}", .{e});
     };
 
@@ -270,7 +312,7 @@ pub fn run(
         } else if (@atomicLoad(u32, &state.shutdown_requested, .acquire) == 0) {
             logger.info("[daemon] no active tasks, running startup strategist", .{});
             runStrategistWithPrep(cfg, paths, store, logger, io, allocator, seed_uuid, &state);
-            tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
+            tasks_mod.syncFromFile(store, paths.tasks_file, .strategist, allocator) catch {};
         }
     }
 
@@ -417,6 +459,10 @@ pub fn run(
 
             merge_cycle += 1;
 
+            // Did the strategist run this cycle? Decides the origin recorded for
+            // the tasks it wrote into tasks.json (see sync below).
+            var strategist_ran = false;
+
             // Execute post-merger workflow steps (skip worker and merger — already handled)
             for (wf.steps) |step| {
                 if (@atomicLoad(u32, &state.shutdown_requested, .acquire) != 0) break;
@@ -443,8 +489,16 @@ pub fn run(
                     writeTaskTrends(cfg, paths, store, logger, allocator);
                 }
 
-                // Resolve role config — try roles dir, fall back to hardcoded defaults
-                var role_cfg = roles.get(step.role) orelse role_mod.RoleConfig{ .name = step.role };
+                // Resolve role config — a step naming a role we cannot fully
+                // resolve must not spawn a budgeted agent with no instructions.
+                var role_cfg = roles.get(step.role) orelse {
+                    logger.err("[daemon] no role definition for '{s}' — skipping step", .{step.role});
+                    continue;
+                };
+                if (role_cfg.prompt_path.len == 0) {
+                    logger.err("[daemon] role '{s}' has no prompt — skipping step", .{step.role});
+                    continue;
+                }
 
                 // Build context from role's declared sources (including knowledge tags)
                 const resolved = role_mod.resolveContextSources(role_cfg, allocator);
@@ -466,7 +520,10 @@ pub fn run(
                 };
 
                 // Route a fraction of strategist runs to Codex.
-                if (session_type == .strategist) applyStrategistCodex(cfg, &role_cfg, &state, logger);
+                if (session_type == .strategist) {
+                    applyStrategistCodex(cfg, &role_cfg, &state, logger);
+                    strategist_ran = true;
+                }
 
                 // Run through generic executor
                 executor.runRole(
@@ -502,7 +559,12 @@ pub fn run(
             sleepInterruptible(io, &state, @as(u64, cfg.daemon.cooldown_secs));
 
             // Sync tasks.json into LMDB and reload from store
-            tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
+            tasks_mod.syncFromFile(
+                store,
+                paths.tasks_file,
+                if (strategist_ran) .strategist else .template,
+                allocator,
+            ) catch {};
             reloadPool(&pool, store, paths.tasks_file, allocator);
 
             // Self-hosted hot reload: persist state and return to caller for execve
@@ -532,7 +594,7 @@ pub fn run(
             if (!pool.hasActiveTasks()) {
                 logger.info("[daemon] all tasks exhausted, running strategist", .{});
                 runStrategistWithPrep(cfg, paths, store, logger, io, allocator, seed_uuid, &state);
-                tasks_mod.syncFromFile(store, paths.tasks_file, allocator) catch {};
+                tasks_mod.syncFromFile(store, paths.tasks_file, .strategist, allocator) catch {};
                 reloadPool(&pool, store, paths.tasks_file, allocator);
             }
 
@@ -616,7 +678,7 @@ fn spawnWorker(
     // Route a configurable fraction of workers to the Codex backend. Codex uses
     // an OpenAI model, so also swap in the codex model for those workers.
     var worker_cfg = cfg;
-    if (useCodex(wid, cfg.workers.codex_fraction)) {
+    if (!backend.gatewayActive() and useCodex(wid, cfg.workers.codex_fraction)) {
         // Workers are defined-execution roles → terra at ultra-high reasoning.
         worker_cfg.workers.backend = "codex";
         worker_cfg.workers.model = cfg.codex_execution.model;
@@ -662,6 +724,26 @@ fn workerTask(
             wid, result.session_id, result.tool_errors,
         });
     }
+}
+
+/// Warn (never abort) about workflow steps naming unknown roles and roles with
+/// missing prompts or dangling report: sources. Runs once, at daemon start.
+fn validateConfigAtStartup(
+    paths: config_mod.ProjectPaths,
+    logger: *log_mod.Logger,
+    allocator: std.mem.Allocator,
+) void {
+    var role_set = role_mod.loadRoles(paths, allocator) catch return;
+    defer role_set.deinit();
+
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(allocator);
+    var it = role_set.roles.keyIterator();
+    while (it.next()) |k| names.append(allocator, k.*) catch {};
+
+    const wf = workflow_mod.load(paths, allocator);
+    for (workflow_mod.validate(&wf, names.items, allocator)) |m| logger.warn("[config] {s}", .{m});
+    for (role_mod.validate(&role_set, allocator)) |m| logger.warn("[config] {s}", .{m});
 }
 
 fn cleanupStaleSessions(store: *store_mod.Store, logger: *log_mod.Logger) void {
@@ -976,6 +1058,31 @@ fn writeTaskTrends(
             pos += line.len;
         }
     }
+
+    // Retired history — without it the strategist only ever sees the pool it
+    // wrote last cycle and re-authors the same failed task under a new spelling.
+    const ret_header = "\n## Previously Retired Tasks (already tried — do not re-author under a new spelling)\n";
+    if (pos + ret_header.len <= buf.len) {
+        @memcpy(buf[pos..][0..ret_header.len], ret_header);
+        pos += ret_header.len;
+    }
+
+    if (store.iterTasks(read_txn)) |iter_const| {
+        var iter = iter_const;
+        defer iter.close();
+        var shown: u32 = 0;
+        while (iter.next()) |entry| {
+            if (shown >= 40) break;
+            const h = entry.view.header;
+            if (h.status == .active) continue;
+            if (h.total_runs == 0) continue;
+            const line = std.fmt.bufPrint(buf[pos..], "- {s}: {d} runs, {d} accepted, {d} empty\n", .{
+                entry.name, h.total_runs, h.accepted, h.empty,
+            }) catch break;
+            pos += line.len;
+            shown += 1;
+        }
+    } else |_| {}
 
     const write_txn = store.beginWriteTxn() catch return;
     store.putMeta(write_txn, "report:trends", buf[0..pos]) catch {

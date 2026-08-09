@@ -113,14 +113,13 @@ const default_steps = [_]Step{
     .{ .role = "user" },
     .{ .role = "sre", .condition = "tool_errors" },
     .{ .role = "researcher", .every = 2 },
-    .{ .role = "improver", .every = 5 },
     .{ .role = "founder", .every = 10 },
     .{ .role = "strategist", .every = 3 },
 };
 
 /// Validate that all roles referenced in the workflow exist.
 pub fn validate(wf: *const Workflow, role_names: []const []const u8, allocator: std.mem.Allocator) []const []const u8 {
-    var errors = std.ArrayList([]const u8).init(allocator);
+    var errors: std.ArrayList([]const u8) = .empty;
     for (wf.steps) |step| {
         validateStep(&step, role_names, &errors, allocator);
     }

@@ -33,6 +33,8 @@ The system accumulates knowledge as it works. Not documentation (which rots), bu
 
 **Config** at `<project>/.bees/config.json` + `tasks.json`, auto-detected by walking up from CWD. REST API (port 3002) for dashboard. Security profiles per-role via `--allowedTools`/`--disallowedTools`.
 
+**Gateway mode** (`config.json` → `"gateway"`) — run the entire swarm against one Anthropic-compatible endpoint (e.g. LiteLLM at `https://ai.starflinger.eu`). When `"enabled": true`, every role is forced onto the Claude backend (codex_fraction routing and per-role `"backend"` overrides are ignored), and `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY` plus model-alias remaps are injected into every agent session. Per-role models still apply: a role whose `"model"` is a Claude alias (`opus`/`sonnet`/`haiku`/`fable`) defaults to the gateway's `"model"` (e.g. `starflinger-anthropic`), while an explicit id in `roles/<name>/config.json` — e.g. `"openrouter/deepseek/deepseek-chat"` — passes through, so each role can pin any model the gateway serves. The API key is read from the env var named by `"api_key_env"` (default `LITELLM_API_KEY`) — never stored in config; startup fails fast if it's unset. `"bearer": true` sends it as `Authorization: Bearer` (`ANTHROPIC_AUTH_TOKEN`) for endpoints like vLLM's native `/v1/messages`; the default is `x-api-key`. Inherited `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` are filtered from child envs so only the gateway's auth applies. `"text_only": true` (default) marks the model as vision-less: the browser stays available for textual driving (DOM/a11y snapshots, console, `evaluate_script`), but image-producing tools (`take_screenshot`) are disallowed at spawn. Enforced centrally in `src/backend.zig` (`configureGateway`), activated from `loadProject` in `src/main.zig`.
+
 ## Data Model
 
 **Packed structs** with comptime size assertions:
@@ -49,21 +51,30 @@ The system accumulates knowledge as it works. Not documentation (which rots), bu
 
 ## Zig Coding Standards
 
-**Safety > Performance > Developer Experience.** Zero technical debt — do it right the first time.
+**Safety > Performance > Developer Experience.** Write code that reads like the module
+around it — match its assertion density, naming, error style, and decomposition. The
+surrounding file is the spec; the rules below are the ones you cannot read off it.
+
+**Hard invariants** — breaking these is a defect, not a style call:
+
+- Monetary values are integer microdollars, timestamps are u40 unix seconds. Never f64, never ISO strings.
+- Packed structs carry comptime size assertions. A struct change that breaks one is fixed by fixing the layout, never by deleting the assertion.
+- Schema lives once in `src/db/schema.zig`. No ad-hoc DDL or SQL strings elsewhere.
+- Every loop is bounded. Dispatch loops carry a safety counter. No unbounded recursion.
+- `errdefer` goes immediately after the fallible operation that needs unwinding.
+
+**Conventions** — follow unless the code has a reason not to:
 
 - `const assert = std.debug.assert;` at module scope. `std` imports first, then local modules.
-- **Assert preconditions, postconditions, and state transitions.** Split compound assertions. Pair assertions at write AND read paths.
-- **Comptime assertions** for struct sizes, bit widths, and cross-struct relationships.
-- **`assert`** = programmer bug. **`unreachable`** = logically impossible. **`@panic`** = impossible runtime condition with message.
-- **`errdefer`** immediately after each fallible operation. `switch` on errors, never `== error.`.
-- **≤70 lines per function.** Decompose into focused helpers. Public functions at top of file.
-- **Exhaustive switches** on enums — list every variant. `else =>` hides new variants from the compiler.
-- **All loops bounded.** Safety counters on dispatch loops. No unbounded recursion.
-- **`@divExact`/`@divFloor`** to show division intent.
-- **Units last** in names: `timeout_secs`, `cost_microdollars`. No abbreviations.
-- **`zig fmt` always.** Trailing commas. 100-column limit. `defer` followed by blank line.
-- **One generic solution** over N copies. No role-specific modules — everything through executor.
-- Comments are sentences. Always say *why*.
+- `assert` = programmer bug. `unreachable` = logically impossible. `@panic` = impossible runtime condition, with a message.
+- Assert preconditions, postconditions, and state transitions; split compound assertions and pair them at write AND read paths.
+- Switch enums exhaustively. `else =>` hides new variants from the compiler — use it only for genuinely open sets (foreign/C enums, `_` tags).
+- `switch` on errors rather than `== error.X`.
+- `@divExact`/`@divFloor` to show division intent. Units last in names (`timeout_secs`, `cost_microdollars`), no abbreviations.
+- Keep functions small enough to hold in your head — ~70 lines is where this codebase decomposes. Public functions at the top of the file.
+- `zig fmt` always. Trailing commas, 100 columns, blank line after a `defer` block.
+- One generic solution over N copies. No role-specific modules — everything goes through executor.
+- Comments are sentences and say *why*.
 
 ## Key Constraints
 
@@ -74,3 +85,30 @@ The system accumulates knowledge as it works. Not documentation (which rots), bu
 - The workflow definition is the single source of truth for what runs, when, and under what conditions
 - Reports derived on demand from LMDB meta — not written to disk as files
 - Knowledge base is append-mostly — agents add and refine, never bulk-delete
+
+## Browser Automation
+
+Use the **`browser`** skill / `bx` CLI. The kit lives at `~/.local/share/browser-kit`;
+update it from the laptop with `browser-kit/deploy.sh cryo` — never edit it here.
+
+- `bx open <url>` — headless Chromium this VM owns. Reaches `10.20.212.x`, `*.bruno`, `localhost`
+- `bx state` — indexed interactive elements with stable `id`/`name` selectors and coordinates
+- `bx click N` · `bx input N "text"` · `bx shot out.png` · `bx stop`
+- `bx --cloud open <url>` — stealth Browser Use Cloud browser, for targets that block this IP
+- `bx agent "<task>"` — cloud AI agent does the whole task; `--cache NAME` replays it for $0
+
+Playwright scripts use the shared launcher, so flags match the CLI exactly:
+`import { launch } from '@starflinger/browser-kit/launch'`.
+
+`mcp-chrome.json` points chrome-devtools-mcp at `127.0.0.1:9222`, which assumes a
+Chrome someone put into remote-debug mode by hand. `bx` already owns one — reuse its
+DevTools endpoint instead of launching a second browser:
+
+```bash
+bx open about:blank
+PORT=$(jq -r .sessions.local.port ~/.config/browser-kit/state.json)
+npx chrome-devtools-mcp@latest --browserUrl "http://127.0.0.1:$PORT"
+```
+
+The hosted Browser Use MCP server is also registered with Claude Code (user scope);
+its tools drive a *cloud* browser, so anything internal still goes through `bx`.

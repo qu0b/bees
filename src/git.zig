@@ -145,7 +145,12 @@ pub fn resetHard(allocator: std.mem.Allocator, io: Io, repo_path: []const u8, re
 }
 
 pub fn getCurrentHead(allocator: std.mem.Allocator, io: Io, repo_path: []const u8) ![]const u8 {
-    const result = try run(allocator, io, &.{ "git", "rev-parse", "HEAD" }, repo_path);
+    return revParse(allocator, io, repo_path, "HEAD");
+}
+
+/// Resolve any ref (branch, tag, HEAD) to its commit hash. Caller owns the result.
+pub fn revParse(allocator: std.mem.Allocator, io: Io, repo_path: []const u8, ref: []const u8) ![]const u8 {
+    const result = try run(allocator, io, &.{ "git", "rev-parse", ref }, repo_path);
     defer allocator.free(result.stderr);
     if (result.exit_code != 0) {
         allocator.free(result.stdout);
@@ -157,6 +162,14 @@ pub fn getCurrentHead(allocator: std.mem.Allocator, io: Io, repo_path: []const u
     const owned = try allocator.dupe(u8, trimmed);
     allocator.free(result.stdout);
     return owned;
+}
+
+/// True when `ancestor` is an ancestor of (or equal to) `descendant`.
+pub fn isAncestor(allocator: std.mem.Allocator, io: Io, repo_path: []const u8, ancestor: []const u8, descendant: []const u8) bool {
+    const result = run(allocator, io, &.{ "git", "merge-base", "--is-ancestor", ancestor, descendant }, repo_path) catch return false;
+    allocator.free(result.stdout);
+    allocator.free(result.stderr);
+    return result.exit_code == 0;
 }
 
 pub fn getChangedFiles(allocator: std.mem.Allocator, io: Io, repo_path: []const u8, old_ref: []const u8, new_ref: []const u8) ![]const u8 {

@@ -83,7 +83,6 @@ pub fn processEvent(line: []const u8, acc: *backend.ResultAccumulator) types.Eve
         .is_error = false,
         .role = .none,
         .duration_secs = 0,
-        .cost_cents = 0,
         .num_turns = 0,
     };
 
@@ -130,6 +129,12 @@ pub fn processEvent(line: []const u8, acc: *backend.ResultAccumulator) types.Eve
                     acc.tool_errors +|= 1;
                 }
             }
+        } else if (std.mem.indexOf(u8, line, "\"agent_message\"") != null) {
+            meta.event_type = .message;
+            meta.role = .assistant;
+            // Last agent message is the session's result text — reports and
+            // knowledge updates are extracted from it (executor.zig).
+            if (claude.findJsonStringValue(line, "\"text\"")) |t| acc.result_text = t;
         }
     } else if (std.mem.eql(u8, event_type, "turn.completed")) {
         meta.event_type = .result;
@@ -148,7 +153,9 @@ pub fn processEvent(line: []const u8, acc: *backend.ResultAccumulator) types.Eve
         meta.event_type = .result;
         meta.is_error = true;
         acc.is_error = true;
-        if (claude.findJsonStringValue(line, "\"message\"")) |_| {}
+        // Keep the failure text: executor logs it and it is the only signal a
+        // Codex-routed session produced nothing.
+        if (claude.findJsonStringValue(line, "\"message\"")) |m| acc.result_text = m;
     }
 
     return meta;
@@ -180,6 +187,13 @@ test "processEvent item.started agent_message" {
     const meta = processEvent("{\"event\":\"item.started\",\"item\":{\"type\":\"agent_message\",\"text\":\"hello\"}}", &acc);
     try std.testing.expectEqual(types.EventType.message, meta.event_type);
     try std.testing.expectEqual(types.Role.assistant, meta.role);
+}
+
+test "processEvent item.completed agent_message captures result text" {
+    var acc = backend.ResultAccumulator{};
+    const meta = processEvent("{\"event\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"done\"}}", &acc);
+    try std.testing.expectEqual(types.EventType.message, meta.event_type);
+    try std.testing.expectEqualStrings("done", acc.result_text);
 }
 
 test "processEvent turn.completed accumulates tokens" {

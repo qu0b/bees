@@ -555,12 +555,30 @@ pub const Store = struct {
         return .{ .cursor = cursor, .exhausted = false, .first_key = key_val, .first_data = data_val, .has_first = true };
     }
 
+    /// Newest-first iteration. `sessions` is keyed by ascending id, so a
+    /// listing with a limit must walk backwards to mean "the latest N".
+    pub fn iterSessionsDesc(self: *Store, txn: ?*c.MDB_txn) !SessionIterator {
+        var cursor: ?*c.MDB_cursor = null;
+        try check(c.mdb_cursor_open(txn, self.sessions, &cursor));
+
+        var key_val: c.MDB_val = undefined;
+        var data_val: c.MDB_val = undefined;
+        const rc = c.mdb_cursor_get(cursor, &key_val, &data_val, c.MDB_LAST);
+        if (rc == c.MDB_NOTFOUND) return .{ .cursor = cursor, .exhausted = true, .desc = true };
+        if (rc != 0) {
+            c.mdb_cursor_close(cursor);
+            return lmdbError(rc);
+        }
+        return .{ .cursor = cursor, .exhausted = false, .first_key = key_val, .first_data = data_val, .has_first = true, .desc = true };
+    }
+
     pub const SessionIterator = struct {
         cursor: ?*c.MDB_cursor,
         exhausted: bool,
         first_key: c.MDB_val = undefined,
         first_data: c.MDB_val = undefined,
         has_first: bool = false,
+        desc: bool = false,
 
         pub const Entry = struct {
             id: u64,
@@ -578,11 +596,8 @@ pub const Store = struct {
                 data_val = self.first_data;
                 self.has_first = false;
             } else {
-                const rc = c.mdb_cursor_get(self.cursor, &key_val, &data_val, c.MDB_NEXT);
-                if (rc == c.MDB_NOTFOUND) {
-                    self.exhausted = true;
-                    return null;
-                }
+                const op: c.MDB_cursor_op = if (self.desc) c.MDB_PREV else c.MDB_NEXT;
+                const rc = c.mdb_cursor_get(self.cursor, &key_val, &data_val, op);
                 if (rc != 0) {
                     self.exhausted = true;
                     return null;
@@ -695,6 +710,9 @@ pub const Store = struct {
 
     pub fn getDailyStats(self: *Store, txn: ?*c.MDB_txn, day_start_ts: u64) !DailyStats {
         var stats = DailyStats{};
+        // Accumulate in microdollars and divide once — dividing per session
+        // discards each sub-cent remainder and systematically under-reports.
+        var cost_micros: u64 = 0;
         var cursor: ?*c.MDB_cursor = null;
         try check(c.mdb_cursor_open(txn, self.sessions_by_time, &cursor));
         defer c.mdb_cursor_close(cursor);
@@ -722,12 +740,18 @@ pub const Store = struct {
                     .err => stats.errors += 1,
                     .running, .done => {},
                 }
-                stats.total_cost_cents += @as(u64, session.header.cost_microdollars) / 10000;
+                // Only sum spend we actually observed. Rows with has_cost = false
+                // carry an unreported (not zero) cost; adding them would make the
+                // rollup a silent undercount presented as a total.
+                if (session.header.has_cost) {
+                    cost_micros += session.header.cost_microdollars;
+                }
             }
 
             rc = c.mdb_cursor_get(cursor, &key_val, &data_val, c.MDB_NEXT);
         }
 
+        stats.total_cost_cents = cost_micros / 10000;
         return stats;
     }
 };
@@ -940,4 +964,60 @@ test "store insert and iterate events" {
 
         try std.testing.expectEqual(@as(?types.EventView, null), iter.next());
     }
+}
+
+test "getDailyStats sums microdollars before converting to cents" {
+    const tmp_dir = "/tmp/bees-test-dailystats";
+    _ = std.c.mkdir(tmp_dir, 0o755);
+    defer {
+        _ = std.c.unlink(tmp_dir ++ "/data.mdb");
+        _ = std.c.unlink(tmp_dir ++ "/lock.mdb");
+        _ = std.c.rmdir(tmp_dir);
+    }
+
+    var store = try Store.open(tmp_dir);
+    defer store.close();
+
+    const day_start: u64 = 1709856000;
+    // Three sessions at 1.5 cents each: 45000 micros = 4 cents. Dividing per
+    // session first would truncate each to 1 cent and report 3.
+    for (0..3) |_| {
+        _ = try store.createSession(.{
+            .type = .worker,
+            .status = .done,
+            .has_exit_code = false,
+            .has_cost = true,
+            .model = .sonnet,
+            .has_tokens = false,
+            .has_duration = false,
+            .has_diff_summary = false,
+            .worker_id = 1,
+            .commit_count = 0,
+            .num_turns = 0,
+            .exit_code = 0,
+            .started_at = day_start + 10,
+            .finished_at = 0,
+            .duration_ms = 0,
+            .cost_microdollars = 15000,
+            .input_tokens = 0,
+            .output_tokens = 0,
+            .cache_creation_tokens = 0,
+            .cache_read_tokens = 0,
+        }, "t", "b", "/tmp/wt");
+    }
+
+    const txn = try store.beginReadTxn();
+    defer Store.abortTxn(txn);
+    const stats = try store.getDailyStats(txn, day_start);
+    try std.testing.expectEqual(@as(u32, 3), stats.total);
+    try std.testing.expectEqual(@as(u64, 4), stats.total_cost_cents);
+
+    // Descending iteration yields the newest ids first, so a limited listing
+    // shows the latest sessions rather than the oldest.
+    var iter = try store.iterSessionsDesc(txn);
+    defer iter.close();
+    try std.testing.expectEqual(@as(u64, 3), iter.next().?.id);
+    try std.testing.expectEqual(@as(u64, 2), iter.next().?.id);
+    try std.testing.expectEqual(@as(u64, 1), iter.next().?.id);
+    try std.testing.expect(iter.next() == null);
 }

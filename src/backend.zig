@@ -1,6 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const Io = std.Io;
+const config_mod = @import("config.zig");
 const types = @import("types.zig");
 const store_mod = @import("store.zig");
 const dlq_mod = @import("dlq.zig");
@@ -15,6 +16,105 @@ pub const findJsonStringValue = claude.findJsonStringValue;
 pub const findJsonNumberValue = claude.findJsonNumberValue;
 pub const collectToolErrors = claude.collectToolErrors;
 pub const streamEvent = claude.streamEvent;
+
+// ── Gateway mode ─────────────────────────────────────────────────────────
+// Optional Anthropic-compatible gateway (cfg.gateway): every agent session in
+// the whole swarm runs against one endpoint serving one model (e.g. LiteLLM at
+// ai.starflinger.eu serving "starflinger-anthropic"). Configured once at
+// startup; kept as module state so the spawn path — the single choke point all
+// backends and the seed's haiku call go through — needs no config plumbing.
+
+const GatewayState = struct {
+    active: bool = false,
+    text_only: bool = false,
+    model: []const u8 = "",
+    /// Injected into every child env. The ANTHROPIC_DEFAULT_*_MODEL entries
+    /// remap alias model names ("haiku"/"sonnet"/"opus") that reach the Claude
+    /// CLI outside the spawn() override (e.g. seed file selection).
+    env: [6][2][]const u8 = undefined,
+};
+var gateway: GatewayState = .{};
+
+/// Activate gateway mode from config. Reads the API key from the environment
+/// (never from config.json); fails fast when the key env var is unset so the
+/// daemon can't start half-configured. No-op when gateway is disabled.
+/// The `gw` string slices must outlive all spawns (they do: config is arena-
+/// allocated for the process lifetime).
+pub fn configureGateway(gw: config_mod.Config.Gateway) error{GatewayKeyMissing}!void {
+    if (!gw.enabled) return;
+    // std.c.getenv wants a sentinel-terminated name; config strings aren't.
+    // Copy into a bounded buffer (env var names are short by construction).
+    var name_buf: [128:0]u8 = undefined;
+    if (gw.api_key_env.len >= name_buf.len) return error.GatewayKeyMissing;
+    @memcpy(name_buf[0..gw.api_key_env.len], gw.api_key_env);
+    name_buf[gw.api_key_env.len] = 0;
+    const key = std.c.getenv(&name_buf) orelse return error.GatewayKeyMissing;
+    configureGatewayWithKey(gw, std.mem.sliceTo(key, 0));
+}
+
+/// Testable core of configureGateway — key passed in instead of read from env.
+pub fn configureGatewayWithKey(gw: config_mod.Config.Gateway, api_key: []const u8) void {
+    gateway = .{
+        .active = true,
+        .text_only = gw.text_only,
+        .model = gw.model,
+        .env = .{
+            .{ "ANTHROPIC_BASE_URL", gw.base_url },
+            // Bearer endpoints (e.g. vLLM /v1/messages) authenticate via
+            // ANTHROPIC_AUTH_TOKEN; the Anthropic default is x-api-key.
+            .{ if (gw.bearer) "ANTHROPIC_AUTH_TOKEN" else "ANTHROPIC_API_KEY", api_key },
+            .{ "ANTHROPIC_DEFAULT_HAIKU_MODEL", gw.model },
+            .{ "ANTHROPIC_DEFAULT_SONNET_MODEL", gw.model },
+            .{ "ANTHROPIC_DEFAULT_OPUS_MODEL", gw.model },
+            .{ "ANTHROPIC_SMALL_FAST_MODEL", gw.model },
+        },
+    };
+}
+
+pub fn gatewayActive() bool {
+    return gateway.active;
+}
+
+// ── Per-tool-call ceilings ───────────────────────────────────────────────
+// Bounds how long ONE Bash call may run, so a wedged command can't hold a
+// session open indefinitely. Complements (does not replace) the stall
+// watchdog: only the watchdog covers non-Bash tools, which is what actually
+// hung on 2026-08-09 (LSP).
+
+var bash_default_buf: [16]u8 = undefined;
+var bash_max_buf: [16]u8 = undefined;
+var tool_timeouts: struct { default_ms: []const u8 = "", max_ms: []const u8 = "" } = .{};
+
+/// Configure per-tool-call ceilings injected into every agent child.
+pub fn configureToolTimeouts(t: config_mod.Config.Timeouts) void {
+    tool_timeouts = .{
+        .default_ms = if (t.bash_default_ms > 0)
+            std.fmt.bufPrint(&bash_default_buf, "{d}", .{t.bash_default_ms}) catch ""
+        else
+            "",
+        .max_ms = if (t.bash_max_ms > 0)
+            std.fmt.bufPrint(&bash_max_buf, "{d}", .{t.bash_max_ms}) catch ""
+        else
+            "",
+    };
+}
+
+/// Effective model for a session under gateway mode. Claude alias names
+/// (opus/sonnet/haiku/fable) default to the gateway's model; an explicit model
+/// id passes through untouched, so a role's config.json can pin any model the
+/// gateway serves (e.g. "openrouter/deepseek/deepseek-chat" via LiteLLM).
+/// Identity when the gateway is off.
+pub fn gatewayEffectiveModel(model: []const u8) []const u8 {
+    if (!gateway.active) return model;
+    return if (isClaudeModelName(model)) gateway.model else model;
+}
+
+/// True when the gateway serves a text-only (no-vision) model. The browser
+/// stays available for textual driving (DOM snapshots, console, JS); only
+/// image-producing tools (screenshots) are disallowed at spawn.
+pub fn gatewayTextOnly() bool {
+    return gateway.active and gateway.text_only;
+}
 
 // === Shared spawn helpers (used by per-backend spawners) ===
 
@@ -52,6 +152,11 @@ pub fn buildFilteredEnvMap(allocator: std.mem.Allocator) std.process.Environ.Map
         const eq_pos = std.mem.indexOfScalar(u8, entry_slice, '=') orelse continue;
         const key = entry_slice[0..eq_pos];
         if (std.mem.eql(u8, key, "CLAUDECODE")) continue;
+        // Gateway mode: inherited Anthropic credentials must not reach the
+        // child — only the gateway's own auth var (injected below) may. An
+        // inherited ANTHROPIC_API_KEY would otherwise shadow a bearer token.
+        if (gateway.active and (std.mem.eql(u8, key, "ANTHROPIC_API_KEY") or
+            std.mem.eql(u8, key, "ANTHROPIC_AUTH_TOKEN"))) continue;
         const value = entry_slice[eq_pos + 1 ..];
         env_map.put(key, value) catch continue;
     }
@@ -75,6 +180,14 @@ pub fn buildFilteredEnvMap(allocator: std.mem.Allocator) std.process.Environ.Map
     // Raise file read token limit from default 25K to 50K — workers reading large
     // source files (configs, generated code) hit the cap and get truncated results.
     env_map.put("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS", "50000") catch {};
+    // Bound a single Bash call so a wedged command can't hold the session open.
+    if (tool_timeouts.default_ms.len > 0) env_map.put("BASH_DEFAULT_TIMEOUT_MS", tool_timeouts.default_ms) catch {};
+    if (tool_timeouts.max_ms.len > 0) env_map.put("BASH_MAX_TIMEOUT_MS", tool_timeouts.max_ms) catch {};
+    // Gateway mode: route every child to the configured endpoint/model,
+    // deliberately overriding any inherited ANTHROPIC_* variables.
+    if (gateway.active) {
+        for (gateway.env) |pair| env_map.put(pair[0], pair[1]) catch {};
+    }
     return env_map;
 }
 
@@ -163,6 +276,9 @@ pub const ResultAccumulator = struct {
     result_text: []const u8 = "",
     session_id: []const u8 = "",
     is_error: bool = false,
+    /// Set once a terminal result event has been seen. Until then any cost /
+    /// token figure here is a partial running sum, not the authoritative total.
+    saw_result: bool = false,
     tool_errors: u16 = 0,
     duration_secs: u16 = 0,
     /// Result subtype: "success", "error_max_turns", "error_max_budget_usd",
@@ -181,28 +297,138 @@ pub const ResultAccumulator = struct {
 // completes inside systemd's TimeoutStopSec window, and every stop ends in a
 // cgroup SIGKILL with sessions left as stale "running" rows.
 
-var active_children: [2 * 64]std.posix.pid_t = [_]std.posix.pid_t{0} ** (2 * 64);
+const max_children = 2 * 64;
 
-fn registerChild(pid: std.posix.pid_t) void {
-    if (pid <= 0) return;
-    for (&active_children) |*slot| {
-        if (@cmpxchgStrong(std.posix.pid_t, slot, 0, pid, .acq_rel, .monotonic) == null) return;
+/// A live agent process plus the liveness bookkeeping the stall watchdog needs.
+/// `last_progress_s` is stamped only by events that mean the agent ADVANCED —
+/// never by `tool_progress` heartbeats, which a wedged tool emits forever.
+const ChildSlot = struct {
+    pid: std.posix.pid_t = 0,
+    /// Unix seconds of the last progress event. 0 = slot claimed but not yet
+    /// stamped; the watchdog skips those so a recycled slot can't be killed on
+    /// its predecessor's timestamp.
+    last_progress_s: u64 = 0,
+    /// Unix seconds the stall SIGTERM was sent; 0 = none. Gates KILL escalation.
+    term_sent_s: u64 = 0,
+    session_id: u64 = 0,
+};
+
+var active_children: [max_children]ChildSlot = [_]ChildSlot{.{}} ** max_children;
+
+/// Claim a slot for `pid`. Returns its index for later progress stamping, or
+/// null when the registry is full (that child then runs unwatched).
+fn registerChild(pid: std.posix.pid_t, session_id: u64) ?usize {
+    if (pid <= 0) return null;
+    for (&active_children, 0..) |*slot, i| {
+        if (@cmpxchgStrong(std.posix.pid_t, &slot.pid, 0, pid, .acq_rel, .monotonic) == null) {
+            slot.session_id = session_id;
+            @atomicStore(u64, &slot.term_sent_s, 0, .release);
+            // Published last: makes the slot eligible for the watchdog only
+            // once its metadata is valid.
+            @atomicStore(u64, &slot.last_progress_s, fs.timestamp(), .release);
+            return i;
+        }
     }
     // Registry full — the child simply won't receive a shutdown signal.
+    return null;
 }
 
 fn unregisterChild(pid: std.posix.pid_t) void {
     if (pid <= 0) return;
     for (&active_children) |*slot| {
-        if (@cmpxchgStrong(std.posix.pid_t, slot, pid, 0, .acq_rel, .monotonic) == null) return;
+        if (@atomicLoad(std.posix.pid_t, &slot.pid, .acquire) != pid) continue;
+        // Retire the liveness data BEFORE releasing the slot, so the next
+        // claimant never inherits a stale progress timestamp.
+        @atomicStore(u64, &slot.last_progress_s, 0, .release);
+        @atomicStore(u64, &slot.term_sent_s, 0, .release);
+        if (@cmpxchgStrong(std.posix.pid_t, &slot.pid, pid, 0, .acq_rel, .monotonic) == null) return;
     }
+}
+
+/// Record that the child in `slot_index` produced a real progress event.
+fn stampProgress(slot_index: usize) void {
+    if (slot_index >= active_children.len) return;
+    @atomicStore(u64, &active_children[slot_index].last_progress_s, fs.timestamp(), .release);
 }
 
 pub fn hasActiveChildren() bool {
     for (&active_children) |*slot| {
-        if (@atomicLoad(std.posix.pid_t, slot, .acquire) != 0) return true;
+        if (@atomicLoad(std.posix.pid_t, &slot.pid, .acquire) != 0) return true;
     }
     return false;
+}
+
+/// An agent process the watchdog acted on, for the caller to log.
+pub const StalledChild = struct {
+    pid: std.posix.pid_t,
+    session_id: u64,
+    idle_secs: u64,
+    /// false = first SIGTERM, true = SIGKILL follow-up.
+    escalated: bool,
+};
+
+/// Seconds between the stall SIGTERM and its SIGKILL follow-up.
+pub const stall_kill_grace_secs: u64 = 30;
+
+/// Signal every agent process that has made no progress for `idle_limit_secs`.
+/// TERM first (the CLI flushes and exits, its stdout closes, and runSession
+/// returns normally with a negative exit code), KILL if it ignores that.
+/// Returns how many entries of `out` were filled. 0 disables the watchdog.
+///
+/// This is the Zig-native replacement for the external `timeout` wrapper, which
+/// cannot be used here (it breaks the agent CLI under io_uring — see
+/// config.Daemon.worker_timeout_minutes).
+pub fn reapStalledChildren(idle_limit_secs: u32, out: []StalledChild) usize {
+    if (idle_limit_secs == 0 or out.len == 0) return 0;
+    const now = fs.timestamp();
+    var n: usize = 0;
+    for (&active_children) |*slot| {
+        if (n >= out.len) break;
+        var idle: u64 = 0;
+        const action = classifyStall(slot, now, idle_limit_secs, &idle);
+        if (action == .none) continue;
+        const pid = @atomicLoad(std.posix.pid_t, &slot.pid, .acquire);
+        switch (action) {
+            .term => std.posix.kill(pid, std.c.SIG.TERM) catch continue,
+            .kill => std.posix.kill(pid, std.c.SIG.KILL) catch continue,
+            .none => unreachable,
+        }
+        out[n] = .{
+            .pid = pid,
+            .session_id = slot.session_id,
+            .idle_secs = idle,
+            .escalated = action == .kill,
+        };
+        n += 1;
+    }
+    return n;
+}
+
+const StallAction = enum { none, term, kill };
+
+/// Decide what to do with one slot, and record that the decision was made.
+/// Split from the signaling so the escalation state machine is testable with a
+/// caller-supplied `now` and no real process.
+fn classifyStall(slot: *ChildSlot, now: u64, idle_limit_secs: u32, idle_out: *u64) StallAction {
+    if (@atomicLoad(std.posix.pid_t, &slot.pid, .acquire) <= 0) return .none;
+    const last = @atomicLoad(u64, &slot.last_progress_s, .acquire);
+    if (last == 0) return .none; // claimed but not yet stamped
+    const idle = now -| last;
+    idle_out.* = idle;
+    if (idle <= idle_limit_secs) return .none;
+
+    const term_at = @atomicLoad(u64, &slot.term_sent_s, .acquire);
+    if (term_at == 0) {
+        @atomicStore(u64, &slot.term_sent_s, now, .release);
+        return .term;
+    }
+    if (now -| term_at >= stall_kill_grace_secs) {
+        // Re-arm so an unkillable process is acted on once per grace window
+        // rather than on every tick.
+        @atomicStore(u64, &slot.term_sent_s, now, .release);
+        return .kill;
+    }
+    return .none;
 }
 
 pub const ChildSignal = enum { term, kill };
@@ -213,7 +439,7 @@ pub const ChildSignal = enum { term, kill };
 pub fn signalActiveChildren(sig: ChildSignal) u32 {
     var n: u32 = 0;
     for (&active_children) |*slot| {
-        const pid = @atomicLoad(std.posix.pid_t, slot, .acquire);
+        const pid = @atomicLoad(std.posix.pid_t, &slot.pid, .acquire);
         if (pid == 0) continue;
         switch (sig) {
             .term => std.posix.kill(pid, std.c.SIG.TERM) catch continue,
@@ -234,6 +460,16 @@ fn f64ToU32Sat(v: f64) u32 {
     return if (v >= max_f) std.math.maxInt(u32) else @intFromFloat(v);
 }
 
+/// Saturating f64 → u64 for numbers parsed out of untrusted event JSON
+/// (replayed raw_json blobs). Same contract as `f64ToU32Sat`: `!(v > 0)`
+/// maps NaN and negatives to 0, and an out-of-range cast is avoided because
+/// `@intFromFloat` past the destination range is illegal behavior.
+pub fn f64ToU64Sat(v: f64) u64 {
+    if (!(v > 0)) return 0;
+    const max_f: f64 = @floatFromInt(@as(u64, std.math.maxInt(u64)));
+    return if (v >= max_f) std.math.maxInt(u64) else @intFromFloat(v);
+}
+
 /// True if `model` is a Claude-family model name. Non-Claude backends (Codex)
 /// must not receive these — they use their own provider's models.
 pub fn isClaudeModelName(model: []const u8) bool {
@@ -245,7 +481,10 @@ pub fn isClaudeModelName(model: []const u8) bool {
 }
 
 /// Resolve the effective backend: use role-specific override if non-empty, else project default.
+/// Gateway mode overrides everything — the gateway speaks the Anthropic API,
+/// so only the Claude backend can talk to it.
 pub fn resolveBackend(default_backend: []const u8, role_backend: []const u8) types.BackendType {
+    if (gateway.active) return .claude;
     const effective = if (role_backend.len > 0) role_backend else default_backend;
     return types.BackendType.fromString(effective);
 }
@@ -261,6 +500,28 @@ pub const max_argv_prompt_bytes: usize = 100_000;
 
 fn spawn(backend: types.BackendType, allocator: std.mem.Allocator, io: Io, options: BackendOptions, claude_binary: []const u8, pi_binary: []const u8) !std.process.Child {
     var opts = options;
+    if (gateway.active and backend == .claude) {
+        // Claude alias models default to the gateway's model; explicit ids
+        // (a role pinning e.g. an openrouter/* model) pass through. Alias
+        // fallbacks are dropped — they'd resolve to the same gateway model.
+        opts.model = gatewayEffectiveModel(options.model);
+        opts.fallback_model = if (options.fallback_model) |fm|
+            (if (isClaudeModelName(fm)) null else fm)
+        else
+            null;
+        // Text-only model (no vision): the browser stays usable — DOM/a11y
+        // snapshots, console, network, evaluate_script are all textual — but
+        // image-producing tools would feed the model bytes it cannot see.
+        if (gateway.text_only) {
+            const screenshot_tool = "mcp__chrome-devtools__take_screenshot";
+            const old = opts.disallowed_tools orelse &.{};
+            if (allocator.alloc([]const u8, old.len + 1)) |list| {
+                @memcpy(list[0..old.len], old);
+                list[old.len] = screenshot_tool;
+                opts.disallowed_tools = list;
+            } else |_| {} // OOM: keep the original deny list
+        }
+    }
     if (opts.prompt.len > max_argv_prompt_bytes and backend == .claude) {
         // Move the oversized prompt to stdin — the Claude CLI reads piped stdin
         // as user input alongside the argv prompt. If a stdin payload already
@@ -401,12 +662,24 @@ pub fn probeBackend(
 
 /// Dispatch event processing to the appropriate backend normalizer.
 fn processEvent(backend: types.BackendType, line: []const u8, acc: *ResultAccumulator) types.EventMeta {
-    return switch (backend) {
+    const meta = switch (backend) {
         .claude => claudeProcessEvent(line, acc),
         .codex => backend_codex.processEvent(line, acc),
         .opencode => backend_opencode.processEvent(line, acc),
         .pi => backend_pi.processEvent(line, acc),
     };
+    // claudeProcessEvent sets saw_result itself. The other adapters normalize
+    // their terminal events to .result; require a recognized event-kind key so
+    // an unparseable line (whose EventMeta default is .result) is not mistaken
+    // for a completed session. Codex keys its events on "event", not "type" —
+    // checking only "type" would leave every Codex session cost_known = false.
+    if (backend != .claude and meta.event_type == .result and
+        (claude.findJsonStringValue(line, "\"event\"") != null or
+            claude.findJsonStringValue(line, "\"type\"") != null))
+    {
+        acc.saw_result = true;
+    }
+    return meta;
 }
 
 /// Claude adapter: wraps existing parseEventMeta + result field extraction into the accumulator pattern.
@@ -425,7 +698,20 @@ fn claudeProcessEvent(line: []const u8, acc: *ResultAccumulator) types.EventMeta
         }
     }
 
+    // Accumulate per-message usage so a SIGTERMed/timed-out session still reports
+    // the tokens it actually burned. The result branch below assigns (not +|=),
+    // so the authoritative totals overwrite this running sum — no double count.
+    if (meta.event_type == .message or meta.event_type == .tool_use) {
+        if (meta.role == .assistant) {
+            if (claude.findJsonNumberValue(line, "\"input_tokens\"")) |v| acc.input_tokens +|= f64ToU32Sat(v);
+            if (claude.findJsonNumberValue(line, "\"output_tokens\"")) |v| acc.output_tokens +|= f64ToU32Sat(v);
+            if (claude.findJsonNumberValue(line, "\"cache_creation_input_tokens\"")) |v| acc.cache_creation_tokens +|= f64ToU32Sat(v);
+            if (claude.findJsonNumberValue(line, "\"cache_read_input_tokens\"")) |v| acc.cache_read_tokens +|= f64ToU32Sat(v);
+        }
+    }
+
     if (meta.event_type == .result) {
+        acc.saw_result = true;
         acc.is_error = meta.is_error;
         acc.duration_secs = meta.duration_secs;
         acc.num_turns = meta.num_turns;
@@ -488,7 +774,7 @@ pub fn runSession(
     // Register for the daemon's shutdown watchdog; always unregister on exit.
     // Capture the pid locally — wait() may clear child.id before the defer runs.
     const child_pid: std.posix.pid_t = child.id orelse 0;
-    if (child_pid > 0) registerChild(child_pid);
+    const child_slot: ?usize = if (child_pid > 0) registerChild(child_pid, session_id) else null;
     defer if (child_pid > 0) unregisterChild(child_pid);
 
     // Set up stdout writer for streaming mode
@@ -601,10 +887,15 @@ pub fn runSession(
                 const end = base + line_copy.len;
 
                 // Dupe any field that points into line_copy (about to be freed)
+                // result_text is the only field that carries free-form agent
+                // prose, so it is the only one that needs JSON escapes decoded.
+                // Decode exactly here — the single point where it stops pointing
+                // into the raw line buffer. session_id/subtype/stop_reason are
+                // escape-free enum-like tokens and stay raw.
                 if (acc.result_text.len > 0) {
                     const p = @intFromPtr(acc.result_text.ptr);
                     if (p >= base and p < end)
-                        acc.result_text = try allocator.dupe(u8, acc.result_text);
+                        acc.result_text = try claude.jsonUnescapeAlloc(allocator, acc.result_text);
                 }
                 if (acc.session_id.len > 0) {
                     const p = @intFromPtr(acc.session_id.ptr);
@@ -648,6 +939,14 @@ pub fn runSession(
                         allocator.free(old_stop_reason);
                 }
             }
+
+            // A heartbeat proves the child is alive, not that it is advancing:
+            // never stamp progress, store, or stream it. (2026-08-09: one wedged
+            // LSP call emitted 986 of these over 8h while the daemon waited.)
+            if (meta.event_type == .tool_progress) continue;
+
+            // Real progress — reset this child's stall clock.
+            if (child_slot) |si| stampProgress(si);
 
             const now: u64 = fs.timestamp();
             const offset_ms: u16 = @truncate((now -| session_start) *| 1000);
@@ -699,6 +998,7 @@ pub fn runSession(
             .result_text = acc.result_text,
             .claude_session_id = acc.session_id,
             .cost_microdollars = acc.cost_microdollars,
+            .cost_known = acc.saw_result,
             .input_tokens = acc.input_tokens,
             .output_tokens = acc.output_tokens,
             .cache_creation_tokens = acc.cache_creation_tokens,
@@ -730,6 +1030,7 @@ pub fn runSession(
         .result_text = acc.result_text,
         .claude_session_id = acc.session_id,
         .cost_microdollars = acc.cost_microdollars,
+        .cost_known = acc.saw_result,
         .input_tokens = acc.input_tokens,
         .output_tokens = acc.output_tokens,
         .cache_creation_tokens = acc.cache_creation_tokens,
@@ -1070,6 +1371,71 @@ fn cdpGet(io: Io, addr: Io.net.IpAddress, path: []const u8, buf: []u8) ?[]const 
     return buf[body_start..total];
 }
 
+test "f64ToU64Sat saturates instead of illegal cast" {
+    try std.testing.expectEqual(@as(u64, 0), f64ToU64Sat(-1.0));
+    try std.testing.expectEqual(@as(u64, 0), f64ToU64Sat(std.math.nan(f64)));
+    try std.testing.expectEqual(@as(u64, 42), f64ToU64Sat(42.9));
+    try std.testing.expectEqual(std.math.maxInt(u64), f64ToU64Sat(1e30));
+    try std.testing.expectEqual(std.math.maxInt(u64), f64ToU64Sat(std.math.inf(f64)));
+}
+
+test "stall watchdog: heartbeat-only session is TERMed once, then KILLed after the grace" {
+    // Replays the 2026-08-09 incident: 8h13m of heartbeats, zero progress.
+    var slot = ChildSlot{ .pid = 424242, .session_id = 95 };
+    const t0: u64 = 1_000_000;
+    var idle: u64 = 0;
+
+    // Claimed but not yet stamped — never acted on.
+    try std.testing.expectEqual(StallAction.none, classifyStall(&slot, t0, 1800, &idle));
+
+    @atomicStore(u64, &slot.last_progress_s, t0, .release);
+    // Inside the budget: a slow turn is not a stall.
+    try std.testing.expectEqual(StallAction.none, classifyStall(&slot, t0 + 1799, 1800, &idle));
+
+    // The real hang: 29581s idle → one TERM.
+    try std.testing.expectEqual(StallAction.term, classifyStall(&slot, t0 + 29_581, 1800, &idle));
+    try std.testing.expectEqual(@as(u64, 29_581), idle);
+
+    // Next tick, still within the grace → no repeat signal.
+    try std.testing.expectEqual(StallAction.none, classifyStall(&slot, t0 + 29_596, 1800, &idle));
+
+    // Ignored the TERM → escalate exactly once per grace window.
+    try std.testing.expectEqual(
+        StallAction.kill,
+        classifyStall(&slot, t0 + 29_581 + stall_kill_grace_secs, 1800, &idle),
+    );
+}
+
+test "a recycled slot cannot be killed on its predecessor's timestamp" {
+    // Slot reuse must not inherit a stale progress stamp, or the next session
+    // to land in that slot is signaled the moment the watchdog ticks.
+    const idx = registerChild(999_001, 1) orelse return error.SkipZigTest;
+    @atomicStore(u64, &active_children[idx].last_progress_s, fs.timestamp() -| 7200, .release);
+    unregisterChild(999_001);
+    try std.testing.expectEqual(@as(u64, 0), @atomicLoad(u64, &active_children[idx].last_progress_s, .acquire));
+
+    var idle: u64 = 0;
+    try std.testing.expectEqual(StallAction.none, classifyStall(&active_children[idx], fs.timestamp(), 1800, &idle));
+
+    // A disabled watchdog never signals, whatever the registry holds.
+    var hits: [2]StalledChild = undefined;
+    try std.testing.expectEqual(@as(usize, 0), reapStalledChildren(0, &hits));
+}
+
+test "configureToolTimeouts injects per-call Bash ceilings" {
+    configureToolTimeouts(.{});
+    var env_map = buildFilteredEnvMap(std.testing.allocator);
+    defer env_map.deinit();
+    try std.testing.expectEqualStrings("300000", env_map.get("BASH_DEFAULT_TIMEOUT_MS").?);
+    try std.testing.expectEqualStrings("900000", env_map.get("BASH_MAX_TIMEOUT_MS").?);
+
+    // 0 means "don't set it" — leave the CLI's own default in place.
+    configureToolTimeouts(.{ .bash_default_ms = 0, .bash_max_ms = 0 });
+    var bare = buildFilteredEnvMap(std.testing.allocator);
+    defer bare.deinit();
+    try std.testing.expect(bare.get("BASH_DEFAULT_TIMEOUT_MS") == null);
+}
+
 test "resolveBackend defaults to claude" {
     try std.testing.expectEqual(types.BackendType.claude, resolveBackend("claude", ""));
     try std.testing.expectEqual(types.BackendType.claude, resolveBackend("", ""));
@@ -1079,4 +1445,60 @@ test "resolveBackend role override" {
     try std.testing.expectEqual(types.BackendType.codex, resolveBackend("claude", "codex"));
     try std.testing.expectEqual(types.BackendType.opencode, resolveBackend("claude", "opencode"));
     try std.testing.expectEqual(types.BackendType.pi, resolveBackend("pi", ""));
+}
+
+test "gateway mode forces claude backend and injects endpoint env" {
+    configureGatewayWithKey(.{
+        .enabled = true,
+        .base_url = "https://ai.starflinger.eu",
+        .model = "starflinger-anthropic",
+    }, "sk-test");
+    defer gateway = .{}; // reset module state for other tests
+
+    try std.testing.expect(gatewayActive());
+    try std.testing.expect(gatewayTextOnly()); // text_only defaults on
+
+    // Every backend choice collapses to claude — codex routing included.
+    try std.testing.expectEqual(types.BackendType.claude, resolveBackend("claude", "codex"));
+    try std.testing.expectEqual(types.BackendType.claude, resolveBackend("pi", ""));
+
+    // Claude alias models default to the gateway model; explicit per-role
+    // model ids (e.g. an openrouter model served by the gateway) pass through.
+    try std.testing.expectEqualStrings("starflinger-anthropic", gatewayEffectiveModel("opus"));
+    try std.testing.expectEqualStrings("starflinger-anthropic", gatewayEffectiveModel("fable"));
+    try std.testing.expectEqualStrings("openrouter/deepseek/deepseek-chat", gatewayEffectiveModel("openrouter/deepseek/deepseek-chat"));
+
+    // Child env carries the gateway endpoint, key, and model alias remaps.
+    var env_map = buildFilteredEnvMap(std.testing.allocator);
+    defer env_map.deinit();
+    try std.testing.expectEqualStrings("https://ai.starflinger.eu", env_map.get("ANTHROPIC_BASE_URL").?);
+    try std.testing.expectEqualStrings("sk-test", env_map.get("ANTHROPIC_API_KEY").?);
+    try std.testing.expectEqualStrings("starflinger-anthropic", env_map.get("ANTHROPIC_DEFAULT_OPUS_MODEL").?);
+    try std.testing.expectEqualStrings("starflinger-anthropic", env_map.get("ANTHROPIC_SMALL_FAST_MODEL").?);
+
+    // Bearer endpoints (vLLM /v1/messages) get ANTHROPIC_AUTH_TOKEN instead.
+    configureGatewayWithKey(.{
+        .enabled = true,
+        .base_url = "http://10.20.212.92:8002",
+        .model = "starflinger",
+        .bearer = true,
+    }, "tok");
+    var bearer_env = buildFilteredEnvMap(std.testing.allocator);
+    defer bearer_env.deinit();
+    try std.testing.expectEqualStrings("tok", bearer_env.get("ANTHROPIC_AUTH_TOKEN").?);
+}
+
+test "configureGateway is a no-op when disabled and fails fast on missing key" {
+    try configureGateway(.{ .enabled = false });
+    try std.testing.expect(!gatewayActive());
+    // Gateway off: model resolution is the identity.
+    try std.testing.expectEqualStrings("opus", gatewayEffectiveModel("opus"));
+
+    try std.testing.expectError(error.GatewayKeyMissing, configureGateway(.{
+        .enabled = true,
+        .base_url = "https://ai.starflinger.eu",
+        .model = "starflinger-anthropic",
+        .api_key_env = "BEES_TEST_NONEXISTENT_KEY_ENV",
+    }));
+    try std.testing.expect(!gatewayActive());
 }

@@ -351,7 +351,10 @@ fn runWorkerImpl(
         .status = if (result.is_error and result.exit_code != 124 and
             rs != .error_max_turns and rs != .error_max_budget) .err else .done,
         .has_exit_code = true,
-        .has_cost = true,
+        // Only true when a terminal result event carried the authoritative spend.
+        // A killed/timed-out agent has real spend we never saw — recording it as
+        // a confident $0.00 makes the most expensive role look like the cheapest.
+        .has_cost = result.cost_known,
         .model = model,
         .has_tokens = has_tokens,
         .has_duration = true,
@@ -398,8 +401,13 @@ fn runWorkerImpl(
         }
     }
 
-    // Update task stats
-    {
+    // Update task stats — only for sessions that reached a real verdict.
+    // Infrastructure failures (API errors, non-resumable spawn faults) must not
+    // be charged to the task: total_runs/empty are the only inputs to
+    // tasks.isExhausted and the strategist's trends report, so counting them
+    // retires healthy tasks for runner faults. Timeout-restart, max_turns and
+    // max_budget outcomes are already .done and keep counting as empty runs.
+    if (new_header.status == .done) {
         const txn = store.beginWriteTxn() catch null;
         if (txn) |t| {
             store.incrementTaskStat(t, task_name, .total_runs) catch {};

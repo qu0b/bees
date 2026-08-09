@@ -289,7 +289,9 @@ pub fn bindSession(stmt: *c.sqlite3_stmt, id: u64, h: types.SessionHeader, task:
     col += 1;
     sqlite.bindInt(stmt, col, @intCast(h.cache_read_tokens));
     col += 1;
-    sqlite.bindInt(stmt, col, @intFromEnum(h.model));
+    // getModel(), not h.model: pre-2026-07 records carry their model in the
+    // frozen model_legacy slot and would all replicate as .opus otherwise.
+    sqlite.bindInt(stmt, col, @intFromEnum(h.getModel()));
     col += 1;
     sqlite.bindInt(stmt, col, @intFromEnum(h.result_subtype));
     col += 1;
