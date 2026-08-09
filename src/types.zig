@@ -546,9 +546,16 @@ pub const TaskHeader = packed struct(u128) {
     origin: TaskOrigin,
     _reserved: u12 = 0,
 
-    /// Exhausted: tried enough times with no accepted result.
+    /// Exhausted: no longer worth spending a worker slot on.
     pub fn isExhausted(self: TaskHeader) bool {
-        return self.total_runs >= 3 and self.accepted == 0 and self.empty >= 3;
+        // Tried repeatedly, never landed anything.
+        if (self.total_runs >= 3 and self.accepted == 0 and self.empty >= 3) return true;
+        // Already delivered, and a later run found nothing left to do. Without
+        // this a finished task stayed in the pool forever and kept being drawn:
+        // 2026-08-09, "Install snippet on plugin detail page" was re-picked two
+        // cycles after merging and burned a full session reporting "already
+        // done". If more work is wanted there, that is a new task.
+        return self.accepted >= 1 and self.empty >= 1;
     }
 
     comptime {
@@ -556,6 +563,47 @@ pub const TaskHeader = packed struct(u128) {
         assert(@bitSizeOf(TaskHeader) == 128);
     }
 };
+
+test "isExhausted retires delivered work, not work still in progress" {
+    const base = TaskHeader{
+        .weight = 2,
+        .total_runs = 0,
+        .accepted = 0,
+        .rejected = 0,
+        .empty = 0,
+        .status = .active,
+        .origin = .strategist,
+    };
+
+    // Fresh, and mid-flight after one accepted run: still eligible.
+    try std.testing.expect(!base.isExhausted());
+    var delivered = base;
+    delivered.total_runs = 1;
+    delivered.accepted = 1;
+    try std.testing.expect(!delivered.isExhausted());
+
+    // Delivered, then a later run found nothing to do → retire.
+    var done = delivered;
+    done.total_runs = 2;
+    done.empty = 1;
+    try std.testing.expect(done.isExhausted());
+
+    // Never delivered: only retire after repeated empty attempts.
+    var failing = base;
+    failing.total_runs = 2;
+    failing.empty = 2;
+    try std.testing.expect(!failing.isExhausted());
+    failing.total_runs = 3;
+    failing.empty = 3;
+    try std.testing.expect(failing.isExhausted());
+
+    // Rejections are not emptiness: work that produced code and was turned down
+    // stays eligible for a retry.
+    var rejected = base;
+    rejected.total_runs = 3;
+    rejected.rejected = 3;
+    try std.testing.expect(!rejected.isExhausted());
+}
 
 pub const TaskView = struct {
     header: TaskHeader,
