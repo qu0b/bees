@@ -60,7 +60,15 @@ pub fn parse(args: []const []const u8) !Command {
     if (std.mem.eql(u8, cmd, "restart")) {
         return .{ .restart = .{ .force = hasFlag(args[2..], "--force") } };
     }
-    if (std.mem.eql(u8, cmd, "daemon")) return .daemon;
+    if (std.mem.eql(u8, cmd, "daemon")) {
+        // `daemon` takes no subcommand. Silently ignoring one turned an agent's
+        // `bees daemon status` into a second daemon launch (2026-08-09), so a
+        // stray word is an error, not a shrug. Flags stay allowed.
+        for (args[2..]) |a| {
+            if (a.len > 0 and a[0] != '-') return error.DaemonTakesNoSubcommand;
+        }
+        return .daemon;
+    }
     if (std.mem.eql(u8, cmd, "version")) return .version;
     if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) return .help;
 
@@ -215,6 +223,14 @@ test "parse init" {
     const cmd = try parse(&.{ "bees", "init" });
     try std.testing.expect(cmd == .init);
     try std.testing.expectEqual(false, cmd.init.skip_analysis);
+}
+
+test "daemon rejects a stray subcommand but accepts flags" {
+    // `bees daemon status` used to start a daemon: the extra word was ignored.
+    try std.testing.expectError(error.DaemonTakesNoSubcommand, parse(&.{ "bees", "daemon", "status" }));
+    try std.testing.expectError(error.DaemonTakesNoSubcommand, parse(&.{ "bees", "daemon", "stop" }));
+    try std.testing.expectEqual(Command.daemon, try parse(&.{ "bees", "daemon" }));
+    try std.testing.expectEqual(Command.daemon, try parse(&.{ "bees", "daemon", "--verbose" }));
 }
 
 test "parse init skip analysis" {

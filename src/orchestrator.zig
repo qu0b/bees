@@ -207,6 +207,22 @@ pub fn run(
     io: Io,
     allocator: std.mem.Allocator,
 ) !DaemonAction {
+    // Single instance per project. Two daemons on one project double-spawn
+    // workers, race the same git base, and corrupt task accounting. This
+    // happened on 2026-08-09: an agent ran `bees daemon status` for
+    // diagnostics, a stale `bees` on PATH parsed `daemon`, and a second
+    // gateway-less daemon ran alongside the real one.
+    var lock_buf: [256]u8 = undefined;
+    const lock_path = std.fmt.bufPrint(&lock_buf, "/tmp/bees-{s}-daemon.lock", .{cfg.project.name}) catch
+        return error.InvalidProjectName;
+    if (!(worker.acquireLock(lock_path) catch false)) {
+        logger.err("[daemon] another daemon already owns {s} (lock {s}) — refusing to start", .{
+            cfg.project.name, lock_path,
+        });
+        return error.DaemonAlreadyRunning;
+    }
+    defer worker.releaseLock(lock_path);
+
     logger.info("[daemon] starting — workers={d} threshold={d} timeout={d}min cooldown={d}s", .{
         cfg.workers.count,                 cfg.merger.merge_threshold,
         cfg.daemon.worker_timeout_minutes, cfg.daemon.cooldown_secs,

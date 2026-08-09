@@ -2891,6 +2891,8 @@ fn printError(stdout: *Io.Writer, e: anyerror) !void {
         error.UnknownCommand => "Unknown command. Run `bees help` for usage.",
         error.InvalidWorkerId => "Invalid worker ID. Must be a number.",
         error.NotABeesProject => "Not a bees project. Run `bees init` first.",
+        error.DaemonTakesNoSubcommand => "`bees daemon` takes no subcommand — did you mean `bees status`?",
+        error.DaemonAlreadyRunning => "Another daemon already owns this project (see /tmp/bees-<project>-daemon.lock).",
         error.GatewayKeyMissing => "gateway.enabled is set but the API key env var (gateway.api_key_env, default LITELLM_API_KEY) is not in the environment.",
         else => "An error occurred",
     };

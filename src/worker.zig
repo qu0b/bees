@@ -483,7 +483,9 @@ fn workerGroupTask(
     };
 }
 
-fn acquireLock(path: []const u8) !bool {
+/// PID-file lock. Public so the daemon can claim single-instance ownership of
+/// a project with the same stale-lock reclamation the worker slots use.
+pub fn acquireLock(path: []const u8) !bool {
     const file = fs.createFile(path, .{ .exclusive = true }) catch {
         // Lock exists — check if PID is alive
         const existing = fs.openFile(path) catch return false;
@@ -520,6 +522,6 @@ fn acquireLock(path: []const u8) !bool {
     return true;
 }
 
-fn releaseLock(path: []const u8) void {
+pub fn releaseLock(path: []const u8) void {
     fs.deleteFile(path) catch {};
 }
