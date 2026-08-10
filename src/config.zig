@@ -126,12 +126,16 @@ pub const Config = struct {
         /// When true, daemon re-execs itself after merging source code changes.
         /// Only useful when bees is building itself.
         self_hosted: bool = false,
-        /// How many independent observer roles (qa, user, sre, researcher) may
-        /// run at once. They are read-only analyses of the same merged state,
-        /// so serializing them wasted ~25min of dead time per cycle. The role
-        /// phase runs after every worker has finished (that is what triggered
-        /// the merge), so the provider's whole concurrency budget is free here
-        /// — 3 leaves one slot of headroom against rate limits.
+        /// Ceiling on TOTAL agent sessions in flight — workers plus roles —
+        /// matched to the provider's concurrent-request budget (the LiteLLM
+        /// gateway allows 4). The observer cap is derived from what workers
+        /// leave free, because workers now run through the role phase. 0 =
+        /// unbudgeted (use `max_parallel_roles` as-is).
+        max_concurrent_sessions: u32 = 4,
+        /// Upper bound on independent observer roles (qa, user, researcher)
+        /// running at once. They are read-only analyses of the same merged
+        /// state, so serializing them wasted ~25min of dead time per cycle.
+        /// The effective cap is min(this, max_concurrent_sessions - workers).
         max_parallel_roles: u32 = 3,
         /// Circuit breaker: halt the daemon after this many consecutive merge
         /// cycles with zero accepted merges (systemic failure — burning money on

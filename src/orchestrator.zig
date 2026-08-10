@@ -76,8 +76,15 @@ const RoleJob = struct {
     role_cfg: role_mod.RoleConfig,
     session_type: types.SessionType,
     name: []const u8,
-    /// Context blob built for this role; owned here, freed after the run.
-    injected: ?[]const u8,
+    /// Context SOURCES, not a prebuilt blob. The blob is built inside the job,
+    /// at the moment the role runs: the strategist and founder read
+    /// `report:qa`/`report:user`, which the observers write earlier in this
+    /// same phase. Building every context up front (as the first version of
+    /// this refactor did) silently fed them the PREVIOUS cycle's reports.
+    sources: []const ctx.Source,
+    knowledge_tags: ?[]const []const u8,
+    changed_files: ?[]const u8,
+    worker_summary: ?[]const u8,
 };
 
 /// True for roles that only OBSERVE the merged state (read-only analysis) and
@@ -87,9 +94,23 @@ const RoleJob = struct {
 /// PREVIOUS cycle's reports.
 fn isObserverRole(t: types.SessionType) bool {
     return switch (t) {
-        .qa, .user, .sre, .researcher => true,
+        // `.sre` is deliberately absent: its prompt tells it to FIX configs,
+        // prompts and tasks, and it runs in the main checkout — so it can race
+        // `git worktree add` against a concurrently spawning worker.
+        .qa, .user, .researcher => true,
         else => false,
     };
+}
+
+/// Observer concurrency that respects the TOTAL session budget. Workers now run
+/// through the role phase, so `max_parallel_roles` alone would oversubscribe the
+/// provider: 2 workers + 3 observers = 5 against a 4-request budget, and queued
+/// sessions emit no progress events — which the stall watchdog reads as a hang.
+fn observerCap(cfg: config_mod.Config) u32 {
+    const want = @max(1, cfg.daemon.max_parallel_roles);
+    if (cfg.daemon.max_concurrent_sessions == 0) return want;
+    const free = cfg.daemon.max_concurrent_sessions -| @min(cfg.workers.count, MAX_WORKERS);
+    return @max(1, @min(want, free));
 }
 
 fn runRoleJob(
@@ -102,6 +123,17 @@ fn runRoleJob(
     allocator: std.mem.Allocator,
     seed_uuid: ?[]const u8,
 ) void {
+    // Built here, not at collection time — see RoleJob.sources.
+    const injected: ?[]const u8 = if (job.sources.len > 0)
+        ctx.build(store, paths, job.sources, .{
+            .changed_files = job.changed_files,
+            .worker_summary = job.worker_summary,
+            .knowledge_tags = job.knowledge_tags,
+        }, allocator)
+    else
+        null;
+    defer if (injected) |sc| allocator.free(sc);
+
     executor.runRole(
         job.role_cfg,
         job.session_type,
@@ -111,7 +143,7 @@ fn runRoleJob(
         logger,
         io,
         allocator,
-        job.injected,
+        injected,
         false,
         cfg,
         seed_uuid,
@@ -135,7 +167,8 @@ fn runRoleJobs(
     max_concurrent: u32,
 ) void {
     defer for (jobs) |j| {
-        if (j.injected) |sc| allocator.free(sc);
+        if (j.sources.len > 0) allocator.free(j.sources);
+        if (j.knowledge_tags) |t| allocator.free(t);
     };
 
     const cap: usize = @max(1, @min(max_concurrent, 4));
@@ -565,7 +598,13 @@ pub fn run(
             // it when a cycle runs 70-110min.
             tasks_mod.syncFromFile(store, paths.tasks_file, .template, allocator) catch {};
             reloadPool(&pool, store, paths.tasks_file, allocator);
-            if (pool.hasActiveTasks() and @atomicLoad(u32, &state.shutdown_requested, .acquire) == 0) {
+            // NOT when this cycle ends in a re-exec: the reload path waits only
+            // 300s for workers, then execve replaces the process image and wipes
+            // the child registry — orphaning agents nobody can signal, still
+            // spending. Let the old batch finish and spawn after the restart.
+            if (!source_changed and
+                pool.hasActiveTasks() and @atomicLoad(u32, &state.shutdown_requested, .acquire) == 0)
+            {
                 const active_now = @atomicLoad(u32, &state.active_count, .acquire);
                 const need_now = @min(cfg.workers.count, MAX_WORKERS) -| active_now;
                 if (need_now > 0) {
@@ -637,22 +676,16 @@ pub fn run(
                     continue;
                 }
 
-                // Build context from role's declared sources (including knowledge tags)
+                // Resolve the role's declared sources. The context BLOB is built
+                // later, inside the job, so report-consuming roles see reports
+                // the observers write during this same phase.
                 const resolved = role_mod.resolveContextSources(role_cfg, allocator);
-                const step_extras = ctx.Extras{
-                    .changed_files = changed_files,
-                    .worker_summary = worker_summary,
-                    .knowledge_tags = resolved.knowledge_tags,
-                };
-                const step_ctx = if (resolved.sources.len > 0)
-                    ctx.build(store, paths, resolved.sources, step_extras, allocator)
-                else
-                    null;
 
                 // Map role name to session type
                 const session_type = mapRoleToSessionType(step.role) orelse {
                     logger.warn("[daemon] unknown role '{s}', skipping", .{step.role});
-                    if (step_ctx) |sc| allocator.free(sc);
+                    if (resolved.sources.len > 0) allocator.free(resolved.sources);
+                    if (resolved.knowledge_tags) |t| allocator.free(t);
                     continue;
                 };
 
@@ -666,7 +699,10 @@ pub fn run(
                     .role_cfg = role_cfg,
                     .session_type = session_type,
                     .name = step.role,
-                    .injected = step_ctx,
+                    .sources = resolved.sources,
+                    .knowledge_tags = resolved.knowledge_tags,
+                    .changed_files = changed_files,
+                    .worker_summary = worker_summary,
                 };
                 // Observers analyze the merged state independently; the
                 // strategist/founder READ their reports, so they must follow.
@@ -677,14 +713,15 @@ pub fn run(
                     dependent_jobs[dependent_n] = job;
                     dependent_n += 1;
                 } else {
-                    if (step_ctx) |sc| allocator.free(sc);
+                    if (resolved.sources.len > 0) allocator.free(resolved.sources);
+                    if (resolved.knowledge_tags) |t| allocator.free(t);
                 }
             }
 
             // Observers first, concurrently (bounded so workers + roles stay
             // inside the provider's concurrent-request budget), then the roles
             // that consume their reports.
-            runRoleJobs(observer_jobs[0..observer_n], cfg, paths, store, logger, io, allocator, seed_uuid, @max(1, cfg.daemon.max_parallel_roles));
+            runRoleJobs(observer_jobs[0..observer_n], cfg, paths, store, logger, io, allocator, seed_uuid, observerCap(cfg));
             runRoleJobs(dependent_jobs[0..dependent_n], cfg, paths, store, logger, io, allocator, seed_uuid, 1);
 
             // Drain any remaining SRE triggers not handled by workflow
@@ -1281,14 +1318,39 @@ fn reloadPool(pool: *tasks_mod.TaskPool, store: *store_mod.Store, tasks_file: []
     pool.* = new_pool;
 }
 
+test "observerCap keeps total sessions inside the provider budget" {
+    const base = config_mod.Config{ .project = .{ .name = "t" } };
+    // 2 workers + budget 4 -> at most 2 observers, not max_parallel_roles (3).
+    var c = base;
+    c.workers.count = 2;
+    c.daemon.max_concurrent_sessions = 4;
+    c.daemon.max_parallel_roles = 3;
+    try std.testing.expectEqual(@as(u32, 2), observerCap(c));
+
+    // Workers alone can fill the budget — still allow one observer to progress.
+    c.workers.count = 5;
+    try std.testing.expectEqual(@as(u32, 1), observerCap(c));
+
+    // Small worker count: the role cap, not the budget, is the limit.
+    c.workers.count = 1;
+    try std.testing.expectEqual(@as(u32, 3), observerCap(c));
+
+    // Unbudgeted: honor max_parallel_roles verbatim.
+    c.daemon.max_concurrent_sessions = 0;
+    c.workers.count = 5;
+    try std.testing.expectEqual(@as(u32, 3), observerCap(c));
+}
+
 test "observer roles run concurrently; report-consumers do not" {
     // qa/user/sre/researcher only READ the merged state, so they have no
     // ordering relationship. strategist/founder consume their reports and must
     // follow — running them in the same batch would feed them last cycle's data.
     try std.testing.expect(isObserverRole(.qa));
     try std.testing.expect(isObserverRole(.user));
-    try std.testing.expect(isObserverRole(.sre));
     try std.testing.expect(isObserverRole(.researcher));
+    // sre WRITES (configs, prompts, tasks) in the main checkout, so it is not
+    // an independent observer despite reading the same state.
+    try std.testing.expect(!isObserverRole(.sre));
     try std.testing.expect(!isObserverRole(.strategist));
     try std.testing.expect(!isObserverRole(.founder));
     try std.testing.expect(!isObserverRole(.worker));

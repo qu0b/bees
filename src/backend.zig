@@ -403,6 +403,9 @@ pub fn reapStalledChildren(idle_limit_secs: u32, out: []StalledChild) usize {
         const action = classifyStall(slot, now, idle_limit_secs, &idle);
         if (action == .none) continue;
         const pid = @atomicLoad(std.posix.pid_t, &slot.pid, .acquire);
+        // The slot can be released between the decision and this load. kill(0)
+        // signals the WHOLE process group — the daemon and every agent child.
+        if (pid <= 0) continue;
         switch (action) {
             .term => std.posix.kill(pid, std.c.SIG.TERM) catch continue,
             .kill => std.posix.kill(pid, std.c.SIG.KILL) catch continue,
