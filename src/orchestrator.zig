@@ -71,6 +71,100 @@ fn applyStrategistCodex(
     }
 }
 
+/// One resolved post-merger workflow step, ready to run.
+const RoleJob = struct {
+    role_cfg: role_mod.RoleConfig,
+    session_type: types.SessionType,
+    name: []const u8,
+    /// Context blob built for this role; owned here, freed after the run.
+    injected: ?[]const u8,
+};
+
+/// True for roles that only OBSERVE the merged state (read-only analysis) and
+/// therefore have no ordering relationship with each other. The strategist and
+/// founder are excluded on purpose: they read `report:qa`/`report:user`/
+/// `report:sre`, so running them alongside the observers would feed them the
+/// PREVIOUS cycle's reports.
+fn isObserverRole(t: types.SessionType) bool {
+    return switch (t) {
+        .qa, .user, .sre, .researcher => true,
+        else => false,
+    };
+}
+
+fn runRoleJob(
+    job: RoleJob,
+    cfg: config_mod.Config,
+    paths: config_mod.ProjectPaths,
+    store: *store_mod.Store,
+    logger: *log_mod.Logger,
+    io: Io,
+    allocator: std.mem.Allocator,
+    seed_uuid: ?[]const u8,
+) void {
+    executor.runRole(
+        job.role_cfg,
+        job.session_type,
+        job.name,
+        paths,
+        store,
+        logger,
+        io,
+        allocator,
+        job.injected,
+        false,
+        cfg,
+        seed_uuid,
+    ) catch |e| {
+        logger.err("[daemon] {s} failed: {}", .{ job.name, e });
+    };
+}
+
+/// Run `jobs`, at most `max_concurrent` at a time, and free their contexts.
+/// Serializing independent observers cost ~25min of dead time every cycle —
+/// no code is being written while they run one after another.
+fn runRoleJobs(
+    jobs: []const RoleJob,
+    cfg: config_mod.Config,
+    paths: config_mod.ProjectPaths,
+    store: *store_mod.Store,
+    logger: *log_mod.Logger,
+    io: Io,
+    allocator: std.mem.Allocator,
+    seed_uuid: ?[]const u8,
+    max_concurrent: u32,
+) void {
+    defer for (jobs) |j| {
+        if (j.injected) |sc| allocator.free(sc);
+    };
+
+    const cap: usize = @max(1, @min(max_concurrent, 4));
+    var i: usize = 0;
+    while (i < jobs.len) {
+        const batch = @min(cap, jobs.len - i);
+        var futures: [4]Io.Future(void) = undefined;
+        var spawned: usize = 0;
+        for (jobs[i .. i + batch]) |job| {
+            if (batch == 1) {
+                runRoleJob(job, cfg, paths, store, logger, io, allocator, seed_uuid);
+                continue;
+            }
+            if (io.concurrent(runRoleJob, .{ job, cfg, paths, store, logger, io, allocator, seed_uuid })) |f| {
+                futures[spawned] = f;
+                spawned += 1;
+            } else |_| {
+                // No concurrency available — run it inline rather than skip it.
+                runRoleJob(job, cfg, paths, store, logger, io, allocator, seed_uuid);
+            }
+        }
+        if (spawned > 1) {
+            logger.info("[daemon] running {d} observer roles concurrently", .{spawned});
+        }
+        for (futures[0..spawned]) |*f| f.await(io);
+        i += batch;
+    }
+}
+
 /// Global pointer for signal handler (signals can't capture context).
 var g_daemon_state: ?*DaemonState = null;
 
@@ -479,6 +573,13 @@ pub fn run(
             // the tasks it wrote into tasks.json (see sync below).
             var strategist_ran = false;
 
+            // Post-merger steps are collected first, then executed by group:
+            // independent observers concurrently, report-consumers after.
+            var observer_jobs: [8]RoleJob = undefined;
+            var observer_n: usize = 0;
+            var dependent_jobs: [8]RoleJob = undefined;
+            var dependent_n: usize = 0;
+
             // Execute post-merger workflow steps (skip worker and merger — already handled)
             for (wf.steps) |step| {
                 if (@atomicLoad(u32, &state.shutdown_requested, .acquire) != 0) break;
@@ -527,11 +628,11 @@ pub fn run(
                     ctx.build(store, paths, resolved.sources, step_extras, allocator)
                 else
                     null;
-                defer if (step_ctx) |sc| allocator.free(sc);
 
                 // Map role name to session type
                 const session_type = mapRoleToSessionType(step.role) orelse {
                     logger.warn("[daemon] unknown role '{s}', skipping", .{step.role});
+                    if (step_ctx) |sc| allocator.free(sc);
                     continue;
                 };
 
@@ -541,24 +642,30 @@ pub fn run(
                     strategist_ran = true;
                 }
 
-                // Run through generic executor
-                executor.runRole(
-                    role_cfg,
-                    session_type,
-                    step.role,
-                    paths,
-                    store,
-                    logger,
-                    io,
-                    allocator,
-                    step_ctx,
-                    false,
-                    cfg,
-                    seed_uuid,
-                ) catch |e| {
-                    logger.err("[daemon] {s} failed: {}", .{ step.role, e });
+                const job = RoleJob{
+                    .role_cfg = role_cfg,
+                    .session_type = session_type,
+                    .name = step.role,
+                    .injected = step_ctx,
                 };
+                // Observers analyze the merged state independently; the
+                // strategist/founder READ their reports, so they must follow.
+                if (isObserverRole(session_type) and observer_n < observer_jobs.len) {
+                    observer_jobs[observer_n] = job;
+                    observer_n += 1;
+                } else if (dependent_n < dependent_jobs.len) {
+                    dependent_jobs[dependent_n] = job;
+                    dependent_n += 1;
+                } else {
+                    if (step_ctx) |sc| allocator.free(sc);
+                }
             }
+
+            // Observers first, concurrently (bounded so workers + roles stay
+            // inside the provider's concurrent-request budget), then the roles
+            // that consume their reports.
+            runRoleJobs(observer_jobs[0..observer_n], cfg, paths, store, logger, io, allocator, seed_uuid, @max(1, cfg.daemon.max_parallel_roles));
+            runRoleJobs(dependent_jobs[0..dependent_n], cfg, paths, store, logger, io, allocator, seed_uuid, 1);
 
             // Drain any remaining SRE triggers not handled by workflow
             drainSreTriggers(cfg, paths, store, logger, io, allocator, &state);
@@ -1152,6 +1259,20 @@ fn reloadPool(pool: *tasks_mod.TaskPool, store: *store_mod.Store, tasks_file: []
         tasks_mod.TaskPool.load(allocator, tasks_file) catch return;
     pool.deinit(allocator);
     pool.* = new_pool;
+}
+
+test "observer roles run concurrently; report-consumers do not" {
+    // qa/user/sre/researcher only READ the merged state, so they have no
+    // ordering relationship. strategist/founder consume their reports and must
+    // follow — running them in the same batch would feed them last cycle's data.
+    try std.testing.expect(isObserverRole(.qa));
+    try std.testing.expect(isObserverRole(.user));
+    try std.testing.expect(isObserverRole(.sre));
+    try std.testing.expect(isObserverRole(.researcher));
+    try std.testing.expect(!isObserverRole(.strategist));
+    try std.testing.expect(!isObserverRole(.founder));
+    try std.testing.expect(!isObserverRole(.worker));
+    try std.testing.expect(!isObserverRole(.merger));
 }
 
 test "useCodex splits deterministically by fraction" {

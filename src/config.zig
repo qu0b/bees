@@ -126,6 +126,13 @@ pub const Config = struct {
         /// When true, daemon re-execs itself after merging source code changes.
         /// Only useful when bees is building itself.
         self_hosted: bool = false,
+        /// How many independent observer roles (qa, user, sre, researcher) may
+        /// run at once. They are read-only analyses of the same merged state,
+        /// so serializing them wasted ~25min of dead time per cycle. The role
+        /// phase runs after every worker has finished (that is what triggered
+        /// the merge), so the provider's whole concurrency budget is free here
+        /// — 3 leaves one slot of headroom against rate limits.
+        max_parallel_roles: u32 = 3,
         /// Circuit breaker: halt the daemon after this many consecutive merge
         /// cycles with zero accepted merges (systemic failure — burning money on
         /// work that never lands). The unit stays stopped for operator attention
