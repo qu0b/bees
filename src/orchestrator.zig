@@ -556,6 +556,26 @@ pub fn run(
             seed_uuid = seed_result.uuid;
             context_blob = seed_result.context_blob;
 
+            // Start the next worker batch NOW, before the observer roles, so
+            // coding overlaps with analysis. The roles only read the merged
+            // state and the workers build in their own worktrees, so nothing
+            // conflicts. Serializing them left 32-42min per cycle in which no
+            // code was written (measured 2026-08-10). The trade: workers see
+            // the reports and strategist tasks from the PREVIOUS cycle — worth
+            // it when a cycle runs 70-110min.
+            tasks_mod.syncFromFile(store, paths.tasks_file, .template, allocator) catch {};
+            reloadPool(&pool, store, paths.tasks_file, allocator);
+            if (pool.hasActiveTasks() and @atomicLoad(u32, &state.shutdown_requested, .acquire) == 0) {
+                const active_now = @atomicLoad(u32, &state.active_count, .acquire);
+                const need_now = @min(cfg.workers.count, MAX_WORKERS) -| active_now;
+                if (need_now > 0) {
+                    logger.info("[daemon] spawning {d} new workers (overlapping the role phase)", .{need_now});
+                    for (0..need_now) |_| {
+                        spawnWorker(cfg, paths, store, pool, logger, io, allocator, &state, context_blob);
+                    }
+                }
+            }
+
             // Precompute shared context values
             const worker_summary = ctx.buildWorkerSummary(store, null, allocator);
             defer if (worker_summary) |ws| allocator.free(ws);
