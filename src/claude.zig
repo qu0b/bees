@@ -213,7 +213,9 @@ pub fn parseEventMeta(line: []const u8) types.EventMeta {
         .num_turns = 0,
     };
 
-    const type_val = findJsonStringValue(line, "\"type\"") orelse return meta;
+    // Top-level only: a result event's nested `usage` block carries its own
+    // "type", which a first-match scan would read instead.
+    const type_val = findTopLevelJsonString(line, "\"type\"") orelse return meta;
 
     // Claude CLI stream-json uses top-level types: "system", "assistant", "user", "result"
     // Map these to our internal EventType enum
@@ -221,13 +223,13 @@ pub fn parseEventMeta(line: []const u8) types.EventMeta {
         meta.event_type = .init_event;
     } else if (std.mem.eql(u8, type_val, "result")) {
         meta.event_type = .result;
-        if (findJsonNumberValue(line, "\"duration_ms\"")) |dur| {
+        if (findTopLevelJsonNumber(line, "\"duration_ms\"")) |dur| {
             meta.duration_secs = @intFromFloat(@min(dur / 1000.0, 65535.0));
         }
-        if (findJsonNumberValue(line, "\"num_turns\"")) |turns| {
+        if (findTopLevelJsonNumber(line, "\"num_turns\"")) |turns| {
             meta.num_turns = @intFromFloat(@min(turns, 255.0));
         }
-        if (findJsonStringValue(line, "\"subtype\"")) |subtype| {
+        if (findTopLevelJsonString(line, "\"subtype\"")) |subtype| {
             // Subtypes: success, error_max_turns, error_max_budget_usd,
             // error_during_execution, error_max_structured_output_retries
             if (std.mem.startsWith(u8, subtype, "error")) {
@@ -277,6 +279,77 @@ pub fn parseEventMeta(line: []const u8) types.EventMeta {
     }
 
     return meta;
+}
+
+/// Offset just past `key` when it appears as a key of the OUTERMOST object,
+/// skipping anything nested. Substring search is not enough for the fields that
+/// decide what an event *is*: a real `result` event carries a `usage` block that
+/// contains its own `"type":"message"` hundreds of bytes before the top-level
+/// `"type":"result"`, so a first-match scan classifies the terminal event as a
+/// message and silently drops the session's cost and turn count.
+fn topLevelKeyEnd(json: []const u8, key: []const u8) ?usize {
+    var depth: i32 = 0;
+    var i: usize = 0;
+    var in_string = false;
+    var string_start: usize = 0;
+    while (i < json.len) : (i += 1) {
+        const c = json[i];
+        if (in_string) {
+            if (c == '\\') {
+                i += 1;
+                continue;
+            }
+            if (c != '"') continue;
+            in_string = false;
+            // A key sits at depth 1 and is followed by its colon.
+            if (depth == 1 and string_start >= 1) {
+                const name = json[string_start - 1 .. i + 1];
+                if (std.mem.eql(u8, name, key)) {
+                    var j = i + 1;
+                    while (j < json.len and (json[j] == ' ' or json[j] == '\t')) : (j += 1) {}
+                    if (j < json.len and json[j] == ':') return i + 1;
+                }
+            }
+            continue;
+        }
+        switch (c) {
+            '"' => {
+                in_string = true;
+                string_start = i + 1;
+            },
+            '{', '[' => depth += 1,
+            '}', ']' => depth -= 1,
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Like `findJsonStringValue`, but only matches a key of the outermost object.
+pub fn findTopLevelJsonString(json: []const u8, key: []const u8) ?[]const u8 {
+    const end = topLevelKeyEnd(json, key) orelse return null;
+    var pos = end;
+    while (pos < json.len and (json[pos] == ' ' or json[pos] == ':' or json[pos] == '\t')) : (pos += 1) {}
+    if (pos >= json.len or json[pos] != '"') return null;
+    pos += 1;
+    const start = pos;
+    while (pos < json.len and json[pos] != '"') {
+        if (json[pos] == '\\') pos += 1;
+        pos += 1;
+    }
+    if (pos >= json.len) return null;
+    return json[start..pos];
+}
+
+/// Like `findJsonNumberValue`, but only matches a key of the outermost object.
+pub fn findTopLevelJsonNumber(json: []const u8, key: []const u8) ?f64 {
+    const end = topLevelKeyEnd(json, key) orelse return null;
+    var pos = end;
+    while (pos < json.len and (json[pos] == ' ' or json[pos] == ':' or json[pos] == '\t')) : (pos += 1) {}
+    const start = pos;
+    while (pos < json.len and (std.ascii.isDigit(json[pos]) or json[pos] == '.' or json[pos] == '-' or json[pos] == 'e' or json[pos] == 'E' or json[pos] == '+')) : (pos += 1) {}
+    if (pos == start) return null;
+    return std.fmt.parseFloat(f64, json[start..pos]) catch null;
 }
 
 pub fn findJsonStringValue(json: []const u8, key: []const u8) ?[]const u8 {
@@ -529,6 +602,28 @@ test "parseEventMeta user tool_result" {
     const meta = parseEventMeta("{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"123\",\"content\":\"ok\"}]}}");
     try std.testing.expectEqual(types.EventType.tool_result, meta.event_type);
     try std.testing.expectEqual(types.Role.user, meta.role);
+}
+
+test "a result event is not shadowed by the type inside its usage block" {
+    // Shape taken from a real claude 2.1.229 session: the terminal event leads
+    // with is_error, and its usage block carries "type":"message" long before
+    // the top-level "type":"result". Reading the first match classified this as
+    // a message, so the whole accounting branch was skipped and the session
+    // recorded $0.00 for work that really happened.
+    const line =
+        "{\"is_error\":false,\"duration_api_ms\":14774,\"num_turns\":8,\"stop_reason\":\"end_turn\"," ++
+        "\"usage\":{\"input_tokens\":4,\"server_tool_use\":[{\"type\":\"message\"}],\"speed\":\"standard\"}," ++
+        "\"modelUsage\":{\"claude-haiku\":{\"costUSD\":0.06}}," ++
+        "\"type\":\"result\",\"subtype\":\"success\",\"total_cost_usd\":0.0659559,\"duration_ms\":19000}";
+    const meta = parseEventMeta(line);
+    try std.testing.expectEqual(types.EventType.result, meta.event_type);
+    try std.testing.expectEqual(@as(u8, 8), meta.num_turns);
+    try std.testing.expectEqual(@as(u16, 19), meta.duration_secs);
+    try std.testing.expect(!meta.is_error);
+    // The money number must come from the top level, not from modelUsage.
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0659559), findTopLevelJsonNumber(line, "\"total_cost_usd\"").?, 1e-9);
+    try std.testing.expect(findTopLevelJsonNumber(line, "\"costUSD\"") == null);
+    try std.testing.expect(findTopLevelJsonString(line, "\"speed\"") == null);
 }
 
 test "parseEventMeta result" {
