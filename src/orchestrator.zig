@@ -354,6 +354,17 @@ pub fn run(
         cfg.workers.count,                 cfg.merger.merge_threshold,
         cfg.daemon.worker_timeout_minutes, cfg.daemon.cooldown_secs,
     });
+    // Config is read once, here: editing config.json while the daemon runs
+    // changes nothing until it restarts. That silence is expensive — a worker
+    // budget was lowered to $40 during an incident and the daemon, still
+    // holding the old value, let a session reach $115.79. Print what is
+    // actually in force so the effective limits can be checked against the
+    // file, and say plainly that a restart is what applies an edit.
+    logger.info("[daemon] budget in force (restart to change): worker=${d:.0} merger=${d:.0} sre=${d:.0} strategist=${d:.0} qa=${d:.0}", .{
+        cfg.workers.max_budget_usd, cfg.merger.max_budget_usd,
+        cfg.sre.max_budget_usd,     cfg.strategist.max_budget_usd,
+        cfg.qa.max_budget_usd,
+    });
 
     var state = DaemonState{};
     installSignalHandlers(&state);
