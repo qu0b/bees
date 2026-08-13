@@ -11,6 +11,7 @@ const fs = @import("fs.zig");
 const ctx_mod = @import("context.zig");
 const seed_mod = @import("seed.zig");
 const role_mod = @import("role.zig");
+const tasks_mod = @import("tasks.zig");
 
 const WorktreeCandidate = struct {
     branch: []const u8,
@@ -474,6 +475,11 @@ fn incrementWorkerTaskStat(store: *store_mod.Store, worker_session_id: u64, fiel
     }
     @memcpy(name_buf[0..name_len], session.task[0..name_len]);
     store_mod.Store.abortTxn(read_txn);
+
+    // The worker held its claim past the end of its session so nothing would
+    // re-run a task whose candidate was still queued. The candidate is judged
+    // now, so the task is free to be picked again.
+    defer tasks_mod.TaskPool.release(name_buf[0..name_len]);
 
     const write_txn = store.beginWriteTxn() catch return;
     store.incrementTaskStat(write_txn, name_buf[0..name_len], switch (field) {

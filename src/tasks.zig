@@ -518,6 +518,31 @@ pub fn syncFromFile(
     try syncFromJson(store, data, origin, allocator);
 }
 
+test "a task stays claimed while its candidate awaits review" {
+    // Sequential duplicates cost as much as concurrent ones: on chatplugin a
+    // worker delivered a branch, and 36 minutes later — with that branch still
+    // unmerged — another worker started the same task. The claim outlives the
+    // session that produced a candidate; the merger drops it on accept/reject.
+    TaskPool.resetClaims();
+    defer TaskPool.resetClaims();
+    var pool = TaskPool{
+        .tasks = @constCast(&[_]Task{
+            .{ .name = "only", .weight = 1, .prompt = "p", .cumulative = 1 },
+        }),
+        .total_weight = 1,
+    };
+    const first = pool.selectUnclaimed() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("only", first.name);
+
+    // Session ended with a candidate: the worker does NOT release, so nothing
+    // may pick it up again.
+    try std.testing.expect(pool.selectUnclaimed() == null);
+
+    // The merger judges it, and the task returns to the pool.
+    TaskPool.release("only");
+    try std.testing.expect(pool.selectUnclaimed() != null);
+}
+
 test "delivered work is demoted, never dropped" {
     const base = types.TaskHeader{
         .weight = 8,

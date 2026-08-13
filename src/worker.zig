@@ -89,9 +89,15 @@ fn runWorkerImpl(
     };
     const task_name = try allocator.dupe(u8, selected.name);
     defer allocator.free(task_name);
-    // Held for the whole session: another worker starting now must not pick
-    // the same task and produce a branch the merger will only reject.
-    defer tasks_mod.TaskPool.release(task_name);
+    // Held for the whole session, and beyond it when the session leaves a
+    // candidate behind: releasing at session end let the next batch re-run a
+    // task whose branch was still queued for review. Observed on chatplugin —
+    // one worker delivered "Enforce plugin/mcp $schema version match", and 36
+    // minutes later, with that branch still unmerged, another worker started
+    // the same task. The merger releases the claim when it accepts or rejects
+    // the candidate; a session that produced nothing releases here.
+    var produced_candidate = false;
+    defer if (!produced_candidate) tasks_mod.TaskPool.release(task_name);
     const task_prompt = try allocator.dupe(u8, selected.prompt);
     defer allocator.free(task_prompt);
     logger.info("[worker:{d}] start task=\"{s}\"", .{ worker_id, task_name });
@@ -341,6 +347,8 @@ fn runWorkerImpl(
 
     // Count commits
     const commits = git.getCommitsAhead(allocator, io, paths.root, branch_name, cfg.project.base_branch) catch 0;
+    // A branch the merger has yet to judge keeps the task claimed.
+    produced_candidate = commits > 0;
 
     // Finish session
     const finish_time: u64 = fs.timestamp();
