@@ -83,12 +83,15 @@ fn runWorkerImpl(
     // Select task. The returned pointer aliases the shared pool, which the
     // main loop's reloadPool can free while this session runs for up to an
     // hour — so take owned copies of the strings we need for the whole session.
-    const selected = pool.select() orelse {
-        logger.info("[worker:{d}] no active tasks, skipping", .{worker_id});
+    const selected = pool.selectUnclaimed() orelse {
+        logger.info("[worker:{d}] no unclaimed task, skipping", .{worker_id});
         return .{};
     };
     const task_name = try allocator.dupe(u8, selected.name);
     defer allocator.free(task_name);
+    // Held for the whole session: another worker starting now must not pick
+    // the same task and produce a branch the merger will only reject.
+    defer tasks_mod.TaskPool.release(task_name);
     const task_prompt = try allocator.dupe(u8, selected.prompt);
     defer allocator.free(task_prompt);
     logger.info("[worker:{d}] start task=\"{s}\"", .{ worker_id, task_name });

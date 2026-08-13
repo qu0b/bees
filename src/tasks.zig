@@ -148,7 +148,125 @@ pub const TaskPool = struct {
         assert(task.prompt.len > 0);
         return task;
     }
+
+    /// Select a task no other in-flight worker is already running, and claim it.
+    ///
+    /// Weight-proportional selection alone repeats: three workers drawing from
+    /// three tasks put two on the same one, the merger rejected the loser as
+    /// redundant, and 47% of that cycle's spend bought nothing. The collision
+    /// rate rises with worker count, so parallelism made it worse — the fix has
+    /// to be a claim, not a better hash.
+    ///
+    /// Returns null when every task is already claimed: paying for known
+    /// duplicate work is worse than running fewer workers. Deliberate
+    /// best-of-N, if we ever want it, should be an explicit fan-out rather than
+    /// an accident of the draw.
+    ///
+    /// The caller MUST `release` the returned task's name when its session
+    /// ends. Claims are process-local by design: a daemon that dies takes its
+    /// in-flight workers with it, and the pool is rebuilt on the next start.
+    pub fn selectUnclaimed(self: *const TaskPool) ?*const Task {
+        if (self.tasks.len == 0 or self.total_weight == 0) return null;
+
+        claims_lock.lock();
+        defer claims_lock.unlock();
+
+        // Try the weighted draw first so selection keeps honouring weights,
+        // then fall back to a scan so a claimed-heavy pool still finds work.
+        var attempt: usize = 0;
+        while (attempt < 8) : (attempt += 1) {
+            const task = self.select() orelse return null;
+            if (claimUnlocked(task.name)) return task;
+        }
+        for (self.tasks) |*task| {
+            if (claimUnlocked(task.name)) return task;
+        }
+        return null;
+    }
+
+    /// Drop a claim taken by `selectUnclaimed`. Safe to call with a name that
+    /// is not claimed, so callers can `defer` it unconditionally.
+    pub fn release(name: []const u8) void {
+        claims_lock.lock();
+        defer claims_lock.unlock();
+        var buf: [max_claim_name]u8 = undefined;
+        const key = canonical(&buf, name);
+        for (&claims) |*slot| {
+            if (slot.len > 0 and std.mem.eql(u8, slot.slice(), key)) {
+                slot.len = 0;
+                return;
+            }
+        }
+    }
+
+    /// Number of tasks currently claimed. For tests and status reporting.
+    pub fn claimedCount() usize {
+        claims_lock.lock();
+        defer claims_lock.unlock();
+        var n: usize = 0;
+        for (claims) |slot| {
+            if (slot.len > 0) n += 1;
+        }
+        return n;
+    }
+
+    /// Test-only: forget every claim, so one test's leftovers cannot fail the
+    /// next. Not for production use — a real release happens per session.
+    pub fn resetClaims() void {
+        claims_lock.lock();
+        defer claims_lock.unlock();
+        for (&claims) |*slot| slot.len = 0;
+    }
 };
+
+/// Claims are compared canonically, so "Fix the parser" and "fix the parser!"
+/// are one task — the same rule the pool already uses for duplicate detection.
+const max_claim_name = 96;
+const ClaimSlot = struct {
+    buf: [max_claim_name]u8 = undefined,
+    len: usize = 0,
+
+    fn slice(self: *const ClaimSlot) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+/// Sized to the worker ceiling: a claim exists only while a session runs.
+var claims: [64]ClaimSlot = @splat(.{});
+var claims_lock: Mutex = .{};
+
+const Mutex = struct {
+    inner: std.c.pthread_mutex_t = .{},
+
+    fn lock(self: *Mutex) void {
+        _ = std.c.pthread_mutex_lock(&self.inner);
+    }
+
+    fn unlock(self: *Mutex) void {
+        _ = std.c.pthread_mutex_unlock(&self.inner);
+    }
+};
+
+/// Caller holds `claims_lock`. False when the task is already claimed or there
+/// is no free slot — both mean "do not run this now".
+fn claimUnlocked(name: []const u8) bool {
+    var buf: [max_claim_name]u8 = undefined;
+    const key = canonical(&buf, name);
+    if (key.len == 0) return false;
+
+    var free_slot: ?*ClaimSlot = null;
+    for (&claims) |*slot| {
+        if (slot.len == 0) {
+            if (free_slot == null) free_slot = slot;
+            continue;
+        }
+        if (std.mem.eql(u8, slot.slice(), key)) return false;
+    }
+    const slot = free_slot orelse return false;
+    @memcpy(slot.buf[0..key.len], key);
+    slot.len = key.len;
+    return true;
+}
 
 /// Canonical form for duplicate detection: lowercase, drop non-alphanumerics,
 /// collapse runs to single spaces. Writes into `buf`, returns the used slice.
@@ -402,6 +520,57 @@ test "task pool select is weight-proportional" {
     // Expect ~200/800; allow generous slack for the hash's discrepancy.
     try std.testing.expect(a > 120 and a < 290);
     try std.testing.expect(b > 710 and b < 880);
+}
+
+test "a batch of workers never draws the same task twice" {
+    // The regression this exists for: three workers, three tasks, two landed on
+    // the heaviest one and the merger rejected the duplicate — 47% of that
+    // cycle's spend bought nothing.
+    TaskPool.resetClaims();
+    defer TaskPool.resetClaims();
+    var pool = TaskPool{
+        .tasks = @constCast(&[_]Task{
+            .{ .name = "light", .weight = 1, .prompt = "p", .cumulative = 1 },
+            .{ .name = "heavy", .weight = 100, .prompt = "p", .cumulative = 101 },
+            .{ .name = "middle", .weight = 10, .prompt = "p", .cumulative = 111 },
+        }),
+        .total_weight = 111,
+    };
+
+    var seen: [3][]const u8 = undefined;
+    for (0..3) |i| {
+        const t = pool.selectUnclaimed() orelse return error.TestUnexpectedResult;
+        for (seen[0..i]) |prev| try std.testing.expect(!std.mem.eql(u8, prev, t.name));
+        seen[i] = t.name;
+    }
+    // Every task is claimed; a fourth worker must idle rather than duplicate.
+    try std.testing.expectEqual(@as(usize, 3), TaskPool.claimedCount());
+    try std.testing.expect(pool.selectUnclaimed() == null);
+
+    // Releasing one frees exactly that task, and only it.
+    TaskPool.release(seen[1]);
+    try std.testing.expectEqual(@as(usize, 2), TaskPool.claimedCount());
+    const again = pool.selectUnclaimed() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(seen[1], again.name);
+}
+
+test "claims ignore spelling, and releasing an unheld task is harmless" {
+    TaskPool.resetClaims();
+    defer TaskPool.resetClaims();
+    var pool = TaskPool{
+        .tasks = @constCast(&[_]Task{
+            .{ .name = "Fix the parser!", .weight = 1, .prompt = "p", .cumulative = 1 },
+        }),
+        .total_weight = 1,
+    };
+    _ = pool.selectUnclaimed() orelse return error.TestUnexpectedResult;
+    // Same task, different spelling — must not be claimable twice.
+    try std.testing.expect(!claimUnlocked("fix the parser"));
+    // A defer that runs on a path which never claimed must not corrupt state.
+    TaskPool.release("something never claimed");
+    try std.testing.expectEqual(@as(usize, 1), TaskPool.claimedCount());
+    TaskPool.release("  fix   the parser  ");
+    try std.testing.expectEqual(@as(usize, 0), TaskPool.claimedCount());
 }
 
 test "canonical collapses spelling differences" {
