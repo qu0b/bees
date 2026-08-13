@@ -48,6 +48,13 @@ pub const OutputOptions = struct {
 pub fn parse(args: []const []const u8) !Command {
     if (args.len < 2) return .help;
 
+    // `--help` ANYWHERE means help, before any command is dispatched. Agents
+    // explore a CLI by asking for help, and `bees run sre --help` used to
+    // ignore the flag and launch a real, billable SRE session (2026-08-13).
+    for (args[1..]) |a| {
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) return .help;
+    }
+
     const cmd = args[1];
 
     if (std.mem.eql(u8, cmd, "init")) {
@@ -223,6 +230,16 @@ test "parse init" {
     const cmd = try parse(&.{ "bees", "init" });
     try std.testing.expect(cmd == .init);
     try std.testing.expectEqual(false, cmd.init.skip_analysis);
+}
+
+test "--help anywhere returns help, never an expensive command" {
+    // `bees run sre --help` used to ignore the flag and START an SRE session.
+    try std.testing.expectEqual(Command.help, try parse(&.{ "bees", "run", "sre", "--help" }));
+    try std.testing.expectEqual(Command.help, try parse(&.{ "bees", "run", "worker", "-h" }));
+    try std.testing.expectEqual(Command.help, try parse(&.{ "bees", "daemon", "--help" }));
+    try std.testing.expectEqual(Command.help, try parse(&.{ "bees", "--help" }));
+    // Without the flag the command still dispatches normally.
+    try std.testing.expectEqual(Command.run_sre, try parse(&.{ "bees", "run", "sre" }));
 }
 
 test "daemon rejects a stray subcommand but accepts flags" {

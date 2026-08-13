@@ -944,6 +944,11 @@ fn drainSreTriggers(
     allocator: std.mem.Allocator,
     state: *DaemonState,
 ) void {
+    // Never start a diagnosis session while shutting down. Without this the
+    // stop path spawned a fresh SRE agent AFTER the watchdog had already TERMed
+    // the in-flight ones (2026-08-13), so a stop that should take seconds sat
+    // for minutes waiting on work it had just decided not to do.
+    if (@atomicLoad(u32, &state.shutdown_requested, .acquire) != 0) return;
     const count = @atomicRmw(u32, &state.sre_trigger_count, .Xchg, 0, .acquire);
     if (count == 0) return;
 
