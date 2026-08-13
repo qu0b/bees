@@ -222,6 +222,22 @@ pub fn writeStdinAndClose(child: *std.process.Child, io: Io, data: ?[]const u8) 
 
 /// Read system/append prompt files and build a combined prompt string.
 /// Returns the combined prompt (caller owns memory via allocator).
+/// Cut to at most `limit` bytes without splitting a UTF-8 character.
+///
+/// Slicing on a byte boundary lands mid-sequence whenever the cut falls inside
+/// a multi-byte character — an em dash is three bytes, and role prompts are
+/// full of them. The half-character is stored verbatim and every later read of
+/// that event fails to decode: `bees session <id> --json` emitted bytes that
+/// python, jq and the dashboard all reject. The event is immutable once
+/// written, so this has to be right at the point of capture.
+fn utf8Truncate(s: []const u8, limit: usize) []const u8 {
+    if (s.len <= limit) return s;
+    var end = limit;
+    // Continuation bytes are 0b10xxxxxx; walk back to the character's start.
+    while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
+    return s[0..end];
+}
+
 pub fn buildPromptWithFiles(allocator: std.mem.Allocator, prompt: []const u8, system_prompt_file: ?[]const u8, append_prompt_file: ?[]const u8) ![]const u8 {
     var buf: std.ArrayList(u8) = .empty;
 
@@ -845,7 +861,7 @@ pub fn runSession(
         if (prefix.len < prompt_json_buf.len) {
             @memcpy(prompt_json_buf[0..prefix.len], prefix);
             var pos: usize = prefix.len;
-            const prompt_preview = if (options.prompt.len > 3000) options.prompt[0..3000] else options.prompt;
+            const prompt_preview = utf8Truncate(options.prompt, 3000);
             for (prompt_preview) |ch| {
                 if (pos + 2 >= prompt_json_buf.len - suffix.len) break;
                 switch (ch) {
@@ -1482,6 +1498,22 @@ test "resolveBackend role override" {
     try std.testing.expectEqual(types.BackendType.codex, resolveBackend("claude", "codex"));
     try std.testing.expectEqual(types.BackendType.opencode, resolveBackend("claude", "opencode"));
     try std.testing.expectEqual(types.BackendType.pi, resolveBackend("pi", ""));
+}
+
+test "prompt preview never splits a character" {
+    // An em dash is three bytes; cutting between them produced events that
+    // python, jq and the dashboard all refused to decode.
+    const dash = "\xE2\x80\x94";
+    const s = "ab" ++ dash ++ "cd";
+    // Limits landing inside the dash must drop it whole, not half of it.
+    try std.testing.expectEqualStrings("ab", utf8Truncate(s, 3));
+    try std.testing.expectEqualStrings("ab", utf8Truncate(s, 4));
+    try std.testing.expectEqualStrings("ab" ++ dash, utf8Truncate(s, 5));
+    // Under the limit, and exactly at it, nothing is dropped.
+    try std.testing.expectEqualStrings(s, utf8Truncate(s, s.len));
+    try std.testing.expectEqualStrings(s, utf8Truncate(s, 99));
+    // Every truncation of a valid string stays valid.
+    for (0..s.len + 2) |n| try std.testing.expect(std.unicode.utf8ValidateSlice(utf8Truncate(s, n)));
 }
 
 test "gateway mode forces claude backend and injects endpoint env" {

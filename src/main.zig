@@ -361,13 +361,34 @@ fn runCommand(cmd: cli.Command, arena: std.mem.Allocator, io: Io, stdout: *Io.Wr
         },
         .daemon => try cmdDaemon(arena, io, stdout),
         .status => |opts| try cmdStatus(arena, stdout, opts.json),
-        .run_worker => |opts| try cmdRunWorker(arena, io, stdout, opts.id),
-        .run_merger => try cmdRunMerger(arena, io, stdout),
-        .run_strategist => try cmdRunStrategist(arena, io, stdout),
-        .run_sre => try cmdRunSre(arena, io, stdout),
-        .run_qa => try cmdRunQa(arena, io, stdout),
-        .run_user => try cmdRunUser(arena, io, stdout),
-        .run_researcher => try cmdRunResearcher(arena, io, stdout),
+        .run_worker => |opts| {
+            try refuseIfDaemonOwns(arena, stdout, "worker");
+            try cmdRunWorker(arena, io, stdout, opts.id);
+        },
+        .run_merger => {
+            try refuseIfDaemonOwns(arena, stdout, "merger");
+            try cmdRunMerger(arena, io, stdout);
+        },
+        .run_strategist => {
+            try refuseIfDaemonOwns(arena, stdout, "strategist");
+            try cmdRunStrategist(arena, io, stdout);
+        },
+        .run_sre => {
+            try refuseIfDaemonOwns(arena, stdout, "sre");
+            try cmdRunSre(arena, io, stdout);
+        },
+        .run_qa => {
+            try refuseIfDaemonOwns(arena, stdout, "qa");
+            try cmdRunQa(arena, io, stdout);
+        },
+        .run_user => {
+            try refuseIfDaemonOwns(arena, stdout, "user");
+            try cmdRunUser(arena, io, stdout);
+        },
+        .run_researcher => {
+            try refuseIfDaemonOwns(arena, stdout, "researcher");
+            try cmdRunResearcher(arena, io, stdout);
+        },
         .doctor => |opts| try cmdDoctor(arena, io, stdout, opts.role, opts.probe),
         .log => try cmdLog(arena, stdout),
         .config => |opts| try cmdConfig(arena, stdout, opts.json),
@@ -1659,6 +1680,30 @@ fn cmdRunWorker(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, id: ?u32) 
     }
 
     try stdout.print("Worker run complete\n", .{});
+}
+
+/// Refuse a one-shot role run while a daemon owns this project.
+///
+/// The daemon runs these roles itself on its own schedule. A second one racing
+/// it reviews the same candidates, competes for the same git refs, and
+/// interleaves writes into the shared log — observed as two processes' lines
+/// spliced mid-timestamp. `bees daemon` already refuses a second daemon via
+/// this lock; a one-shot run was simply never checked against it.
+fn refuseIfDaemonOwns(arena: std.mem.Allocator, stdout: *Io.Writer, role: []const u8) !void {
+    // Best effort: a project we cannot read is not a project a daemon owns.
+    const project = loadProject(arena) catch return;
+    const lock_path = std.fmt.allocPrint(arena, "/tmp/bees-{s}-daemon.lock", .{project[0].project.name}) catch return;
+    const pid = worker.lockHolderPid(lock_path) orelse return;
+    try stdout.print(
+        \\A daemon already owns this project (pid {d}, lock {s}).
+        \\It runs the {s} role itself; a second one races it on git refs and the log.
+        \\Stop the daemon first, or let it reach this role on its own schedule.
+        \\
+    , .{ pid, lock_path, role });
+    // exit() does not run deferred flushes, and an unflushed refusal reads as
+    // a command that silently did nothing.
+    stdout.flush() catch {};
+    std.process.exit(1);
 }
 
 fn cmdRunMerger(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {

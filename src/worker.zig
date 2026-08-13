@@ -488,6 +488,22 @@ fn workerGroupTask(
 
 /// PID-file lock. Public so the daemon can claim single-instance ownership of
 /// a project with the same stale-lock reclamation the worker slots use.
+/// Pid of the live process holding `path`, or null when the lock is absent,
+/// unreadable, or left behind by a process that has since died. Read-only —
+/// unlike `acquireLock`, it never reclaims a stale lock.
+pub fn lockHolderPid(path: []const u8) ?std.c.pid_t {
+    const file = fs.openFile(path) catch return null;
+    defer fs.closeFile(file);
+    var pid_buf: [32]u8 = undefined;
+    const len = fs.readAll(file, &pid_buf) catch return null;
+    const text = std.mem.trim(u8, pid_buf[0..len], &std.ascii.whitespace);
+    const pid = std.fmt.parseInt(std.c.pid_t, text, 10) catch return null;
+    // Only ESRCH means gone; EPERM is a live process owned by someone else.
+    const rc = std.c.kill(pid, @enumFromInt(0));
+    if (rc != 0 and std.c.errno(rc) == .SRCH) return null;
+    return pid;
+}
+
 pub fn acquireLock(path: []const u8) !bool {
     const file = fs.createFile(path, .{ .exclusive = true }) catch {
         // Lock exists — check if PID is alive
