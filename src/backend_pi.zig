@@ -130,24 +130,18 @@ pub fn processEvent(line: []const u8, acc: *backend.ResultAccumulator) types.Eve
         if (std.mem.eql(u8, role, "assistant")) {
             meta.role = .assistant;
             acc.num_turns +|= 1;
+            // Usage rides each assistant message. pi names these fields itself
+            // (`usage.input`, `usage.cost.total`) — reading them with Anthropic
+            // names reported every pi session as 0 tokens and $0.00 spent,
+            // which is worse than reporting nothing.
+            accumulateUsage(line, acc);
         } else if (std.mem.eql(u8, role, "user")) {
             meta.role = .user;
         }
     } else if (std.mem.eql(u8, event_type, "agent_end")) {
         meta.event_type = .result;
-        // Extract token usage from messages — look for usage fields
-        if (claude.findJsonNumberValue(line, "\"input_tokens\"")) |v| {
-            acc.input_tokens +|= @intFromFloat(@max(v, 0.0));
-        }
-        if (claude.findJsonNumberValue(line, "\"output_tokens\"")) |v| {
-            acc.output_tokens +|= @intFromFloat(@max(v, 0.0));
-        }
-        if (claude.findJsonNumberValue(line, "\"cache_creation_input_tokens\"")) |v| {
-            acc.cache_creation_tokens +|= @intFromFloat(@max(v, 0.0));
-        }
-        if (claude.findJsonNumberValue(line, "\"cache_read_input_tokens\"")) |v| {
-            acc.cache_read_tokens +|= @intFromFloat(@max(v, 0.0));
-        }
+        // Usage is accumulated per message above; agent_end repeats every
+        // message, so re-reading it here would double count.
         // Extract result text from last assistant message
         if (claude.findJsonStringValue(line, "\"text\"")) |text| {
             acc.result_text = text;
@@ -158,6 +152,29 @@ pub fn processEvent(line: []const u8, acc: *backend.ResultAccumulator) types.Eve
     }
 
     return meta;
+}
+
+/// Read pi's own usage/cost shape off one assistant message:
+///   "usage":{"input":N,"output":N,"cacheRead":N,"cacheWrite":N,
+///            "cost":{"input":F,...,"total":F}}
+/// `"total"` is unambiguous here — `"totalTokens"` does not contain the closing
+/// quote, so it cannot match.
+fn accumulateUsage(line: []const u8, acc: *backend.ResultAccumulator) void {
+    if (claude.findJsonNumberValue(line, "\"input\"")) |v| {
+        acc.input_tokens +|= backend.f64ToU32Sat(v);
+    }
+    if (claude.findJsonNumberValue(line, "\"output\"")) |v| {
+        acc.output_tokens +|= backend.f64ToU32Sat(v);
+    }
+    if (claude.findJsonNumberValue(line, "\"cacheRead\"")) |v| {
+        acc.cache_read_tokens +|= backend.f64ToU32Sat(v);
+    }
+    if (claude.findJsonNumberValue(line, "\"cacheWrite\"")) |v| {
+        acc.cache_creation_tokens +|= backend.f64ToU32Sat(v);
+    }
+    if (claude.findJsonNumberValue(line, "\"total\"")) |usd| {
+        acc.cost_microdollars +|= backend.f64ToU32Sat(usd * 1_000_000.0);
+    }
 }
 
 fn mapPiTool(tool: []const u8) types.ToolName {
@@ -172,6 +189,31 @@ fn mapPiTool(tool: []const u8) types.ToolName {
     if (std.mem.eql(u8, tool, "glob")) return .glob;
     if (std.mem.eql(u8, tool, "grep")) return .grep;
     return .unknown;
+}
+
+test "pi usage and cost are read from pi's own field names" {
+    // Regression: this was read with Anthropic names (input_tokens, ...), so
+    // every pi session reported 0 tokens and $0.00 — and because agent_end
+    // marks the session terminal, that $0.00 was reported as AUTHORITATIVE.
+    var acc = backend.ResultAccumulator{};
+    const line =
+        \\{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"OK"}],"provider":"openrouter","model":"deepseek/deepseek-v4-flash","usage":{"input":4658,"output":15,"cacheRead":7,"cacheWrite":3,"reasoning":12,"totalTokens":4673,"cost":{"input":0.00065212,"output":0.0000042,"cacheRead":0,"cacheWrite":0,"total":0.00065632}}}}
+    ;
+    const meta = processEvent(line, &acc);
+    try std.testing.expectEqual(types.EventType.message, meta.event_type);
+    try std.testing.expectEqual(types.Role.assistant, meta.role);
+    try std.testing.expectEqual(@as(u8, 1), acc.num_turns);
+    try std.testing.expectEqual(@as(u32, 4658), acc.input_tokens);
+    try std.testing.expectEqual(@as(u32, 15), acc.output_tokens);
+    try std.testing.expectEqual(@as(u32, 7), acc.cache_read_tokens);
+    try std.testing.expectEqual(@as(u32, 3), acc.cache_creation_tokens);
+    // 0.00065632 USD -> 656 microdollars ("totalTokens" must not match "total").
+    try std.testing.expectEqual(@as(u32, 656), acc.cost_microdollars);
+
+    // A second assistant message accumulates rather than replaces.
+    _ = processEvent(line, &acc);
+    try std.testing.expectEqual(@as(u32, 9316), acc.input_tokens);
+    try std.testing.expectEqual(@as(u32, 1312), acc.cost_microdollars);
 }
 
 test "processEvent session" {
@@ -211,10 +253,17 @@ test "processEvent message_end assistant" {
     try std.testing.expectEqual(@as(u8, 1), acc.num_turns);
 }
 
-test "processEvent agent_end" {
+test "processEvent agent_end is terminal and does not re-count usage" {
+    // agent_end repeats every message of the run, so usage is taken from
+    // message_end instead; counting it here too would double the totals. (The
+    // previous version of this test asserted Anthropic field names that pi
+    // never emits, which is how the $0.00-per-session bug stayed invisible.)
     var acc = backend.ResultAccumulator{};
-    const meta = processEvent("{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"usage\":{\"input_tokens\":1000,\"output_tokens\":500},\"content\":[{\"type\":\"text\",\"text\":\"All done\"}]}]}", &acc);
+    acc.input_tokens = 4658;
+    const line = "{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"usage\":{\"input\":4658,\"output\":15,\"cost\":{\"total\":0.00065632}},\"content\":[{\"type\":\"text\",\"text\":\"All done\"}]}]}";
+    const meta = processEvent(line, &acc);
     try std.testing.expectEqual(types.EventType.result, meta.event_type);
-    try std.testing.expectEqual(@as(u32, 1000), acc.input_tokens);
-    try std.testing.expectEqual(@as(u32, 500), acc.output_tokens);
+    try std.testing.expectEqual(@as(u32, 4658), acc.input_tokens);
+    try std.testing.expectEqual(@as(u32, 0), acc.cost_microdollars);
+    try std.testing.expectEqualStrings("All done", acc.result_text);
 }

@@ -472,7 +472,7 @@ pub fn signalActiveChildren(sig: ChildSignal) u32 {
 /// A malformed value (e.g. "input_tokens":1e300, inf, or NaN) must never
 /// reach `@intFromFloat` directly — that is checked illegal behavior and
 /// would abort the whole daemon. The `!(v > 0)` form also maps NaN to 0.
-fn f64ToU32Sat(v: f64) u32 {
+pub fn f64ToU32Sat(v: f64) u32 {
     if (!(v > 0)) return 0;
     const max_f: f64 = @floatFromInt(@as(u32, std.math.maxInt(u32)));
     return if (v >= max_f) std.math.maxInt(u32) else @intFromFloat(v);
@@ -664,12 +664,24 @@ pub fn probeBackend(
             {
                 saw_auth = true;
             }
-            // Require a real completion signal, not just a clean exit.
-            if (bt == .claude) {
-                if (std.mem.indexOf(u8, l, "\"subtype\":\"success\"") != null) saw_success = true;
-            } else {
-                if (std.mem.indexOf(u8, l, "turn.completed") != null or
-                    std.mem.indexOf(u8, l, "agent_message") != null) saw_success = true;
+            // Require a real completion signal, not just a clean exit. The
+            // marker is per-backend: pi ends with agent_end/turn_end, and
+            // probing it against Codex's markers reported every healthy pi
+            // model as "no valid completion".
+            switch (bt) {
+                .claude => if (std.mem.indexOf(u8, l, "\"subtype\":\"success\"") != null) {
+                    saw_success = true;
+                },
+                .pi => if (std.mem.indexOf(u8, l, "\"type\":\"agent_end\"") != null or
+                    std.mem.indexOf(u8, l, "\"type\":\"turn_end\"") != null)
+                {
+                    saw_success = true;
+                },
+                .codex, .opencode => if (std.mem.indexOf(u8, l, "turn.completed") != null or
+                    std.mem.indexOf(u8, l, "agent_message") != null)
+                {
+                    saw_success = true;
+                },
             }
         }
     }
