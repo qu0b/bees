@@ -13,6 +13,23 @@ pub const Task = struct {
     cumulative: u32,
 };
 
+/// Selection weight for a task that has already delivered something.
+///
+/// A task retires once a later run finds nothing left to do (`isExhausted`),
+/// so the pool deliberately pays one session to confirm completion. At full
+/// weight that confirmation competes with undelivered work and gets drawn
+/// early: on chatplugin a delivered task was re-picked and spent $4.82 to
+/// report there was nothing to do, while four untouched tasks waited.
+///
+/// Demoting keeps the confirmation — it still happens, and still retires the
+/// task — but lets fresh work go first, so the cost lands when the swarm would
+/// otherwise be idle rather than instead of real progress.
+fn deliveredWeight(header: types.TaskHeader) u32 {
+    const w: u32 = @as(u32, header.weight);
+    if (header.accepted == 0) return w;
+    return @max(1, w / 4);
+}
+
 pub const TaskPool = struct {
     tasks: []Task,
     total_weight: u32,
@@ -84,7 +101,7 @@ pub const TaskPool = struct {
                 if (entry.view.header.isExhausted()) continue;
                 if (idx >= count) break;
 
-                const w: u32 = @as(u32, entry.view.header.weight);
+                const w: u32 = deliveredWeight(entry.view.header);
                 cumulative += w;
                 tasks[idx] = .{
                     .name = try allocator.dupe(u8, entry.name),
@@ -499,6 +516,31 @@ pub fn syncFromFile(
     const data = try fs.readFileAlloc(allocator, path, 1024 * 1024);
     defer allocator.free(data);
     try syncFromJson(store, data, origin, allocator);
+}
+
+test "delivered work is demoted, never dropped" {
+    const base = types.TaskHeader{
+        .weight = 8,
+        .total_runs = 1,
+        .accepted = 0,
+        .rejected = 0,
+        .empty = 0,
+        .status = .active,
+        .origin = .strategist,
+    };
+    // Untouched work keeps its full pull.
+    try std.testing.expectEqual(@as(u32, 8), deliveredWeight(base));
+
+    var delivered = base;
+    delivered.accepted = 1;
+    try std.testing.expectEqual(@as(u32, 2), deliveredWeight(delivered));
+
+    // Never zero: the confirmation run must stay reachable, or the task can
+    // never retire and lingers in the pool forever.
+    var small = base;
+    small.weight = 1;
+    small.accepted = 3;
+    try std.testing.expectEqual(@as(u32, 1), deliveredWeight(small));
 }
 
 test "task pool select is weight-proportional" {
