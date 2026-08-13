@@ -498,13 +498,20 @@ pub fn isClaudeModelName(model: []const u8) bool {
     return false;
 }
 
-/// Resolve the effective backend: use role-specific override if non-empty, else project default.
-/// Gateway mode overrides everything — the gateway speaks the Anthropic API,
-/// so only the Claude backend can talk to it.
+/// Resolve the effective backend: explicit per-role override, else the project
+/// default (which gateway mode collapses to Claude, since the gateway speaks the
+/// Anthropic API).
+///
+/// An explicit role backend wins even under gateway mode: it is a deliberate
+/// operator choice, and it is how a role is moved to a DIFFERENT provider —
+/// e.g. sending the observer roles to OpenRouter so the local gateway's whole
+/// concurrency budget stays available to workers. Automatic routing (the
+/// codex_fraction split) is separately disabled under gateway mode, so nothing
+/// reaches here implicitly.
 pub fn resolveBackend(default_backend: []const u8, role_backend: []const u8) types.BackendType {
+    if (role_backend.len > 0) return types.BackendType.fromString(role_backend);
     if (gateway.active) return .claude;
-    const effective = if (role_backend.len > 0) role_backend else default_backend;
-    return types.BackendType.fromString(effective);
+    return types.BackendType.fromString(default_backend);
 }
 
 /// Dispatch spawn to the appropriate backend.
@@ -1476,9 +1483,12 @@ test "gateway mode forces claude backend and injects endpoint env" {
     try std.testing.expect(gatewayActive());
     try std.testing.expect(gatewayTextOnly()); // text_only defaults on
 
-    // Every backend choice collapses to claude — codex routing included.
-    try std.testing.expectEqual(types.BackendType.claude, resolveBackend("claude", "codex"));
+    // The project DEFAULT collapses to claude, whatever it says...
     try std.testing.expectEqual(types.BackendType.claude, resolveBackend("pi", ""));
+    try std.testing.expectEqual(types.BackendType.claude, resolveBackend("codex", ""));
+    // ...but an explicit per-role backend still wins, so a role can be moved to
+    // another provider to free the gateway's concurrency for workers.
+    try std.testing.expectEqual(types.BackendType.pi, resolveBackend("claude", "pi"));
 
     // Claude alias models default to the gateway model; explicit per-role
     // model ids (e.g. an openrouter model served by the gateway) pass through.
