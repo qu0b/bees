@@ -351,14 +351,114 @@ fn dailyCeilingReached(cfg: config_mod.Config, store: *store_mod.Store, logger: 
     return true;
 }
 
+/// Watches config.json and re-reads it when its contents change.
+///
+/// Config used to be read exactly once, at daemon start, so editing the file
+/// while the daemon ran changed nothing until a restart. That silence was
+/// expensive: a worker budget was lowered to $40 mid-incident and the daemon,
+/// still holding the old value, let a session reach $115.79.
+///
+/// Nothing is freed on reload. Both the API server thread and backend's gateway
+/// env table captured string slices from the config at startup; freeing the
+/// old one would dangle them. A config is a few KB and is only re-parsed when
+/// its bytes actually change, so the leak is bounded by how often a human edits
+/// the file — not by uptime.
+const ConfigWatcher = struct {
+    hash: u64,
+
+    fn hashFile(path: []const u8, allocator: std.mem.Allocator) u64 {
+        const data = fs.readFileAlloc(allocator, path, 1024 * 1024) catch return 0;
+        defer allocator.free(data);
+        return std.hash.Wyhash.hash(0, data);
+    }
+
+    fn init(path: []const u8, allocator: std.mem.Allocator) ConfigWatcher {
+        return .{ .hash = hashFile(path, allocator) };
+    }
+
+    /// Apply an on-disk edit to `cfg`. Returns true when one was applied.
+    fn poll(
+        self: *ConfigWatcher,
+        cfg: *config_mod.Config,
+        paths: config_mod.ProjectPaths,
+        logger: *log_mod.Logger,
+        allocator: std.mem.Allocator,
+    ) bool {
+        const h = hashFile(paths.config_file, allocator);
+        if (h == self.hash or h == 0) return false;
+        self.hash = h;
+
+        // A half-written file is a normal thing to observe while someone types
+        // into it, so a parse failure must not take the daemon down. Say so
+        // loudly and keep the last good config in force.
+        const next = config_mod.load(allocator, paths.config_file) catch |e| {
+            logger.err("[daemon] config.json changed but will not load ({s}) — keeping the config already in force", .{@errorName(e)});
+            return false;
+        };
+
+        if (!identityHolds(cfg.*, next)) {
+            logger.err("[daemon] config.json moves project.name or base_branch — ignoring the whole reload, restart to apply", .{});
+            return false;
+        }
+        // The API server is already bound and the listener is not re-plumbed.
+        if (next.api.enabled != cfg.api.enabled or next.api.port != cfg.api.port) {
+            logger.warn("[daemon] api.enabled/api.port changed — restart to rebind the listener", .{});
+        }
+
+        cfg.* = next;
+        backend.configureToolTimeouts(cfg.timeouts);
+        backend.configureGateway(cfg.gateway) catch |e| {
+            logger.err("[daemon] reloaded config leaves the gateway unusable ({s}) — previous gateway settings stay in force", .{@errorName(e)});
+        };
+        logger.info("[daemon] config reloaded — workers={d} threshold={d} cooldown={d}s", .{
+            cfg.workers.count, cfg.merger.merge_threshold, cfg.daemon.cooldown_secs,
+        });
+        logBudgets(cfg.*, logger);
+        return true;
+    }
+};
+
+/// True when `next` describes the same project as `current`, and so may replace
+/// it in a running daemon.
+///
+/// project.name keys the daemon lock (/tmp/bees-{name}-daemon.lock) and the
+/// worktree paths of workers already running; base_branch is what those
+/// worktrees branched from. Rebinding either mid-run orphans the lock and
+/// strands live work, so identity stays restart-only.
+fn identityHolds(current: config_mod.Config, next: config_mod.Config) bool {
+    return std.mem.eql(u8, next.project.name, current.project.name) and
+        std.mem.eql(u8, next.project.base_branch, current.project.base_branch);
+}
+
+/// Log the budgets a daemon is actually enforcing. Printed at startup and again
+/// after every reload, so the effective limits can be checked against the file
+/// instead of assumed from it.
+fn logBudgets(cfg: config_mod.Config, logger: *log_mod.Logger) void {
+    logger.info("[daemon] budget in force: worker=${d:.0} merger=${d:.0} sre=${d:.0} strategist=${d:.0} qa=${d:.0}", .{
+        cfg.workers.max_budget_usd, cfg.merger.max_budget_usd,
+        cfg.sre.max_budget_usd,     cfg.strategist.max_budget_usd,
+        cfg.qa.max_budget_usd,
+    });
+    if (cfg.daemon.max_daily_usd > 0) {
+        logger.info("[daemon] daily ceiling: ${d:.2} — stops spawning once today's spend reaches it", .{cfg.daemon.max_daily_usd});
+    } else {
+        logger.warn("[daemon] no daily ceiling (daemon.max_daily_usd = 0) — only per-session budgets bound spend", .{});
+    }
+}
+
 pub fn run(
-    cfg: config_mod.Config,
+    initial_cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
     store: *store_mod.Store,
     logger: *log_mod.Logger,
     io: Io,
     allocator: std.mem.Allocator,
 ) !DaemonAction {
+    // Mutable so an edit to config.json can take effect without a restart; see
+    // ConfigWatcher, which rewrites this at the top of each poll.
+    var cfg = initial_cfg;
+    var config_watcher = ConfigWatcher.init(paths.config_file, allocator);
+
     // Single instance per project. Two daemons on one project double-spawn
     // workers, race the same git base, and corrupt task accounting. This
     // happened on 2026-08-09: an agent ran `bees daemon status` for
@@ -379,22 +479,7 @@ pub fn run(
         cfg.workers.count,                 cfg.merger.merge_threshold,
         cfg.daemon.worker_timeout_minutes, cfg.daemon.cooldown_secs,
     });
-    // Config is read once, here: editing config.json while the daemon runs
-    // changes nothing until it restarts. That silence is expensive — a worker
-    // budget was lowered to $40 during an incident and the daemon, still
-    // holding the old value, let a session reach $115.79. Print what is
-    // actually in force so the effective limits can be checked against the
-    // file, and say plainly that a restart is what applies an edit.
-    logger.info("[daemon] budget in force (restart to change): worker=${d:.0} merger=${d:.0} sre=${d:.0} strategist=${d:.0} qa=${d:.0}", .{
-        cfg.workers.max_budget_usd, cfg.merger.max_budget_usd,
-        cfg.sre.max_budget_usd,     cfg.strategist.max_budget_usd,
-        cfg.qa.max_budget_usd,
-    });
-    if (cfg.daemon.max_daily_usd > 0) {
-        logger.info("[daemon] daily ceiling: ${d:.2} — stops spawning once today's spend reaches it", .{cfg.daemon.max_daily_usd});
-    } else {
-        logger.warn("[daemon] no daily ceiling (daemon.max_daily_usd = 0) — only per-session budgets bound spend", .{});
-    }
+    logBudgets(cfg, logger);
 
     var state = DaemonState{};
     installSignalHandlers(&state);
@@ -559,6 +644,12 @@ pub fn run(
 
         // Graceful shutdown: stop spawning, wait for running workers to drain
         if (@atomicLoad(u32, &state.shutdown_requested, .acquire) != 0) break;
+
+        // Pick up config edits before any decision that reads cfg — spawn
+        // counts, budgets, the daily ceiling and quiet hours all take effect on
+        // the next poll rather than the next restart. Sessions already running
+        // keep the values they were spawned with.
+        _ = config_watcher.poll(&cfg, paths, logger, allocator);
 
         // Quiet hours — let running workers finish but don't start new work
         if (isQuietHour(cfg.daemon)) {
@@ -1420,4 +1511,21 @@ test "useCodex splits deterministically by fraction" {
     // Boundaries: 0.0 never, 1.0 always.
     try std.testing.expect(!useCodex(0, 0.0));
     try std.testing.expect(useCodex(3, 1.0));
+}
+
+test "config reload accepts budget edits but not a change of project identity" {
+    const base = config_mod.Config{ .project = .{ .name = "bees", .base_branch = "main" } };
+
+    var cheaper = base;
+    cheaper.workers.max_budget_usd = 40;
+    cheaper.daemon.max_daily_usd = 150;
+    try std.testing.expect(identityHolds(base, cheaper));
+
+    var renamed = base;
+    renamed.project.name = "other";
+    try std.testing.expect(!identityHolds(base, renamed));
+
+    var rebased = base;
+    rebased.project.base_branch = "develop";
+    try std.testing.expect(!identityHolds(base, rebased));
 }
