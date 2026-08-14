@@ -11,6 +11,21 @@ pub const Task = struct {
     weight: u32,
     prompt: []const u8,
     cumulative: u32,
+    /// Which model tier this task is worth; see `types.TaskTier`.
+    tier: types.TaskTier = .default,
+};
+
+/// A task as written in tasks.json. `tier` is optional so every existing file
+/// keeps parsing.
+const JsonTask = struct {
+    name: []const u8,
+    weight: u32,
+    prompt: []const u8,
+    tier: ?[]const u8 = null,
+
+    fn parsedTier(self: JsonTask) types.TaskTier {
+        return types.TaskTier.fromString(self.tier orelse "");
+    }
 };
 
 /// Selection weight for a task that has already delivered something.
@@ -39,12 +54,6 @@ pub const TaskPool = struct {
         const data = try fs.readFileAlloc(allocator, path, 1024 * 1024);
         defer allocator.free(data);
 
-        const JsonTask = struct {
-            name: []const u8,
-            weight: u32,
-            prompt: []const u8,
-        };
-
         const parsed = try std.json.parseFromSlice([]const JsonTask, allocator, data, .{
             .allocate = .alloc_always,
         });
@@ -60,6 +69,7 @@ pub const TaskPool = struct {
                 .weight = item.weight,
                 .prompt = try allocator.dupe(u8, item.prompt),
                 .cumulative = cumulative,
+                .tier = item.parsedTier(),
             };
         }
 
@@ -108,6 +118,7 @@ pub const TaskPool = struct {
                     .weight = w,
                     .prompt = try allocator.dupe(u8, entry.view.prompt),
                     .cumulative = cumulative,
+                    .tier = entry.view.header.tier,
                 };
                 idx += 1;
             }
@@ -347,12 +358,6 @@ pub fn syncFromJson(
 ) !void {
     assert(json_data.len > 0);
 
-    const JsonTask = struct {
-        name: []const u8,
-        weight: u32,
-        prompt: []const u8,
-    };
-
     const parsed = try std.json.parseFromSlice([]const JsonTask, allocator, json_data, .{
         .allocate = .alloc_always,
     });
@@ -407,6 +412,7 @@ pub fn syncFromJson(
             // retired instead of being resurrected every cycle.
             var header = view.header;
             header.weight = @truncate(item.weight);
+            header.tier = item.parsedTier();
             header.status = if (header.isExhausted()) .retired else .active;
             try store.upsertTask(txn, key, header, item.prompt);
         } else {
@@ -419,6 +425,7 @@ pub fn syncFromJson(
                 .empty = 0,
                 .status = .active,
                 .origin = origin,
+                .tier = item.parsedTier(),
             };
             try store.upsertTask(txn, item.name, header, item.prompt);
         }
@@ -475,8 +482,8 @@ fn writeTasksMeta(store: *store_mod.Store, txn: anytype, allocator: std.mem.Allo
         try appendJsonStr(&json, allocator, entry.name);
         var stat_buf: [256]u8 = undefined;
         const stats = std.fmt.bufPrint(&stat_buf,
-            \\,"weight":{d},"total_runs":{d},"accepted":{d},"rejected":{d},"empty":{d},"status":"{s}","origin":"{s}","prompt":
-        , .{ h.weight, h.total_runs, h.accepted, h.rejected, h.empty, h.status.label(), h.origin.label() }) catch continue;
+            \\,"weight":{d},"total_runs":{d},"accepted":{d},"rejected":{d},"empty":{d},"status":"{s}","origin":"{s}","tier":"{s}","prompt":
+        , .{ h.weight, h.total_runs, h.accepted, h.rejected, h.empty, h.status.label(), h.origin.label(), h.tier.label() }) catch continue;
         try json.appendSlice(allocator, stats);
         try appendJsonStr(&json, allocator, entry.view.prompt);
         try json.append(allocator, '}');
@@ -705,4 +712,50 @@ test "syncFromJson merges re-spellings and retires exhausted tasks" {
     // reactivated by the sync.
     try std.testing.expectEqual(types.TaskStatus.retired, view.header.status);
     try std.testing.expectEqual(types.TaskOrigin.strategist, view.header.origin);
+}
+
+test "task tier round-trips through JSON and LMDB, and an old task stays default" {
+    const allocator = std.testing.allocator;
+    const tmp_dir = "/tmp/bees-test-tasks-tier";
+    _ = std.c.mkdir(tmp_dir, 0o755);
+    defer {
+        _ = std.c.unlink(tmp_dir ++ "/data.mdb");
+        _ = std.c.unlink(tmp_dir ++ "/lock.mdb");
+        _ = std.c.rmdir(tmp_dir);
+    }
+
+    var store = try store_mod.Store.open(tmp_dir);
+    defer store.close();
+
+    try syncFromJson(&store,
+        \\[{"name":"rename a field","weight":1,"prompt":"p","tier":"cheap"},
+        \\ {"name":"pick a wire format","weight":3,"prompt":"p","tier":"deep"},
+        \\ {"name":"unlabelled","weight":2,"prompt":"p"},
+        \\ {"name":"typo tier","weight":1,"prompt":"p","tier":"gold"}]
+    , .template, allocator);
+
+    var pool = try TaskPool.loadFromStore(&store, allocator);
+    defer pool.deinit(allocator);
+
+    var seen: usize = 0;
+    for (pool.tasks) |t| {
+        const want: types.TaskTier = if (std.mem.eql(u8, t.name, "rename a field"))
+            .cheap
+        else if (std.mem.eql(u8, t.name, "pick a wire format"))
+            .deep
+        else
+            .default; // unlabelled and misspelled both fall back
+        try std.testing.expectEqual(want, t.tier);
+        seen += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 4), seen);
+
+    // Re-syncing an existing task can change its tier without losing history.
+    try syncFromJson(&store,
+        \\[{"name":"rename a field","weight":1,"prompt":"p","tier":"deep"}]
+    , .template, allocator);
+    const txn = try store.beginReadTxn();
+    defer store_mod.Store.abortTxn(txn);
+    const view = (try store.getTask(txn, "rename a field")).?;
+    try std.testing.expectEqual(types.TaskTier.deep, view.header.tier);
 }

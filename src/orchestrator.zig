@@ -997,6 +997,10 @@ fn spawnWorker(
         worker_cfg.workers.backend = "codex";
         worker_cfg.workers.model = cfg.codex_execution.model;
         worker_cfg.workers.effort = cfg.codex_execution.effort;
+        // The backend swap already decides this worker's model, and the tiers
+        // name models for the Claude/gateway side. Leaving them in place would
+        // hand Codex an Anthropic model id the moment it drew a tiered task.
+        worker_cfg.workers.tiers = .{};
         logger.info("[worker:{d}] using Codex ({s}, effort={s})", .{ wid, worker_cfg.workers.model, worker_cfg.workers.effort });
     }
 

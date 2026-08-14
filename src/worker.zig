@@ -100,7 +100,12 @@ fn runWorkerImpl(
     defer if (!produced_candidate) tasks_mod.TaskPool.release(task_name);
     const task_prompt = try allocator.dupe(u8, selected.prompt);
     defer allocator.free(task_prompt);
-    logger.info("[worker:{d}] start task=\"{s}\"", .{ worker_id, task_name });
+    // What model this task is worth. Tiers are strings in config, so the
+    // resolved slices outlive the pool entry that named the tier.
+    const exec = cfg.workers.forTier(selected.tier);
+    logger.info("[worker:{d}] start task=\"{s}\" tier={s} model={s} budget=${d:.0}", .{
+        worker_id, task_name, selected.tier.label(), exec.model, exec.max_budget_usd,
+    });
 
     // Create worktree
     var ts_buf: [32]u8 = undefined;
@@ -149,7 +154,7 @@ fn runWorkerImpl(
 
     // Create session in LMDB
     const bt = backend.resolveBackend(cfg.default_backend, cfg.workers.backend);
-    const model = types.ModelType.fromString(cfg.workers.model);
+    const model = types.ModelType.fromString(exec.model);
     const header = types.SessionHeader{
         .type = .worker,
         .status = .running,
@@ -285,10 +290,10 @@ fn runWorkerImpl(
             .prompt = effective_prompt,
             .cwd = worktree_dir,
             .append_prompt_file = if (role_config) |rc| if (rc.prompt_path.len > 0) rc.prompt_path else null else null,
-            .model = cfg.workers.model,
-            .fallback_model = cfg.workers.fallback_model,
-            .effort = cfg.workers.effort,
-            .max_budget_usd = cfg.workers.max_budget_usd,
+            .model = exec.model,
+            .fallback_model = exec.fallback_model,
+            .effort = exec.effort,
+            .max_budget_usd = exec.max_budget_usd,
             .timeout_secs = effective_timeout,
             .resume_session_id = claude_session_id,
             .stream_output = stream_output,

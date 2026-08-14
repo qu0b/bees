@@ -536,6 +536,44 @@ pub const TaskOrigin = enum(u2) {
     }
 };
 
+/// How much model a task is worth.
+///
+/// Measured on chatplugin 2026-08-13: a worker session on the anthropic-class
+/// model cost $33-37 for ~30 turns, while an observer role on `minimax-m2.7`
+/// ran 95 turns for $0.15. Spending the top tier on work that does not need it
+/// is the single largest waste in a swarm day, so a task declares what it is
+/// worth and config decides which model that buys.
+///
+/// A closed vocabulary, not a model name: tasks are authored by agents, and an
+/// invented model id reaches the gateway as a 400 that kills the pipeline
+/// silently — which is exactly how chatplugin lost a day. An unknown tier can
+/// only ever fall back to the default.
+pub const TaskTier = enum(u3) {
+    /// Unset — the task runs on `workers.model`, as every task did before tiers.
+    default = 0,
+    cheap = 1,
+    standard = 2,
+    deep = 3,
+
+    pub fn label(self: TaskTier) []const u8 {
+        return switch (self) {
+            .default => "default",
+            .cheap => "cheap",
+            .standard => "standard",
+            .deep => "deep",
+        };
+    }
+
+    /// Parse a tier written in tasks.json. Anything unrecognized is `default`,
+    /// so a typo costs the tiering benefit rather than the task.
+    pub fn fromString(s: []const u8) TaskTier {
+        if (std.mem.eql(u8, s, "cheap")) return .cheap;
+        if (std.mem.eql(u8, s, "standard")) return .standard;
+        if (std.mem.eql(u8, s, "deep")) return .deep;
+        return .default;
+    }
+};
+
 pub const TaskHeader = packed struct(u128) {
     weight: u16,
     total_runs: u24,
@@ -544,7 +582,10 @@ pub const TaskHeader = packed struct(u128) {
     empty: u24,
     status: TaskStatus,
     origin: TaskOrigin,
-    _reserved: u12 = 0,
+    /// Carved out of the reserved bits, so the record stays 16 bytes and every
+    /// task already in LMDB reads back as `.default`.
+    tier: TaskTier = .default,
+    _reserved: u9 = 0,
 
     /// Exhausted: no longer worth spending a worker slot on.
     pub fn isExhausted(self: TaskHeader) bool {
@@ -865,3 +906,31 @@ test "readLenPrefixed round-trip" {
     try std.testing.expectEqualStrings("hello", s1);
     try std.testing.expectEqualStrings("world", s2);
 }
+
+test "TaskTier survives a header round-trip and keeps the record at 16 bytes" {
+    // Every task written before tiers existed reads back as .default.
+    const legacy: TaskHeader = @bitCast(@as(u128, 0));
+    try std.testing.expectEqual(TaskTier.default, legacy.tier);
+
+    var h = TaskHeader{
+        .weight = 3,
+        .total_runs = 7,
+        .accepted = 1,
+        .rejected = 2,
+        .empty = 0,
+        .status = .active,
+        .origin = .strategist,
+        .tier = .cheap,
+    };
+    const round: TaskHeader = @bitCast(@as(u128, @bitCast(h)));
+    try std.testing.expectEqual(TaskTier.cheap, round.tier);
+    try std.testing.expectEqual(@as(u24, 7), round.total_runs);
+    try std.testing.expectEqual(types_size_check, @sizeOf(TaskHeader));
+
+    // An unrecognized tier costs the routing, never the task.
+    h.tier = TaskTier.fromString("premium-plus");
+    try std.testing.expectEqual(TaskTier.default, h.tier);
+    try std.testing.expectEqual(TaskTier.deep, TaskTier.fromString("deep"));
+}
+
+const types_size_check: usize = 16;

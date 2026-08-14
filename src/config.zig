@@ -1,6 +1,7 @@
 const std = @import("std");
 const assert = std.debug.assert;
 const fs = @import("fs.zig");
+const types = @import("types.zig");
 
 pub const Config = struct {
     project: Project,
@@ -48,6 +49,52 @@ pub const Config = struct {
         /// Fraction of workers (0.0-1.0) routed to the Codex backend instead of
         /// the Claude default. 0.5 = half. Codex workers use `codex_execution`.
         codex_fraction: f64 = 0.5,
+        /// What each task tier buys. Every field is optional and falls back to
+        /// the plain `workers.*` value above, so a project that names no tiers
+        /// behaves exactly as it did before tiers existed.
+        tiers: Tiers = .{},
+
+        /// Resolve the execution settings for a task at `tier`, filling every
+        /// unset field from the untiered worker defaults.
+        pub fn forTier(self: Workers, tier: types.TaskTier) Execution {
+            const t: Tier = switch (tier) {
+                .default => .{},
+                .cheap => self.tiers.cheap,
+                .standard => self.tiers.standard,
+                .deep => self.tiers.deep,
+            };
+            return .{
+                .model = if (t.model.len > 0) t.model else self.model,
+                .effort = if (t.effort.len > 0) t.effort else self.effort,
+                // A tier that names its own model must not inherit a fallback
+                // pointing at a different tier's model — that would silently
+                // undo the routing on the first retry.
+                .fallback_model = if (t.model.len > 0) t.fallback_model else self.fallback_model,
+                .max_budget_usd = if (t.max_budget_usd > 0) t.max_budget_usd else self.max_budget_usd,
+            };
+        }
+    };
+
+    /// Resolved per-session execution settings (see `Workers.forTier`).
+    pub const Execution = struct {
+        model: []const u8,
+        effort: []const u8,
+        fallback_model: ?[]const u8,
+        max_budget_usd: f64,
+    };
+
+    /// An empty field means "inherit from workers".
+    pub const Tier = struct {
+        model: []const u8 = "",
+        effort: []const u8 = "",
+        fallback_model: ?[]const u8 = null,
+        max_budget_usd: f64 = 0,
+    };
+
+    pub const Tiers = struct {
+        cheap: Tier = .{},
+        standard: Tier = .{},
+        deep: Tier = .{},
     };
 
     pub const Merger = struct {
@@ -404,4 +451,41 @@ test "gateway config defaults off and validates when enabled" {
         .enabled = true,
         .base_url = "https://ai.starflinger.eu",
     } }).validate());
+}
+
+test "task tiers inherit every unset field from the worker defaults" {
+    const w = Config.Workers{
+        .model = "starflinger-anthropic",
+        .effort = "high",
+        .fallback_model = "starflinger-anthropic-fallback",
+        .max_budget_usd = 40,
+        .tiers = .{
+            .cheap = .{ .model = "minimax-m2.7", .max_budget_usd = 2 },
+            .deep = .{ .max_budget_usd = 80 },
+        },
+    };
+
+    // An untiered task is untouched by the feature.
+    const plain = w.forTier(.default);
+    try std.testing.expectEqualStrings("starflinger-anthropic", plain.model);
+    try std.testing.expectEqualStrings("starflinger-anthropic-fallback", plain.fallback_model.?);
+    try std.testing.expectEqual(@as(f64, 40), plain.max_budget_usd);
+
+    // A tier that names a model takes its budget too, and must NOT inherit a
+    // fallback that would route it straight back to the expensive model.
+    const cheap = w.forTier(.cheap);
+    try std.testing.expectEqualStrings("minimax-m2.7", cheap.model);
+    try std.testing.expectEqual(@as(f64, 2), cheap.max_budget_usd);
+    try std.testing.expect(cheap.fallback_model == null);
+    try std.testing.expectEqualStrings("high", cheap.effort); // unset → inherited
+
+    // A tier may raise only the budget and keep the default model.
+    const deep = w.forTier(.deep);
+    try std.testing.expectEqualStrings("starflinger-anthropic", deep.model);
+    try std.testing.expectEqual(@as(f64, 80), deep.max_budget_usd);
+
+    // A tier named in no config is the plain worker config.
+    const standard = w.forTier(.standard);
+    try std.testing.expectEqualStrings("starflinger-anthropic", standard.model);
+    try std.testing.expectEqual(@as(f64, 40), standard.max_budget_usd);
 }
