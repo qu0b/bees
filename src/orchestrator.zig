@@ -494,6 +494,15 @@ pub fn run(
     // Concurrent stall watchdog — same cancel-on-exit rule as above.
     var stall_future = io.async(stallWatchdog, .{ io, &state, logger, cfg.timeouts.max_idle_secs });
     defer _ = stall_future.cancel(io);
+
+    // Both watchdogs park in `while (shutdown_requested == 0) sleep(1)`, and the
+    // io runtime joins every green thread before the process may terminate. The
+    // normal exits set that flag (gracefulDrain does it explicitly), but an
+    // error return skipped it: the daemon printed its error and then hung
+    // forever instead of exiting, which is how a malformed tasks.json turned
+    // into a process that only SIGKILL could clear. Registered after the cancel
+    // defers so it runs before them on the way out.
+    errdefer @atomicStore(u32, &state.shutdown_requested, 1, .release);
     if (cfg.timeouts.max_idle_secs > 0) {
         logger.info("[daemon] stall watchdog armed: {d}s without progress → SIGTERM", .{cfg.timeouts.max_idle_secs});
     } else {
@@ -541,9 +550,22 @@ pub fn run(
     // Track merge cycles for strategist scheduling (survives reload via LMDB)
     var merge_cycle: u32 = loadMergeCycle(store);
 
-    // Bootstrap: sync tasks.json into LMDB
+    // Bootstrap: sync tasks.json into LMDB.
+    //
+    // A malformed tasks.json used to be a warning here and a bare error two
+    // steps later out of TaskPool.load, so the daemon exited without ever
+    // naming the file it could not read. Say which file, which error, and what
+    // the shape is — a swarm with no readable tasks has nothing to do anyway.
     tasks_mod.syncFromFile(store, paths.tasks_file, .template, allocator) catch |e| {
-        logger.warn("[daemon] initial task sync failed: {}", .{e});
+        switch (e) {
+            error.FileNotFound => logger.warn("[daemon] no {s} — starting with whatever tasks LMDB already holds", .{paths.tasks_file}),
+            else => {
+                logger.err("[daemon] {s} will not parse ({s}) — expected a JSON array of {{\"name\",\"weight\",\"prompt\",\"tier\"?}}", .{
+                    paths.tasks_file, @errorName(e),
+                });
+                return error.InvalidTasksFile;
+            },
+        }
     };
 
     // Wait out quiet hours before spending quota on startup strategist
@@ -581,7 +603,9 @@ pub fn run(
         } else if (@atomicLoad(u32, &state.shutdown_requested, .acquire) == 0) {
             logger.info("[daemon] no active tasks, running startup strategist", .{});
             runStrategistWithPrep(cfg, paths, store, logger, io, allocator, seed_uuid, &state);
-            tasks_mod.syncFromFile(store, paths.tasks_file, .strategist, allocator) catch {};
+            tasks_mod.syncFromFile(store, paths.tasks_file, .strategist, allocator) catch |e| {
+                logger.err("[daemon] tasks.json written by the strategist will not parse ({s}) — the pool keeps its previous tasks", .{@errorName(e)});
+            };
         }
     }
 
@@ -728,7 +752,9 @@ pub fn run(
             // code was written (measured 2026-08-10). The trade: workers see
             // the reports and strategist tasks from the PREVIOUS cycle — worth
             // it when a cycle runs 70-110min.
-            tasks_mod.syncFromFile(store, paths.tasks_file, .template, allocator) catch {};
+            tasks_mod.syncFromFile(store, paths.tasks_file, .template, allocator) catch |e| {
+                logger.err("[daemon] tasks.json will not parse ({s}) — the pool keeps its previous tasks", .{@errorName(e)});
+            };
             reloadPool(&pool, store, paths.tasks_file, allocator);
             // NOT when this cycle ends in a re-exec: the reload path waits only
             // 300s for workers, then execve replaces the process image and wipes
@@ -906,7 +932,9 @@ pub fn run(
             if (!pool.hasActiveTasks()) {
                 logger.info("[daemon] all tasks exhausted, running strategist", .{});
                 runStrategistWithPrep(cfg, paths, store, logger, io, allocator, seed_uuid, &state);
-                tasks_mod.syncFromFile(store, paths.tasks_file, .strategist, allocator) catch {};
+                tasks_mod.syncFromFile(store, paths.tasks_file, .strategist, allocator) catch |e| {
+                    logger.err("[daemon] tasks.json written by the strategist will not parse ({s}) — the pool keeps its previous tasks", .{@errorName(e)});
+                };
                 reloadPool(&pool, store, paths.tasks_file, allocator);
             }
 
