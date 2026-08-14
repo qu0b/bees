@@ -137,6 +137,17 @@ pub const Config = struct {
         /// state, so serializing them wasted ~25min of dead time per cycle.
         /// The effective cap is min(this, max_concurrent_sessions - workers).
         max_parallel_roles: u32 = 3,
+        /// Stop spawning sessions once today's spend reaches this many dollars.
+        /// 0 disables the ceiling.
+        ///
+        /// The per-session cap bounds one runaway; nothing bounded a day. On
+        /// 2026-08-13 chatplugin spent $141 in an hour with zero merges and
+        /// only a human noticing stopped it. The ceiling is checked before
+        /// each spawn, so work already running is never cut off mid-session —
+        /// it stops the swarm starting more, and says so.
+        ///
+        /// "Today" is UTC midnight, the same window `bees status` reports.
+        max_daily_usd: f64 = 0,
         /// Circuit breaker: halt the daemon after this many consecutive merge
         /// cycles with zero accepted merges (systemic failure — burning money on
         /// work that never lands). The unit stays stopped for operator attention
@@ -352,6 +363,13 @@ test "default config values" {
     try std.testing.expectEqualStrings("high", cfg.codex_execution.effort);
     try std.testing.expectEqual(@as(f64, 30.0), cfg.workers.max_budget_usd);
     try std.testing.expectEqual(false, cfg.smoke_test.enabled);
+}
+
+test "the daily ceiling is off unless a project asks for it" {
+    // Existing projects must not start refusing to spawn because a new field
+    // appeared; 0 means unbounded, exactly as before this existed.
+    const cfg = Config{ .project = .{ .name = "p" } };
+    try std.testing.expectEqual(@as(f64, 0), cfg.daemon.max_daily_usd);
 }
 
 test "validate accepts a sane config and rejects dangerous ones" {

@@ -326,6 +326,31 @@ fn isQuietHour(daemon: config_mod.Config.Daemon) bool {
     }
 }
 
+/// True when today's spend has reached `daemon.max_daily_usd`.
+///
+/// Checked before spawning, never during: a session already running is left to
+/// finish, because killing it wastes what it has spent without recovering it.
+/// So the ceiling is a floor on where the day stops, not a hard cap — one more
+/// batch may cross it, and the log says by how much.
+fn dailyCeilingReached(cfg: config_mod.Config, store: *store_mod.Store, logger: *log_mod.Logger) bool {
+    if (cfg.daemon.max_daily_usd <= 0) return false;
+
+    const now: u64 = fs.timestamp();
+    const day_start = now - @mod(now, 86400);
+    const txn = store.beginReadTxn() catch return false;
+    defer store_mod.Store.abortTxn(txn);
+    const stats = store.getDailyStats(txn, day_start) catch return false;
+
+    const spent = @as(f64, @floatFromInt(stats.total_cost_cents)) / 100.0;
+    if (spent < cfg.daemon.max_daily_usd) return false;
+
+    logger.warn(
+        "[daemon] daily ceiling reached: ${d:.2} spent today >= ${d:.2} — not spawning more this cycle (raise daemon.max_daily_usd and restart, or wait for UTC midnight)",
+        .{ spent, cfg.daemon.max_daily_usd },
+    );
+    return true;
+}
+
 pub fn run(
     cfg: config_mod.Config,
     paths: config_mod.ProjectPaths,
@@ -365,6 +390,11 @@ pub fn run(
         cfg.sre.max_budget_usd,     cfg.strategist.max_budget_usd,
         cfg.qa.max_budget_usd,
     });
+    if (cfg.daemon.max_daily_usd > 0) {
+        logger.info("[daemon] daily ceiling: ${d:.2} — stops spawning once today's spend reaches it", .{cfg.daemon.max_daily_usd});
+    } else {
+        logger.warn("[daemon] no daily ceiling (daemon.max_daily_usd = 0) — only per-session budgets bound spend", .{});
+    }
 
     var state = DaemonState{};
     installSignalHandlers(&state);
@@ -791,7 +821,9 @@ pub fn run(
 
             // Refill workers (only if there's work to do and no shutdown is in
             // progress — the cooldown sleep above returns early on shutdown)
-            if (pool.hasActiveTasks() and @atomicLoad(u32, &state.shutdown_requested, .acquire) == 0) {
+            if (pool.hasActiveTasks() and @atomicLoad(u32, &state.shutdown_requested, .acquire) == 0 and
+                !dailyCeilingReached(cfg, store, logger))
+            {
                 const current_active = @atomicLoad(u32, &state.active_count, .acquire);
                 const need = @min(cfg.workers.count, MAX_WORKERS) -| current_active;
                 if (need > 0) {
