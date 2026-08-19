@@ -12,7 +12,7 @@ pub fn generateAndInstall(cfg: config_mod.Config, bees_path: []const u8, project
     fs.makePath(systemd_dir) catch {};
 
     // Daemon service (long-running orchestrator)
-    try writeDaemonUnit(allocator, systemd_dir, cfg.project.name, .{
+    try writeDaemonUnit(allocator, systemd_dir, cfg, .{
         .description = try std.fmt.allocPrint(allocator, "Bees daemon ({s})", .{cfg.project.name}),
         .exec_start = try std.fmt.allocPrint(allocator, "{s} daemon", .{bees_path}),
         .working_directory = project_path,
@@ -25,9 +25,18 @@ const DaemonOpts = struct {
     working_directory: []const u8,
 };
 
-fn writeDaemonUnit(allocator: std.mem.Allocator, systemd_dir: []const u8, project_name: []const u8, opts: DaemonOpts) !void {
+fn writeDaemonUnit(allocator: std.mem.Allocator, systemd_dir: []const u8, cfg: config_mod.Config, opts: DaemonOpts) !void {
+    const project_name = cfg.project.name;
     const filename = try std.fmt.allocPrint(allocator, "{s}/bees-{s}.service", .{ systemd_dir, project_name });
     defer allocator.free(filename);
+
+    // The gateway key lives in the invoking shell (~/.bashrc), which a systemd
+    // user unit never sources: without this the daemon starts and immediately
+    // exits with GatewayKeyMissing, so `bees start` only ever worked for
+    // hand-started daemons. Bake it beside the unit in a 0600 EnvironmentFile
+    // rather than into the world-readable unit body.
+    const env_file = try writeGatewayEnvFile(allocator, systemd_dir, cfg);
+    defer if (env_file) |f| allocator.free(f);
 
     const file = try fs.createFile(filename, .{});
     defer fs.closeFile(file);
@@ -38,6 +47,14 @@ fn writeDaemonUnit(allocator: std.mem.Allocator, systemd_dir: []const u8, projec
     // PATH from `bees start` reproduces the environment the user tested with.
     const path_env = if (std.c.getenv("PATH")) |p| std.mem.sliceTo(p, 0) else "/usr/local/bin:/usr/bin:/bin";
 
+    // `-` prefix: a removed env file must not block the daemon from starting
+    // (it still reports GatewayKeyMissing itself, which names the real cause).
+    const env_file_line = if (env_file) |f|
+        try std.fmt.allocPrint(allocator, "EnvironmentFile=-{s}\n", .{f})
+    else
+        "";
+    defer if (env_file != null) allocator.free(env_file_line);
+
     try fs.filePrint(file,
         \\[Unit]
         \\Description={s}
@@ -47,7 +64,7 @@ fn writeDaemonUnit(allocator: std.mem.Allocator, systemd_dir: []const u8, projec
         \\Type=simple
         \\WorkingDirectory={s}
         \\Environment="PATH={s}"
-        \\ExecStart={s}
+        \\{s}ExecStart={s}
         \\Restart=always
         \\RestartSec=30
         \\TimeoutStopSec=30
@@ -60,8 +77,41 @@ fn writeDaemonUnit(allocator: std.mem.Allocator, systemd_dir: []const u8, projec
         opts.description,
         opts.working_directory,
         path_env,
+        env_file_line,
         opts.exec_start,
     });
+}
+
+/// Write `<systemd_dir>/bees-<project>.env` holding the gateway API key, and
+/// return the path (caller owns) so the unit can reference it.
+///
+/// Returns null — leaving the unit unchanged — when the gateway is off or the
+/// key is absent from this process's environment. A null here is not silent
+/// breakage: the daemon still fails with the explicit GatewayKeyMissing error,
+/// which is the honest report that `bees start` was run from a shell that
+/// never had the key.
+fn writeGatewayEnvFile(allocator: std.mem.Allocator, systemd_dir: []const u8, cfg: config_mod.Config) !?[]const u8 {
+    if (!cfg.gateway.enabled) return null;
+
+    var name_buf: [256]u8 = undefined;
+    if (cfg.gateway.api_key_env.len >= name_buf.len) return null;
+    @memcpy(name_buf[0..cfg.gateway.api_key_env.len], cfg.gateway.api_key_env);
+    name_buf[cfg.gateway.api_key_env.len] = 0;
+    const key_ptr = std.c.getenv(@ptrCast(&name_buf)) orelse return null;
+    const key = std.mem.sliceTo(key_ptr, 0);
+    if (key.len == 0) return null;
+
+    const path = try std.fmt.allocPrint(allocator, "{s}/bees-{s}.env", .{ systemd_dir, cfg.project.name });
+    errdefer allocator.free(path);
+
+    const file = try fs.createFile(path, .{});
+    defer fs.closeFile(file);
+    // 0600 before the secret is written: the key is a credential and the unit
+    // directory is not private. Zig 0.16's CreateFlags carries no mode, so the
+    // permission is narrowed on the open handle first.
+    if (std.c.fchmod(file.handle, 0o600) != 0) return error.ChmodFailed;
+    try fs.filePrint(file, "{s}={s}\n", .{ cfg.gateway.api_key_env, key });
+    return path;
 }
 
 pub const unit_prefix = "bees-";

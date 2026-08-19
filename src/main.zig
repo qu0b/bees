@@ -956,6 +956,17 @@ fn checkRole(
             try stdout.print("  ✗ backend {s} — '{s}' not on PATH (model {s})\n", .{ c.bt.label(), bin, c.model });
             blockers.* += 1;
         }
+        // pi takes its endpoint from its OWN provider config, not from the
+        // ANTHROPIC_BASE_URL bees exports: a bare model name resolves to
+        // provider "anthropic" and the request leaves for api.anthropic.com
+        // carrying the gateway's key, which 401s. Naming the provider
+        // ("local-llm/starflinger-anthropic") is what routes it to the gateway.
+        if (c.bt == .pi and backend.gatewayActive() and
+            std.mem.indexOfScalar(u8, c.model, '/') == null)
+        {
+            try stdout.print("  ⚠ model '{s}' names no pi provider — this role bypasses the gateway (use '<provider>/{s}')\n", .{ c.model, c.model });
+            warnings.* += 1;
+        }
     }
 
     // Browser dependency: a role needs a browser when it has an MCP config or

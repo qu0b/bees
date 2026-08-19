@@ -326,13 +326,32 @@ fn isQuietHour(daemon: config_mod.Config.Daemon) bool {
     }
 }
 
-/// True when today's spend has reached `daemon.max_daily_usd`.
+/// The largest per-session budget one worker can hold, across every tier.
+/// What an in-flight worker may still spend before it settles.
+fn maxWorkerBudget(cfg: config_mod.Config) f64 {
+    var m: f64 = cfg.workers.forTier(.default).max_budget_usd;
+    for ([_]types.TaskTier{ .cheap, .standard, .deep }) |t| {
+        m = @max(m, cfg.workers.forTier(t).max_budget_usd);
+    }
+    return m;
+}
+
+/// True when today's spend — settled plus committed — has reached
+/// `daemon.max_daily_usd`.
 ///
-/// Checked before spawning, never during: a session already running is left to
-/// finish, because killing it wastes what it has spent without recovering it.
-/// So the ceiling is a floor on where the day stops, not a hard cap — one more
-/// batch may cross it, and the log says by how much.
-fn dailyCeilingReached(cfg: config_mod.Config, store: *store_mod.Store, logger: *log_mod.Logger) bool {
+/// A session already running is still left to finish: killing it wastes what
+/// it has spent without recovering it. But settled spend alone reads the day
+/// far too late. Spend is only recorded when a session ENDS, and sessions run
+/// tens of minutes in parallel, so on 2026-08-19 chatplugin was $1,128 deep
+/// before a $100 ceiling first tripped. Counting what in-flight sessions may
+/// still spend turns an unbounded overshoot into one bounded by the budgets
+/// already committed.
+fn dailyCeilingReached(
+    cfg: config_mod.Config,
+    store: *store_mod.Store,
+    logger: *log_mod.Logger,
+    state: *const DaemonState,
+) bool {
     if (cfg.daemon.max_daily_usd <= 0) return false;
 
     const now: u64 = fs.timestamp();
@@ -341,12 +360,14 @@ fn dailyCeilingReached(cfg: config_mod.Config, store: *store_mod.Store, logger: 
     defer store_mod.Store.abortTxn(txn);
     const stats = store.getDailyStats(txn, day_start) catch return false;
 
-    const spent = @as(f64, @floatFromInt(stats.total_cost_cents)) / 100.0;
-    if (spent < cfg.daemon.max_daily_usd) return false;
+    const settled = @as(f64, @floatFromInt(stats.total_cost_cents)) / 100.0;
+    const in_flight = @atomicLoad(u32, &state.active_count, .acquire);
+    const committed = @as(f64, @floatFromInt(in_flight)) * maxWorkerBudget(cfg);
+    if (settled + committed < cfg.daemon.max_daily_usd) return false;
 
     logger.warn(
-        "[daemon] daily ceiling reached: ${d:.2} spent today >= ${d:.2} — not spawning more this cycle (raise daemon.max_daily_usd and restart, or wait for UTC midnight)",
-        .{ spent, cfg.daemon.max_daily_usd },
+        "[daemon] daily ceiling reached: ${d:.2} settled + ${d:.2} committed to {d} in-flight session(s) >= ${d:.2} — not spawning more (lower spend, edit daemon.max_daily_usd, or wait for UTC midnight)",
+        .{ settled, committed, in_flight, cfg.daemon.max_daily_usd },
     );
     return true;
 }
@@ -879,8 +900,15 @@ pub fn run(
             // Observers first, concurrently (bounded so workers + roles stay
             // inside the provider's concurrent-request budget), then the roles
             // that consume their reports.
-            runRoleJobs(observer_jobs[0..observer_n], cfg, paths, store, logger, io, allocator, seed_uuid, observerCap(cfg));
-            runRoleJobs(dependent_jobs[0..dependent_n], cfg, paths, store, logger, io, allocator, seed_uuid, 1);
+            // The merger is deliberately NOT gated by the ceiling — it lands
+            // work already paid for, and blocking it strands branches. Every
+            // other role is discretionary spend and waits for the next day.
+            if (dailyCeilingReached(cfg, store, logger, &state)) {
+                logger.warn("[daemon] daily ceiling reached — skipping observer and dependent roles this cycle", .{});
+            } else {
+                runRoleJobs(observer_jobs[0..observer_n], cfg, paths, store, logger, io, allocator, seed_uuid, observerCap(cfg));
+                runRoleJobs(dependent_jobs[0..dependent_n], cfg, paths, store, logger, io, allocator, seed_uuid, 1);
+            }
 
             // Drain any remaining SRE triggers not handled by workflow
             drainSreTriggers(cfg, paths, store, logger, io, allocator, &state);
@@ -929,7 +957,7 @@ pub fn run(
                 return .reload;
             }
 
-            if (!pool.hasActiveTasks()) {
+            if (!pool.hasActiveTasks() and !dailyCeilingReached(cfg, store, logger, &state)) {
                 logger.info("[daemon] all tasks exhausted, running strategist", .{});
                 runStrategistWithPrep(cfg, paths, store, logger, io, allocator, seed_uuid, &state);
                 tasks_mod.syncFromFile(store, paths.tasks_file, .strategist, allocator) catch |e| {
@@ -941,7 +969,7 @@ pub fn run(
             // Refill workers (only if there's work to do and no shutdown is in
             // progress — the cooldown sleep above returns early on shutdown)
             if (pool.hasActiveTasks() and @atomicLoad(u32, &state.shutdown_requested, .acquire) == 0 and
-                !dailyCeilingReached(cfg, store, logger))
+                !dailyCeilingReached(cfg, store, logger, &state))
             {
                 const current_active = @atomicLoad(u32, &state.active_count, .acquire);
                 const need = @min(cfg.workers.count, MAX_WORKERS) -| current_active;
@@ -1526,6 +1554,22 @@ test "observer roles run concurrently; report-consumers do not" {
     try std.testing.expect(!isObserverRole(.founder));
     try std.testing.expect(!isObserverRole(.worker));
     try std.testing.expect(!isObserverRole(.merger));
+}
+
+test "the ceiling's in-flight commitment uses the most expensive tier" {
+    // A worker on any tier can hold that tier's budget, so what one in-flight
+    // session may still spend is the MAX across tiers — under-estimating here
+    // is what let a $100 ceiling read the day at $1,128.
+    var cfg = config_mod.Config{ .project = .{ .name = "bees", .base_branch = "main" } };
+    cfg.workers.max_budget_usd = 36;
+    cfg.workers.tiers.cheap.max_budget_usd = 12;
+    cfg.workers.tiers.deep.max_budget_usd = 60;
+    try std.testing.expectEqual(@as(f64, 60), maxWorkerBudget(cfg));
+
+    // With no tiers named, it is exactly the plain worker budget.
+    var plain = config_mod.Config{ .project = .{ .name = "bees", .base_branch = "main" } };
+    plain.workers.max_budget_usd = 40;
+    try std.testing.expectEqual(@as(f64, 40), maxWorkerBudget(plain));
 }
 
 test "useCodex splits deterministically by fraction" {

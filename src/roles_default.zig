@@ -412,13 +412,22 @@ const roles = [_]RoleDef{
         \\Format: JSON array of task objects.
         \\```json
         \\[
-        \\  {"name": "Short name under 50 chars", "weight": 3, "prompt": "Detailed instructions..."}
+        \\  {"name": "Short name under 50 chars", "weight": 3, "tier": "standard", "prompt": "Detailed instructions..."}
         \\]
         \\```
         \\
-        \\- **name**: Short identifier (<50 chars)
+        \\- **name**: Short identifier (<50 chars). A task's name is its IDENTITY — run and
+        \\  accept counts are keyed by it. Re-use the EXACT existing name for work that is
+        \\  still the same work; a re-worded name forks a fresh row and loses the history
+        \\  that tells you the task keeps failing. Never ship two tasks covering the same
+        \\  change under different names: workers pick them independently and do the work
+        \\  twice, in conflicting branches.
         \\- **weight**: worker-selection probability, 1-5 (5=critical user need, 3=important,
         \\  1=experiment)
+        \\- **tier**: how much model the task is worth — "cheap" for mechanical edits in
+        \\  files you name, "standard" (the default) for ordinary features, "deep" for work
+        \\  needing design judgment across several files. Judge by the thinking required,
+        \\  not the diff size: a one-line change that needs the right decision is not cheap.
         \\- **prompt**: the entire brief a worker gets. Write it so a competent engineer who
         \\  never saw this conversation makes the same choices you would — name the files to
         \\  change and the behavior wanted, say which user this serves and why, state what
