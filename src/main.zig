@@ -968,6 +968,14 @@ fn checkRole(
             try stdout.print("  ⚠ model '{s}' names no pi provider — this role bypasses the gateway (use '<provider>/{s}')\n", .{ c.model, c.model });
             warnings.* += 1;
         }
+        // dsh takes its credentials from the launching environment and exits
+        // MISSING_CREDENTIAL without them — on stderr, which the probe
+        // silences, so an unprobed role looks fine and a probed one only says
+        // "call failed". Name the missing variable while we can still see it.
+        if (c.bt == .dsh and std.c.getenv("DEEPSEEK_API_KEY") == null) {
+            try stdout.print("  ⚠ DEEPSEEK_API_KEY is not set — dsh will exit MISSING_CREDENTIAL before it calls a model\n", .{});
+            warnings.* += 1;
+        }
     }
 
     // Browser dependency: a role needs a browser when it has an MCP config or
