@@ -21,6 +21,7 @@ pub const Command = union(enum) {
     tasks: OutputOptions,
     tasks_sync: struct { file: ?[]const u8 = null },
     tasks_reset: struct { name: ?[]const u8 = null },
+    tasks_retire: struct { name: []const u8 },
     sync,
     sessions: struct { session_type: ?types.SessionType = null, json: bool = false, limit: u32 = 50 },
     session: struct { id: u64, json: bool = false },
@@ -94,6 +95,9 @@ pub fn parse(args: []const []const u8) !Command {
         if (args.len >= 3 and std.mem.eql(u8, args[2], "reset")) {
             const name = if (args.len >= 4) args[3] else null;
             return .{ .tasks_reset = .{ .name = name } };
+        }
+        if (args.len >= 4 and std.mem.eql(u8, args[2], "retire")) {
+            return .{ .tasks_retire = .{ .name = args[3] } };
         }
         return .{ .tasks = .{ .json = hasFlag(args[2..], "--json") } };
     }

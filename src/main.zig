@@ -395,6 +395,7 @@ fn runCommand(cmd: cli.Command, arena: std.mem.Allocator, io: Io, stdout: *Io.Wr
         .tasks => |opts| try cmdTasks(arena, stdout, opts.json),
         .tasks_sync => |opts| try cmdTasksSync(arena, stdout, opts.file),
         .tasks_reset => |opts| try cmdTasksReset(arena, stdout, opts.name),
+        .tasks_retire => |opts| try cmdTasksRetire(arena, stdout, opts.name),
         .sync => try cmdSync(arena, stdout),
         .sessions => |opts| try cmdSessions(arena, stdout, opts.session_type, opts.json, opts.limit),
         .session => |opts| try cmdSession(arena, stdout, opts.id, opts.json),
@@ -2263,6 +2264,50 @@ fn cmdTasksSync(arena: std.mem.Allocator, stdout: *Io.Writer, file: ?[]const u8)
     try stdout.print("Tasks synced to LMDB from {s}\n", .{tasks_path});
 }
 
+/// `bees tasks retire <name>` — retire a task now, whatever its sessions say.
+///
+/// Removing a task from tasks.json is not enough on its own: a task stays
+/// active while a session against it is unresolved, and a `.done` session
+/// counts as unresolved for 24 hours. That window exists so the merger can
+/// still credit work — but when the work was delivered another way (merged by
+/// hand, or superseded), the task keeps being handed to workers for the rest
+/// of the day. This is the operator's "stop working on this".
+///
+/// It does not touch sessions or branches; it only settles the task row.
+fn cmdTasksRetire(arena: std.mem.Allocator, stdout: *Io.Writer, name: []const u8) !void {
+    const project = try loadProject(arena);
+    const paths = project[1];
+
+    var store = try store_mod.Store.open(paths.db_dir);
+    defer store.close();
+
+    var header: types.TaskHeader = undefined;
+    var prompt: []const u8 = "";
+    {
+        const txn = try store.beginReadTxn();
+        defer store_mod.Store.abortTxn(txn);
+        const view = (try store.getTask(txn, name)) orelse {
+            try stdout.print("No task named \"{s}\".\n", .{name});
+            return;
+        };
+        if (view.header.status == .retired) {
+            try stdout.print("\"{s}\" is already retired.\n", .{name});
+            return;
+        }
+        header = view.header;
+        // Copy before writing: the same key invalidates the mmap slice.
+        prompt = try arena.dupe(u8, view.prompt);
+    }
+
+    header.status = .retired;
+    var txn = try store.beginWriteTxn();
+    try store.upsertTask(txn, name, header, prompt);
+    try store_mod.Store.commitTxnConsume(&txn);
+
+    try stdout.print("Retired \"{s}\" — workers will not pick it up again.\n", .{name});
+    try stdout.print("Remove it from tasks.json too, or the next sync makes it active.\n", .{});
+}
+
 /// Whether a live daemon holds this project's lock. The lock file carries the
 /// daemon's pid and `worker.acquireLock` already reclaims it when that process
 /// is gone, so "could not acquire" means a real daemon is running right now.
@@ -3030,6 +3075,7 @@ fn printUsage(stdout: *Io.Writer) !void {
         \\  tasks [--json]           List tasks (from LMDB if available)
         \\  tasks sync [file]        Sync tasks.json into LMDB
         \\  tasks reset [name]       Clear task run history (all or one) and reactivate
+        \\  tasks retire <name>      Retire a task now, even with sessions pending
         \\  sync                     Sync LMDB data to SQLite replica
         \\  sessions [--type X] [--limit N] [--json]  List sessions
         \\  session <id> [--json]    Show session detail (--json includes raw event data)
