@@ -1084,6 +1084,26 @@ pub fn runSession(
         if (trimmed.len > 0) {
             if (acc.result_text.len > 0) allocator.free(acc.result_text);
             acc.result_text = try allocator.dupe(u8, trimmed);
+
+            // Store it as the session's one assistant event too. Without this
+            // the transcript holds only the user prompt and `bees session N`
+            // shows a session that apparently never answered.
+            const raw = std.fmt.allocPrint(allocator, "{{\"type\":\"assistant\",\"text\":{f}}}", .{std.json.fmt(trimmed, .{})}) catch null;
+            if (raw) |r| {
+                defer allocator.free(r);
+                const header = types.EventHeader{
+                    .event_type = .message,
+                    .tool_name = .none,
+                    .role = .assistant,
+                    .timestamp_offset_ms = @truncate((fs.timestamp() -| session_start) *| 1000),
+                };
+                if (store.beginWriteTxn()) |txn| {
+                    if (store.insertEvent(txn, session_id, seq, header, r)) |_| {
+                        store_mod.Store.commitTxn(txn) catch {};
+                        seq += 1;
+                    } else |_| store_mod.Store.abortTxn(txn);
+                } else |_| {}
+            }
         }
     }
 
