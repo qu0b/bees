@@ -448,6 +448,14 @@ fn runWorkerImpl(
     {
         const subtype = if (result.result_subtype.len > 0) result.result_subtype else "unknown";
         const stop = if (result.stop_reason.len > 0) result.stop_reason else "-";
+        // The shared-context seed only pays for itself if the provider actually
+        // returns cache reads. Through a gateway that drops cache_control it is
+        // re-sent in full on EVERY turn: chatplugin's 2026-08-22 sessions spent
+        // 3.9M input tokens to produce 19k of output, ~97% of the budget, and
+        // nothing in the logs said why.
+        if (cfg.cache.shared_context and result.cache_read_tokens == 0 and result.input_tokens > 200_000) {
+            logger.warn("[worker:{d}] {d} input tokens, ZERO cache reads — cache.shared_context is being re-sent in full every turn. Disable it, or fix prompt caching at the gateway", .{ worker_id, result.input_tokens });
+        }
         if (result.permission_denials > 0) {
             logger.warn("[worker:{d}] {d} tool call(s) refused by the permission layer — the role's security profile forbids what this task asked for; check the task, not the tool", .{ worker_id, result.permission_denials });
         }

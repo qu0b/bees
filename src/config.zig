@@ -248,6 +248,13 @@ pub const Config = struct {
 
     pub const Cache = struct {
         /// Enable shared context seed sessions for cross-role prompt caching.
+        ///
+        /// Worth it ONLY where the provider really returns cache reads. The
+        /// seed is ~200k tokens by design, so without caching it is re-sent in
+        /// full on every turn of every session: on chatplugin (LiteLLM, which
+        /// drops cache_control on /v1/messages) that was 3.9M input tokens for
+        /// 19k of output — 97% of a worker's budget spent re-reading context.
+        /// A session that reports zero cache reads now says so in the log.
         shared_context: bool = true,
         /// Maximum bytes of source files to include in the seed (default ~200k tokens).
         max_bytes: u32 = 800_000,
