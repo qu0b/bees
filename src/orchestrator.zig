@@ -674,7 +674,13 @@ pub fn run(
         // Spawn initial workers as green threads — unless a shutdown request
         // arrived during the startup sequence (spawning after the signal used
         // to guarantee a drain timeout + systemd KILL).
-        if (pool.hasActiveTasks() and @atomicLoad(u32, &state.shutdown_requested, .acquire) == 0) {
+        // The ceiling applies to the first batch too. Without this check a
+        // restart was a way to spend past it: chatplugin was already $32 over
+        // a $250 limit when a restart immediately spawned two more workers,
+        // having just logged the ceiling at startup.
+        if (pool.hasActiveTasks() and @atomicLoad(u32, &state.shutdown_requested, .acquire) == 0 and
+            !dailyCeilingReached(cfg, store, logger, &state))
+        {
             const spawn_count = @min(cfg.workers.count, MAX_WORKERS);
             for (0..spawn_count) |_| {
                 spawnWorker(cfg, paths, store, pool, logger, io, allocator, &state, context_blob);
