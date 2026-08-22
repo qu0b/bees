@@ -44,6 +44,11 @@ const roles = [_]RoleDef{
         \\a message saying what changed and why. Verify before you commit: a red build is worse
         \\than an unfinished task, because the merge phase burns a whole cycle on it.
         \\
+        \\Your session ends when its budget runs out, wherever you happen to be. So commit the
+        \\smallest complete, building, tested version of the task as soon as you have one, and
+        \\improve it in further commits. A session that ends mid-refactor leaves a candidate
+        \\nobody can merge; one that ends after a small green commit leaves something real.
+        \\
         \\Deploying is the merge phase's job. Never deploy.
         \\
         ,
