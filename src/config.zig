@@ -7,6 +7,9 @@ pub const Config = struct {
     project: Project,
     claude_binary: []const u8 = "claude",
     pi_binary: []const u8 = "pi",
+    /// DeepSeek Harness launcher. `dsh` when installed from npm; a repo
+    /// checkout runs it as `pnpm dsh`, which is why this is configurable.
+    dsh_binary: []const u8 = "dsh",
     default_backend: []const u8 = "claude",
     /// Codex model + reasoning effort for thinking/knowledge roles (strategist,
     /// researcher). `sol` is the stronger reasoner; runs at the highest (xhigh)

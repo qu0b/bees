@@ -9,6 +9,7 @@ const fs = @import("fs.zig");
 const claude = @import("claude.zig");
 const backend_codex = @import("backend_codex.zig");
 const backend_opencode = @import("backend_opencode.zig");
+const backend_dsh = @import("backend_dsh.zig");
 const backend_pi = @import("backend_pi.zig");
 
 // Re-export shared helpers used by callers (api.zig, main.zig, orchestrator.zig)
@@ -539,7 +540,7 @@ pub fn resolveBackend(default_backend: []const u8, role_backend: []const u8) typ
 /// for the rest of argv.
 pub const max_argv_prompt_bytes: usize = 100_000;
 
-fn spawn(backend: types.BackendType, allocator: std.mem.Allocator, io: Io, options: BackendOptions, claude_binary: []const u8, pi_binary: []const u8) !std.process.Child {
+fn spawn(backend: types.BackendType, allocator: std.mem.Allocator, io: Io, options: BackendOptions, claude_binary: []const u8, pi_binary: []const u8, dsh_binary: []const u8) !std.process.Child {
     var opts = options;
     if (gateway.active and backend == .claude) {
         // Claude alias models default to the gateway's model; explicit ids
@@ -577,10 +578,10 @@ fn spawn(backend: types.BackendType, allocator: std.mem.Allocator, io: Io, optio
             options.prompt;
         opts.prompt = "Your full instructions and context are provided via stdin. Read them and proceed.";
     }
-    return spawnResolved(backend, allocator, io, opts, claude_binary, pi_binary);
+    return spawnResolved(backend, allocator, io, opts, claude_binary, pi_binary, dsh_binary);
 }
 
-fn spawnResolved(backend: types.BackendType, allocator: std.mem.Allocator, io: Io, options: BackendOptions, claude_binary: []const u8, pi_binary: []const u8) !std.process.Child {
+fn spawnResolved(backend: types.BackendType, allocator: std.mem.Allocator, io: Io, options: BackendOptions, claude_binary: []const u8, pi_binary: []const u8, dsh_binary: []const u8) !std.process.Child {
     return switch (backend) {
         .claude => claude.spawnClaude(allocator, io, .{
             .prompt = options.prompt,
@@ -610,6 +611,7 @@ fn spawnResolved(backend: types.BackendType, allocator: std.mem.Allocator, io: I
         .codex => backend_codex.spawnCodex(allocator, io, options),
         .opencode => backend_opencode.spawnOpenCode(allocator, io, options),
         .pi => backend_pi.spawnPi(allocator, io, options, pi_binary),
+        .dsh => backend_dsh.spawnDsh(allocator, io, options, dsh_binary),
     };
 }
 
@@ -637,6 +639,7 @@ pub fn probeBackend(
     cwd: []const u8,
     claude_binary: []const u8,
     pi_binary: []const u8,
+    dsh_binary: []const u8,
     /// When set (claude only), fork a session from this seed uuid — probing the
     /// cross-role cache-lineage path, which can break independently of bare
     /// model calls (e.g. the 2026-07-22 previous_message_id API 400).
@@ -656,7 +659,7 @@ pub fn probeBackend(
         .silence_stderr = true,
         .resume_session_id = resume_session_id,
         .fork_session = resume_session_id != null,
-    }, claude_binary, pi_binary) catch return .failed;
+    }, claude_binary, pi_binary, dsh_binary) catch return .failed;
 
     var saw_auth = false;
     var saw_success = false;
@@ -698,6 +701,12 @@ pub fn probeBackend(
                 {
                     saw_success = true;
                 },
+                // dsh prints the answer itself and nothing else; any nonblank
+                // line IS the completion. Requiring an event marker here would
+                // report every healthy dsh profile as broken.
+                .dsh => if (std.mem.trim(u8, l, &std.ascii.whitespace).len > 0) {
+                    saw_success = true;
+                },
             }
         }
     }
@@ -720,6 +729,16 @@ fn processEvent(backend: types.BackendType, line: []const u8, acc: *ResultAccumu
         .codex => backend_codex.processEvent(line, acc),
         .opencode => backend_opencode.processEvent(line, acc),
         .pi => backend_pi.processEvent(line, acc),
+        // Never reached: a non-streaming backend's stdout is collected as text
+        // before this dispatch (see runSession's read loop).
+        .dsh => types.EventMeta{
+            .event_type = .message,
+            .tool_name = .none,
+            .is_error = false,
+            .role = .assistant,
+            .duration_secs = 0,
+            .num_turns = 0,
+        },
     };
     // claudeProcessEvent sets saw_result itself. The other adapters normalize
     // their terminal events to .result; require a recognized event-kind key so
@@ -818,12 +837,13 @@ pub fn runSession(
     allocator: std.mem.Allocator,
     claude_binary: []const u8,
     pi_binary: []const u8,
+    dsh_binary: []const u8,
 ) !SessionResult {
     assert(session_id > 0);
     assert(options.prompt.len > 0);
     assert(options.cwd.len > 0);
 
-    var child = try spawn(options.backend, allocator, io, options, claude_binary, pi_binary);
+    var child = try spawn(options.backend, allocator, io, options, claude_binary, pi_binary, dsh_binary);
     // Register for the daemon's shutdown watchdog; always unregister on exit.
     // Capture the pid locally — wait() may clear child.id before the defer runs.
     const child_pid: std.posix.pid_t = child.id orelse 0;
@@ -897,6 +917,10 @@ pub fn runSession(
         }
     }
 
+    // Plain-text stdout for backends with no event stream (see BackendType.streamsEvents).
+    var text_output: std.ArrayList(u8) = .empty;
+    defer text_output.deinit(allocator);
+
     // Read stdout line by line
     if (child.stdout) |stdout_file| {
         var read_buf: [256 * 1024]u8 = undefined;
@@ -913,6 +937,16 @@ pub fn runSession(
             if (line == null) break;
             const line_data = line.?;
             if (line_data.len == 0) continue;
+
+            // A backend that streams no events prints its answer as plain
+            // text, which the JSON guard below would discard line by line —
+            // the whole session's output, gone. Collect it instead; it becomes
+            // the result once the stream ends.
+            if (!options.backend.streamsEvents()) {
+                try text_output.appendSlice(allocator, line_data);
+                try text_output.append(allocator, '\n');
+                continue;
+            }
 
             // Guard: divert non-JSON lines to stderr (library banners, stray prints)
             if (line_data.len == 0 or line_data[0] != '{') {
@@ -1037,6 +1071,19 @@ pub fn runSession(
             }
 
             seq += 1;
+        }
+    }
+
+    // A text-only backend's whole stdout IS its result. Ownership matches the
+    // streaming path: result_text is heap-allocated and freed by the caller.
+    // num_turns stays 0 and cost_known stays false — dsh reports neither, and
+    // inventing a zero cost would make the daily ceiling count a real spend as
+    // free.
+    if (!options.backend.streamsEvents() and text_output.items.len > 0) {
+        const trimmed = std.mem.trim(u8, text_output.items, &std.ascii.whitespace);
+        if (trimmed.len > 0) {
+            if (acc.result_text.len > 0) allocator.free(acc.result_text);
+            acc.result_text = try allocator.dupe(u8, trimmed);
         }
     }
 

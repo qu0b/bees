@@ -424,7 +424,7 @@ fn reviewAndMerge(
         .permission_mode = if (opts.perms) |p| p.permission_mode else null,
         .allowed_tools = if (opts.perms) |p| if (p.allowed_tools.len > 0) p.allowed_tools else null else null,
         .disallowed_tools = if (opts.perms) |p| if (p.disallowed_tools.len > 0) p.disallowed_tools else null else null,
-    }, session_id, allocator, cfg.claude_binary, cfg.pi_binary) catch |e| {
+    }, session_id, allocator, cfg.claude_binary, cfg.pi_binary, cfg.dsh_binary) catch |e| {
         logger.err("[merger] review session failed for {s}: {}", .{ candidate.branch, e });
         return .review_failed;
     };
@@ -604,7 +604,7 @@ fn runBuildStep(
         .permission_mode = if (opts.perms) |p| p.permission_mode else null,
         .allowed_tools = if (opts.perms) |p| if (p.allowed_tools.len > 0) p.allowed_tools else null else null,
         .disallowed_tools = if (opts.perms) |p| if (p.disallowed_tools.len > 0) p.disallowed_tools else null else null,
-    }, session_id, allocator, cfg.claude_binary, cfg.pi_binary) catch {
+    }, session_id, allocator, cfg.claude_binary, cfg.pi_binary, cfg.dsh_binary) catch {
         logger.err("[merger] AI fix failed", .{});
         git.resetHard(allocator, io, paths.root, saved_head) catch {};
         return false;

@@ -824,10 +824,10 @@ fn cmdDoctor(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, role_filter: 
         var futures: [cap]Fut = undefined;
         var sync_status = [_]?backend.ProbeStatus{null} ** cap;
         for (combos.items[0..n], 0..) |c, idx| {
-            if (io.concurrent(backend.probeBackend, .{ arena, io, c.bt, c.model, c.effort, cwd, cfg.claude_binary, cfg.pi_binary, @as(?[]const u8, null) })) |f| {
+            if (io.concurrent(backend.probeBackend, .{ arena, io, c.bt, c.model, c.effort, cwd, cfg.claude_binary, cfg.pi_binary, cfg.dsh_binary, @as(?[]const u8, null) })) |f| {
                 futures[idx] = f;
             } else |_| {
-                sync_status[idx] = backend.probeBackend(arena, io, c.bt, c.model, c.effort, cwd, cfg.claude_binary, cfg.pi_binary, null);
+                sync_status[idx] = backend.probeBackend(arena, io, c.bt, c.model, c.effort, cwd, cfg.claude_binary, cfg.pi_binary, cfg.dsh_binary, null);
             }
         }
         // Await in a stable order and report as each resolves.
@@ -852,7 +852,7 @@ fn cmdDoctor(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer, role_filter: 
                 defer store.close();
                 const seed_result = seed_mod.buildSeed(paths.root, cfg.project.name, cfg.cache, &store, arena, io);
                 if (seed_result.uuid) |uuid| {
-                    switch (backend.probeBackend(arena, io, .claude, "sonnet", "low", cwd, cfg.claude_binary, cfg.pi_binary, uuid)) {
+                    switch (backend.probeBackend(arena, io, .claude, "sonnet", "low", cwd, cfg.claude_binary, cfg.pi_binary, cfg.dsh_binary, uuid)) {
                         .ok => try stdout.print("  ✓ seed built and a forked session responded (cache lineage intact)\n", .{}),
                         .auth_error => {
                             try stdout.print("  ✗ seed fork — authentication failed\n", .{});
@@ -1080,6 +1080,7 @@ fn backendBinary(cfg: config_mod.Config, bt: types.BackendType) []const u8 {
         .pi => cfg.pi_binary,
         .codex => "codex",
         .opencode => "opencode",
+        .dsh => cfg.dsh_binary,
     };
 }
 
@@ -3056,6 +3057,7 @@ comptime {
     _ = @import("backend_codex.zig");
     _ = @import("backend_opencode.zig");
     _ = @import("backend_pi.zig");
+    _ = @import("backend_dsh.zig");
     _ = git;
     _ = scheduler;
     _ = tasks_mod;

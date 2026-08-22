@@ -298,11 +298,15 @@ pub const StopReason = enum(u2) {
     }
 };
 
-pub const BackendType = enum(u2) {
+/// Values 0..3 are frozen: they are what pre-2026-08 records wrote into
+/// SessionHeader's 2-bit `backend_legacy` slot. New backends take 4 and up and
+/// are only ever stored in the tail-pad `backend` field — see SessionHeader.
+pub const BackendType = enum(u3) {
     claude = 0,
     opencode = 1,
     pi = 2,
     codex = 3,
+    dsh = 4,
 
     pub fn label(self: BackendType) []const u8 {
         return switch (self) {
@@ -310,6 +314,7 @@ pub const BackendType = enum(u2) {
             .opencode => "opencode",
             .pi => "pi",
             .codex => "codex",
+            .dsh => "dsh",
         };
     }
 
@@ -317,7 +322,16 @@ pub const BackendType = enum(u2) {
         if (std.mem.eql(u8, s, "opencode")) return .opencode;
         if (std.mem.eql(u8, s, "pi")) return .pi;
         if (std.mem.eql(u8, s, "codex")) return .codex;
+        if (std.mem.eql(u8, s, "dsh")) return .dsh;
         return .claude;
+    }
+
+    /// Whether the backend streams machine-readable events. `dsh` prints only
+    /// the final assistant text (its JSONL stream is explicitly test-only
+    /// infrastructure, not a supported output format), so sessions on it carry
+    /// a result and no per-turn telemetry.
+    pub fn streamsEvents(self: BackendType) bool {
+        return self != .dsh;
     }
 };
 
@@ -429,7 +443,12 @@ pub const SessionHeader = packed struct(u384) {
     has_tokens: bool,
     has_duration: bool,
     has_diff_summary: bool,
-    backend: BackendType = .claude,
+    // Bit 14 is the frozen pre-2026-08 BackendType(u2) slot — the same trap
+    // ModelType fell into below. Widening it in place for a fifth backend
+    // would shift worker_id..cache_read_tokens and misread every existing
+    // record, so the slot stays 2 bits forever and `backend` lives in the tail
+    // pad. Old records still carry their value here — see getBackend().
+    backend_legacy: u2 = 0,
     has_result_detail: bool = false,
     worker_id: u16,
     commit_count: u8,
@@ -451,7 +470,10 @@ pub const SessionHeader = packed struct(u384) {
     // Written here (tail pad) instead of bits 9..10 so widening ModelType never
     // moves another field again. Zero (= .opus) in every pre-2026-07 record.
     model: ModelType = .opus,
-    _pad: u7 = 0,
+    /// Written here instead of bit 14 so adding a backend never moves another
+    /// field. Zero (= .claude) in every pre-2026-08 record.
+    backend: BackendType = .claude,
+    _pad: u4 = 0,
 
     /// Model of this session, valid for records written before and after the
     /// move out of bits 9..10. Exact, not a heuristic: writers always leave
@@ -460,6 +482,15 @@ pub const SessionHeader = packed struct(u384) {
     pub fn getModel(self: SessionHeader) ModelType {
         if (self.model != .opus) return self.model;
         return @enumFromInt(@as(u3, self.model_legacy));
+    }
+
+    /// Backend of this session, valid for records written before and after the
+    /// move out of bit 14. Exact, not a heuristic: writers always leave
+    /// backend_legacy zero, so a non-.claude `backend` can only come from a new
+    /// record, and a non-zero `backend_legacy` only from an old one.
+    pub fn getBackend(self: SessionHeader) BackendType {
+        if (self.backend != .claude) return self.backend;
+        return @enumFromInt(@as(u3, self.backend_legacy));
     }
 
     comptime {
@@ -475,6 +506,9 @@ pub const SessionHeader = packed struct(u384) {
         // getModel()'s legacy fallback is only correct while both slots stay put.
         assert(@bitOffsetOf(SessionHeader, "model_legacy") == 9);
         assert(@bitOffsetOf(SessionHeader, "model") == 374);
+        // Same freeze for the backend slot and its tail-pad replacement.
+        assert(@bitOffsetOf(SessionHeader, "backend_legacy") == 14);
+        assert(@bitOffsetOf(SessionHeader, "backend") == 377);
         // Ensure started_at and finished_at can hold timestamps until year ~10889.
         assert(@bitSizeOf(@TypeOf(@as(SessionHeader, undefined).started_at)) == 40);
         assert(@bitSizeOf(@TypeOf(@as(SessionHeader, undefined).finished_at)) == 40);

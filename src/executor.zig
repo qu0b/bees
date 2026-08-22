@@ -149,7 +149,7 @@ pub fn runRole(
         .allowed_tools = if (perms) |p| if (p.allowed_tools.len > 0) p.allowed_tools else null else null,
         .disallowed_tools = if (perms) |p| if (p.disallowed_tools.len > 0) p.disallowed_tools else null else null,
         .extra_env = extra_env,
-    }, session_id, allocator, cfg.claude_binary, cfg.pi_binary) catch |e| {
+    }, session_id, allocator, cfg.claude_binary, cfg.pi_binary, cfg.dsh_binary) catch |e| {
         logger.err("[{s}] session failed: {}", .{ role_name, e });
         // Mark session as error so it doesn't stay stale as "running".
         var err_header = header;
