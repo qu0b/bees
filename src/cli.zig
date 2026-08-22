@@ -20,6 +20,7 @@ pub const Command = union(enum) {
     config: OutputOptions,
     tasks: OutputOptions,
     tasks_sync: struct { file: ?[]const u8 = null },
+    tasks_reset: struct { name: ?[]const u8 = null },
     sync,
     sessions: struct { session_type: ?types.SessionType = null, json: bool = false, limit: u32 = 50 },
     session: struct { id: u64, json: bool = false },
@@ -89,6 +90,10 @@ pub fn parse(args: []const []const u8) !Command {
         if (args.len >= 3 and std.mem.eql(u8, args[2], "sync")) {
             const file = if (args.len >= 4) args[3] else null;
             return .{ .tasks_sync = .{ .file = file } };
+        }
+        if (args.len >= 3 and std.mem.eql(u8, args[2], "reset")) {
+            const name = if (args.len >= 4) args[3] else null;
+            return .{ .tasks_reset = .{ .name = name } };
         }
         return .{ .tasks = .{ .json = hasFlag(args[2..], "--json") } };
     }

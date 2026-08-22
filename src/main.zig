@@ -394,6 +394,7 @@ fn runCommand(cmd: cli.Command, arena: std.mem.Allocator, io: Io, stdout: *Io.Wr
         .config => |opts| try cmdConfig(arena, stdout, opts.json),
         .tasks => |opts| try cmdTasks(arena, stdout, opts.json),
         .tasks_sync => |opts| try cmdTasksSync(arena, stdout, opts.file),
+        .tasks_reset => |opts| try cmdTasksReset(arena, stdout, opts.name),
         .sync => try cmdSync(arena, stdout),
         .sessions => |opts| try cmdSessions(arena, stdout, opts.session_type, opts.json, opts.limit),
         .session => |opts| try cmdSession(arena, stdout, opts.id, opts.json),
@@ -2243,6 +2244,93 @@ fn cmdTasksSync(arena: std.mem.Allocator, stdout: *Io.Writer, file: ?[]const u8)
     try stdout.print("Tasks synced to LMDB from {s}\n", .{tasks_path});
 }
 
+/// `bees tasks reset [name]` — clear a task's run history and make it active.
+///
+/// With no name it resets only the tasks named in the CURRENT tasks.json. The
+/// store also holds every task the project ever had, retired long ago because
+/// it was genuinely finished; reactivating those sends workers to redo shipped
+/// work (a bare reset here reactivated 79 of them, including validation work
+/// completed months earlier).
+///
+/// A task retires itself once it has run enough times without ever being
+/// accepted. That verdict is only as good as the pipeline that produced it:
+/// when chatplugin's workers were silently discarding their work, every task
+/// they touched accumulated "3 runs, 0 accepted" and retired on evidence about
+/// the swarm, not about the task. Re-running such a task needs its counters
+/// cleared, and re-wording its name to force a fresh row would fork the history
+/// rather than fix it.
+fn cmdTasksReset(arena: std.mem.Allocator, stdout: *Io.Writer, name: ?[]const u8) !void {
+    const project = try loadProject(arena);
+    const paths = project[1];
+
+    var store = try store_mod.Store.open(paths.db_dir);
+    defer store.close();
+
+    // Scope of a nameless reset: exactly what tasks.json asks for today.
+    const current: ?tasks_mod.TaskPool = if (name == null)
+        tasks_mod.TaskPool.load(arena, paths.tasks_file) catch null
+    else
+        null;
+    if (name == null and current == null) {
+        try stdout.print("Cannot read {s} — name a single task to reset instead.\n", .{paths.tasks_file});
+        return;
+    }
+
+    // Collect first, write second: the read iterator's slices point into the
+    // mmap and a write in the same pass would invalidate them.
+    var names: std.ArrayList([]const u8) = .empty;
+    var prompts: std.ArrayList([]const u8) = .empty;
+    var headers: std.ArrayList(types.TaskHeader) = .empty;
+    {
+        const txn = try store.beginReadTxn();
+        defer store_mod.Store.abortTxn(txn);
+        var iter = try store.iterTasks(txn);
+        defer iter.close();
+        while (iter.next()) |entry| {
+            if (name) |want| {
+                if (!std.mem.eql(u8, want, entry.name)) continue;
+            } else if (current) |pool| {
+                var listed = false;
+                for (pool.tasks) |t| {
+                    if (std.mem.eql(u8, t.name, entry.name)) {
+                        listed = true;
+                        break;
+                    }
+                }
+                if (!listed) continue;
+            }
+            var header = entry.view.header;
+            if (header.total_runs == 0 and header.status == .active) continue;
+            header.total_runs = 0;
+            header.accepted = 0;
+            header.rejected = 0;
+            header.empty = 0;
+            header.status = .active;
+            try names.append(arena, try arena.dupe(u8, entry.name));
+            try prompts.append(arena, try arena.dupe(u8, entry.view.prompt));
+            try headers.append(arena, header);
+        }
+    }
+
+    if (names.items.len == 0) {
+        if (name) |want| {
+            try stdout.print("No task named \"{s}\" needed a reset.\n", .{want});
+        } else {
+            try stdout.print("No tasks needed a reset.\n", .{});
+        }
+        return;
+    }
+
+    var txn = try store.beginWriteTxn();
+    for (names.items, prompts.items, headers.items) |n, prompt, header| {
+        try store.upsertTask(txn, n, header, prompt);
+        try stdout.print("  reset {s}\n", .{n});
+    }
+    try store_mod.Store.commitTxnConsume(&txn);
+
+    try stdout.print("{d} task(s) reset to active with no run history.\n", .{names.items.len});
+}
+
 fn cmdSync(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
     const project = try loadProject(arena);
     const paths = project[1];
@@ -2901,7 +2989,8 @@ fn printUsage(stdout: *Io.Writer) !void {
         \\  log [--follow]           Show log
         \\  config [--json]          Show config
         \\  tasks [--json]           List tasks (from LMDB if available)
-        \\  tasks sync [file]       Sync tasks.json into LMDB
+        \\  tasks sync [file]        Sync tasks.json into LMDB
+        \\  tasks reset [name]       Clear task run history (all or one) and reactivate
         \\  sync                     Sync LMDB data to SQLite replica
         \\  sessions [--type X] [--limit N] [--json]  List sessions
         \\  session <id> [--json]    Show session detail (--json includes raw event data)
