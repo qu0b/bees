@@ -308,7 +308,7 @@ fn handleSession(w: *Io.Writer, store: *store_mod.Store, id: u64) !void {
             }
         }
         try w.print(",\"raw\":", .{});
-        try w.writeAll(ev.raw_json);
+        try claude.writeValidUtf8(w, ev.raw_json);
 
         try w.print("}}", .{});
     }

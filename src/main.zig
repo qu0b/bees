@@ -2945,7 +2945,7 @@ fn cmdSession(arena: std.mem.Allocator, stdout: *Io.Writer, id: u64, json: bool)
             }
             // Include raw JSON for full event data
             try stdout.print(",\"raw\":", .{});
-            try stdout.writeAll(ev.raw_json);
+            try claude.writeValidUtf8(stdout, ev.raw_json);
             // Extract text preview for message and tool_result events
             {
                 const text_preview: ?[]const u8 = blk: {
@@ -2968,7 +2968,10 @@ fn cmdSession(arena: std.mem.Allocator, stdout: *Io.Writer, id: u64, json: bool)
                 };
                 if (text_preview) |text| {
                     const max_len: usize = 200;
-                    const preview = if (text.len > max_len) text[0..max_len] else text;
+                    // Codepoint-safe: a plain byte cut here put a half
+                    // character into the document and made the whole session
+                    // undecodable by python/jq/the dashboard.
+                    const preview = claude.utf8TruncateBytes(text, max_len);
                     try stdout.print(",\"message\":\"", .{});
                     for (preview) |ch| {
                         switch (ch) {

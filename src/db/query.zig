@@ -7,6 +7,7 @@ const std = @import("std");
 const Io = std.Io;
 const sqlite = @import("sqlite.zig");
 const types = @import("../types.zig");
+const claude = @import("../claude.zig");
 
 // ============================================================================
 // Sessions
@@ -168,7 +169,10 @@ pub fn writeSessionEventsJson(db: *sqlite.Db, w: *Io.Writer, session_id: u64) !v
             try w.print(",\"role\":\"{s}\"", .{role.label()});
         }
         try w.print(",\"raw\":", .{});
-        try w.writeAll(stmt.columnText(5)); // raw_json is already valid JSON
+        // NOT assumed valid: an agent CLI that truncates a long value can cut a
+        // codepoint in half, and one such byte made the whole document
+        // undecodable by python/jq/the dashboard.
+        try claude.writeValidUtf8(w, stmt.columnText(5));
         try w.writeAll("}");
     }
     try w.writeAll("]");

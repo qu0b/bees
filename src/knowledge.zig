@@ -492,14 +492,9 @@ fn extractSummary(content: []const u8) []const u8 {
 }
 
 /// Truncate `s` to at most `max` bytes without splitting a UTF-8 codepoint.
-fn utf8TruncateBytes(s: []const u8, max: usize) []const u8 {
-    if (s.len <= max) return s;
-    var end = max;
-    // Back up while `s[end]` is a UTF-8 continuation byte (0b10xxxxxx), so the
-    // cut lands before the start of the codepoint it would have split.
-    while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
-    return s[0..end];
-}
+/// Lives in `claude.zig` so every byte-capped path shares one implementation —
+/// the CLI's event previews had their own naive cut and reintroduced the bug.
+const utf8TruncateBytes = claude.utf8TruncateBytes;
 
 fn getDefaultTags(path: []const u8, allocator: std.mem.Allocator) []const []const u8 {
     // Derive tag from first directory component: "architecture/foo.md" → ["architecture"]

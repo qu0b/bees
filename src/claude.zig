@@ -689,3 +689,59 @@ test "findJsonNumberValue" {
     try std.testing.expect(val != null);
     try std.testing.expectApproxEqAbs(@as(f64, 2.34), val.?, 0.001);
 }
+
+/// Write stored event bytes, substituting U+FFFD for anything that is not
+/// valid UTF-8.
+///
+/// Events are stored exactly as the agent CLI emitted them, and a CLI that
+/// truncates a long value (a base64 image, say) can cut a multi-byte codepoint
+/// in half. Passing those bytes straight through made the whole `bees session
+/// --json` document undecodable by python, jq and the dashboard — one bad byte
+/// in one event lost the entire session. The JSON we emit is ours to keep
+/// well-formed, whatever arrived.
+pub fn writeValidUtf8(w: *Io.Writer, bytes: []const u8) !void {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const len = std.unicode.utf8ByteSequenceLength(bytes[i]) catch {
+            try w.writeAll("\u{FFFD}");
+            i += 1;
+            continue;
+        };
+        if (i + len > bytes.len or !std.unicode.utf8ValidateSlice(bytes[i..][0..len])) {
+            try w.writeAll("\u{FFFD}");
+            i += 1;
+            continue;
+        }
+        try w.writeAll(bytes[i..][0..len]);
+        i += len;
+    }
+}
+
+test "writeValidUtf8 replaces a split codepoint and keeps valid text" {
+    var buf: [64]u8 = undefined;
+    var w = Io.Writer.fixed(&buf);
+    // "ok" + a lone 0xEF (the first byte of a 3-byte sequence, truncated).
+    try writeValidUtf8(&w, "ok\xef");
+    const out = w.buffered();
+    try std.testing.expect(std.unicode.utf8ValidateSlice(out));
+    try std.testing.expect(std.mem.startsWith(u8, out, "ok"));
+
+    var buf2: [64]u8 = undefined;
+    var w2 = Io.Writer.fixed(&buf2);
+    try writeValidUtf8(&w2, "caf\u{00e9} ☕");
+    try std.testing.expectEqualStrings("caf\u{00e9} ☕", w2.buffered());
+}
+
+/// Truncate `s` to at most `max` bytes without splitting a UTF-8 codepoint.
+///
+/// Any byte-capped path must use this. A plain `s[0..max]` can cut a
+/// multi-byte character in half, and the half-character then travels into
+/// stored records and JSON output that no decoder will accept.
+pub fn utf8TruncateBytes(s: []const u8, max: usize) []const u8 {
+    if (s.len <= max) return s;
+    var end = max;
+    // Back up while `s[end]` is a UTF-8 continuation byte (0b10xxxxxx), so the
+    // cut lands before the start of the codepoint it would have split.
+    while (end > 0 and (s[end] & 0xC0) == 0x80) end -= 1;
+    return s[0..end];
+}
