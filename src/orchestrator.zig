@@ -17,6 +17,9 @@ const workflow_mod = @import("workflow.zig");
 const executor = @import("executor.zig");
 const sync_mod = @import("db/sync.zig");
 const api = @import("api.zig");
+/// How often the idle refill re-reads tasks.json when nothing is running.
+const idle_refill_interval_secs: u64 = 60;
+
 const MAX_WORKERS = 32;
 
 const backend = @import("backend.zig");
@@ -684,6 +687,10 @@ pub fn run(
     // Main loop — polls via cooperative sleep
     var was_quiet = false;
     var consecutive_empty_merges: u32 = 0;
+    // Idle-refill throttle: the check re-reads tasks.json, so it runs on its
+    // own interval rather than on every 10s poll.
+    var last_idle_refill: u64 = 0;
+    var idle_reported = false;
     while (@atomicLoad(u32, &state.shutdown_requested, .acquire) == 0) {
         sleepInterruptible(io, &state, 10);
 
@@ -981,6 +988,44 @@ pub fn run(
                 }
             } else {
                 logger.warn("[daemon] no active tasks, skipping worker spawn — waiting for next cycle", .{});
+            }
+        }
+
+        // ── Idle refill ────────────────────────────────────────────────────
+        // Every spawn path above lives inside the merge-threshold block, so a
+        // cycle that ends with no workers running and `done_count` below the
+        // threshold could never start another: nothing would raise done_count,
+        // and the daemon polled every 10s doing nothing, silently, forever.
+        // On 2026-08-22 that stranded chatplugin for an hour after a broken
+        // tasks.json emptied the pool — and it would have outlasted both the
+        // repaired tasks and the ceiling's midnight reset.
+        //
+        // Re-reads tasks.json first: the reason the pool is empty is usually
+        // that the file was bad or exhausted, and both get fixed on disk.
+        if (@atomicLoad(u32, &state.active_count, .acquire) == 0 and
+            current_done < cfg.merger.merge_threshold and
+            @atomicLoad(u32, &state.shutdown_requested, .acquire) == 0)
+        {
+            const now_s: u64 = fs.timestamp();
+            if (now_s -| last_idle_refill >= idle_refill_interval_secs) {
+                last_idle_refill = now_s;
+                tasks_mod.syncFromFile(store, paths.tasks_file, .template, allocator) catch {};
+                reloadPool(&pool, store, paths.tasks_file, allocator);
+
+                if (pool.hasActiveTasks() and !dailyCeilingReached(cfg, store, logger, &state)) {
+                    const need_idle = @min(cfg.workers.count, MAX_WORKERS);
+                    logger.info("[daemon] idle with work available — spawning {d} worker(s)", .{need_idle});
+                    for (0..need_idle) |_| {
+                        spawnWorker(cfg, paths, store, pool, logger, io, allocator, &state, context_blob);
+                    }
+                } else if (!pool.hasActiveTasks() and !idle_reported) {
+                    // Say it once, not every interval: an idle daemon with no
+                    // work is a normal resting state, but a silent one is
+                    // indistinguishable from a wedged one.
+                    logger.info("[daemon] idle — no active tasks; waiting for tasks.json or the strategist", .{});
+                    idle_reported = true;
+                }
+                if (pool.hasActiveTasks()) idle_reported = false;
             }
         }
     }
