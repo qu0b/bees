@@ -842,6 +842,12 @@ pub fn run(
                 // Conditional steps
                 if (std.mem.eql(u8, step.condition, "tool_errors")) {
                     if (@atomicLoad(u32, &state.sre_trigger_count, .acquire) == 0) continue;
+                    // Diagnosis is discretionary spend like any other role: it
+                    // ran outside the ceiling and pushed chatplugin $32 past a
+                    // $250 limit while the log said "not spawning more".
+                    // The merger stays the only exemption, because it lands
+                    // work already paid for.
+                    if (dailyCeilingReached(cfg, store, logger, &state)) continue;
                     drainSreTriggers(cfg, paths, store, logger, io, allocator, &state);
                     continue;
                 }
@@ -917,8 +923,11 @@ pub fn run(
                 runRoleJobs(dependent_jobs[0..dependent_n], cfg, paths, store, logger, io, allocator, seed_uuid, 1);
             }
 
-            // Drain any remaining SRE triggers not handled by workflow
-            drainSreTriggers(cfg, paths, store, logger, io, allocator, &state);
+            // Drain any remaining SRE triggers not handled by workflow — same
+            // ceiling rule as the workflow step above.
+            if (!dailyCeilingReached(cfg, store, logger, &state)) {
+                drainSreTriggers(cfg, paths, store, logger, io, allocator, &state);
+            }
 
             // Clean up leaked Chrome renderer processes between cycles
             backend.cleanupChrome(io);
