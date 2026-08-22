@@ -349,24 +349,32 @@ fn maxWorkerBudget(cfg: config_mod.Config) f64 {
 /// before a $100 ceiling first tripped. Counting what in-flight sessions may
 /// still spend turns an unbounded overshoot into one bounded by the budgets
 /// already committed.
+fn ceilingExceeded(cfg: config_mod.Config, store: *store_mod.Store, state: *const DaemonState) ?struct { settled: f64, committed: f64, in_flight: u32 } {
+    if (cfg.daemon.max_daily_usd <= 0) return null;
+
+    const now: u64 = fs.timestamp();
+    const day_start = now - @mod(now, 86400);
+    const txn = store.beginReadTxn() catch return null;
+    defer store_mod.Store.abortTxn(txn);
+    const stats = store.getDailyStats(txn, day_start) catch return null;
+
+    const settled = @as(f64, @floatFromInt(stats.total_cost_cents)) / 100.0;
+    const in_flight = @atomicLoad(u32, &state.active_count, .acquire);
+    const committed = @as(f64, @floatFromInt(in_flight)) * maxWorkerBudget(cfg);
+    if (settled + committed < cfg.daemon.max_daily_usd) return null;
+    return .{ .settled = settled, .committed = committed, .in_flight = in_flight };
+}
+
 fn dailyCeilingReached(
     cfg: config_mod.Config,
     store: *store_mod.Store,
     logger: *log_mod.Logger,
     state: *const DaemonState,
 ) bool {
-    if (cfg.daemon.max_daily_usd <= 0) return false;
-
-    const now: u64 = fs.timestamp();
-    const day_start = now - @mod(now, 86400);
-    const txn = store.beginReadTxn() catch return false;
-    defer store_mod.Store.abortTxn(txn);
-    const stats = store.getDailyStats(txn, day_start) catch return false;
-
-    const settled = @as(f64, @floatFromInt(stats.total_cost_cents)) / 100.0;
-    const in_flight = @atomicLoad(u32, &state.active_count, .acquire);
-    const committed = @as(f64, @floatFromInt(in_flight)) * maxWorkerBudget(cfg);
-    if (settled + committed < cfg.daemon.max_daily_usd) return false;
+    const over = ceilingExceeded(cfg, store, state) orelse return false;
+    const settled = over.settled;
+    const committed = over.committed;
+    const in_flight = over.in_flight;
 
     logger.warn(
         "[daemon] daily ceiling reached: ${d:.2} settled + ${d:.2} committed to {d} in-flight session(s) >= ${d:.2} — not spawning more (lower spend, edit daemon.max_daily_usd, or wait for UTC midnight)",
@@ -1097,6 +1105,14 @@ fn spawnWorker(
     state: *DaemonState,
     ctx_blob: ?[]const u8,
 ) void {
+    // The one place every spawn passes through. Gating call sites individually
+    // meant finding them one at a time: the startup batch, the post-merge
+    // overlap refill and the SRE drain each spent past the ceiling on a
+    // different day, while the same cycle logged "not spawning more". A caller
+    // that already checked simply sees this as a no-op; the warning stays with
+    // the callers so it is not repeated once per attempted worker.
+    if (ceilingExceeded(cfg, store, state) != null) return;
+
     const wid = @atomicRmw(u32, &state.next_worker_id, .Add, 1, .monotonic);
     _ = @atomicRmw(u32, &state.active_count, .Add, 1, .release);
 
