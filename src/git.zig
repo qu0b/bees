@@ -121,6 +121,9 @@ pub fn commitLeftovers(allocator: std.mem.Allocator, io: Io, worktree_dir: []con
         if (!std.mem.startsWith(u8, line, "??")) continue;
         const path = std.mem.trim(u8, line[2..], &std.ascii.whitespace);
         if (path.len == 0) continue;
+        // Our own session bookkeeping, written into the worktree — never the
+        // project's files, and a sweep once carried them onto main.
+        if (std.mem.eql(u8, path, ".done") or std.mem.eql(u8, path, ".session-id")) continue;
         if (!looksTextual(allocator, worktree_dir, path)) continue;
         const add_one = run(allocator, io, &.{ "git", "add", "--", path }, worktree_dir) catch continue;
         allocator.free(add_one.stdout);
