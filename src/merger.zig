@@ -267,6 +267,13 @@ const RoleOpts = struct {
     perms: ?role_mod.security_profiles.ToolPermissions,
     /// "" → caller's default prompt path.
     prompt_path: []const u8,
+    /// The role's own backend ("" → cfg.merger.backend). Model and backend
+    /// MUST come from the same config: taking the model from the role while
+    /// the backend came from cfg.merger sent `local-llm/starflinger-anthropic`
+    /// — a pi provider route — to the gateway, which 400'd every review with
+    /// "Invalid model name passed in". Reviews perform the merges, so that
+    /// mismatch is a silently zeroed pipeline.
+    backend: []const u8 = "",
 };
 
 fn roleOpts(
@@ -281,6 +288,7 @@ fn roleOpts(
         .budget = m.max_budget_usd,
         .perms = null,
         .prompt_path = "",
+        .backend = m.backend,
     };
     return .{
         .model = rc.model,
@@ -289,6 +297,8 @@ fn roleOpts(
         .max_turns = rc.max_turns,
         .perms = rc.resolvePermissions() orelse fallback_perms,
         .prompt_path = rc.prompt_path,
+        // Falls back to the merger's backend only when the role names none.
+        .backend = if (rc.backend.len > 0) rc.backend else m.backend,
     };
 }
 
@@ -324,7 +334,7 @@ fn reviewAndMerge(
 
     const merger_model = types.ModelType.fromString(opts.model);
     const now: u64 = fs.timestamp();
-    const review_bt = backend.resolveBackend(cfg.default_backend, cfg.merger.backend);
+    const review_bt = backend.resolveBackend(cfg.default_backend, opts.backend);
     const header = types.SessionHeader{
         .type = .review,
         .status = .running,
@@ -567,7 +577,9 @@ fn runBuildStep(
         .has_tokens = false,
         .has_duration = false,
         .has_diff_summary = false,
-        .backend = backend.resolveBackend(cfg.default_backend, cfg.merger.backend),
+        // Same pairing rule as review: the backend comes from whichever config
+        // supplied the model.
+        .backend = backend.resolveBackend(cfg.default_backend, opts.backend),
         .worker_id = 0,
         .commit_count = 0,
         .num_turns = 0,
@@ -866,6 +878,38 @@ fn updateWorkerStatus(store: *store_mod.Store, worker_session_id: u64, new_statu
     var updated_header = session.header;
     updated_header.status = new_status;
     try store.updateSessionStatus(worker_session_id, .done, old_started_at, updated_header);
+}
+
+test "roleOpts takes the backend from whichever config supplied the model" {
+    // A review role on pi carries a provider-qualified model. If the backend
+    // still came from cfg.merger, that model reached the gateway and every
+    // review 400'd with "Invalid model name passed in" — reviews perform the
+    // merges, so the pipeline silently stopped landing anything.
+    var set = role_mod.RoleSet{
+        .roles = std.StringHashMap(role_mod.RoleConfig).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+    defer set.roles.deinit();
+    try set.roles.put("review", .{
+        .name = "review",
+        .model = "local-llm/starflinger-anthropic",
+        .backend = "pi",
+    });
+
+    const m = config_mod.Config.Merger{ .model = "opus", .backend = "" };
+    const r = roleOpts(set, "review", m, null);
+    try std.testing.expectEqualStrings("local-llm/starflinger-anthropic", r.model);
+    try std.testing.expectEqualStrings("pi", r.backend);
+
+    // A role that names no backend still inherits the merger's.
+    var plain = role_mod.RoleSet{
+        .roles = std.StringHashMap(role_mod.RoleConfig).init(std.testing.allocator),
+        .allocator = std.testing.allocator,
+    };
+    defer plain.roles.deinit();
+    try plain.roles.put("review", .{ .name = "review", .model = "opus" });
+    const inherited = roleOpts(plain, "review", .{ .model = "opus", .backend = "codex" }, null);
+    try std.testing.expectEqualStrings("codex", inherited.backend);
 }
 
 test "roleOpts honors role config.json and sandboxes review with a merge-capable profile" {
