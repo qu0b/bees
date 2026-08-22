@@ -93,6 +93,24 @@ const worker = ToolPermissions{
         "Bash(test *)",
         "Bash(echo *)",
         "Bash(cd *)",
+        // Read-only text tools, added 2026-08-22 after workers spent turns
+        // being refused `sed`, `awk` and `which` while `cat`, `head`, `grep`
+        // and `sort` were already allowed. They grant no capability the role
+        // lacks — it already has Read/Edit/Write — and their absence only
+        // taught agents to burn budget rediscovering the boundary.
+        "Bash(sed *)",
+        "Bash(awk *)",
+        "Bash(which *)",
+        "Bash(grep *)",
+        "Bash(rg *)",
+        "Bash(cut *)",
+        "Bash(tr *)",
+        "Bash(uniq *)",
+        "Bash(basename *)",
+        "Bash(dirname *)",
+        "Bash(env)",
+        "Bash(printf *)",
+        "Bash(jq *)",
         // NOTE: `Bash(sh *)` deliberately omitted — it would let a worker run
         // `sh -c "curl … | sh"`, bypassing every disallow rule below. Project
         // build/setup commands are executed by the daemon itself, not the agent.
