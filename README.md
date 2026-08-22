@@ -28,7 +28,8 @@ All roles are configurable — model, effort level, budget cap, security profile
 - **LMDB** — zero-copy mmap reads, bit-packed records (48B session headers, 4B event headers)
 - **SQLite** — WAL-mode read replica synced from LMDB for queryable analytics
 - **DuckDB** — runtime dlopen, ATTACHes SQLite for analytical queries
-- **Multi-backend** — Claude CLI (primary), OpenAI Codex, OpenCode, Pi. Configurable per-role
+- **Multi-backend** — Claude CLI (primary), OpenAI Codex, OpenCode, Pi, DeepSeek Harness
+  (`dsh`). Configurable per-role
 - **Knowledge base** — persistent institutional memory that agents read before acting and write back what they learn
 
 Data model uses packed structs with comptime size assertions, integer microdollars for costs, u40 unix timestamps, sentinel values over optionals. Zero-copy everywhere.
@@ -131,3 +132,31 @@ Knowledge is organized by category (architecture, components, contracts, decisio
 ## License
 
 MIT
+
+## DeepSeek Harness (`dsh`) backend
+
+Set a role's `backend` to `dsh` to run it on the [DeepSeek
+Harness](https://github.com/deepseek-ai/deepseek-harness):
+
+```json
+{ "backend": "dsh", "model": "headless", "max_budget_usd": 0 }
+```
+
+`model` names a dsh **profile**, not a model id — bees runs `dsh --profile
+<model> "<task>"`, and anything that is not a plain profile name (an empty
+value, or a gateway model id like `local-llm/foo`) falls back to `headless`,
+the profile that answers one task and exits. The model itself is chosen by the
+profile's own Cordis config, and credentials come from the launching
+environment: `DEEPSEEK_API_KEY`, optionally `DEEPSEEK_BASE_URL`. Without a key
+dsh exits with `MISSING_CREDENTIAL` and `bees doctor --probe` reports the role
+as failed.
+
+Set `dsh_binary` in `config.json` if `dsh` is not on PATH — a repo checkout
+runs it as `pnpm dsh`.
+
+**A dsh session reports no cost and no turn count.** The harness prints only
+the final assistant text; its JSONL event stream is test-only infrastructure
+its own docs decline to support, so bees does not parse it. Such sessions store
+`cost unknown` rather than a fabricated `$0`, which means **per-session budgets
+and the daily ceiling cannot bound a dsh role** — bound its spend at the
+provider instead.
