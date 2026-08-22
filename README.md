@@ -154,6 +154,29 @@ as failed.
 Set `dsh_binary` in `config.json` if `dsh` is not on PATH — a repo checkout
 runs it as `pnpm dsh`.
 
+**No DeepSeek key?** The headless profile also ships the `llm-pi-ai` adapter,
+whose routes are plain provider declarations — so a profile patch can point dsh
+at any gateway. Put this in `$DSH_HOME/profiles/headless/cordis.patch.yml`
+(applied to every run of that profile, no extra flags):
+
+```yaml
+- id: llm-pi-ai
+  config:
+    providers:
+      my-gateway:
+        apiKeyEnv: LITELLM_API_KEY
+        api: anthropic-messages
+        baseURL: http://gateway.example:4000
+        models:
+          - id: my-model
+            contextWindow: 600000
+            maxTokens: 32000
+- id: agent-default-model
+  config:
+    provider: my-gateway
+    model: my-model
+```
+
 **A dsh session reports no cost and no turn count.** The harness prints only
 the final assistant text; its JSONL event stream is test-only infrastructure
 its own docs decline to support, so bees does not parse it. Such sessions store
