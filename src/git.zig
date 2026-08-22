@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const fs = @import("fs.zig");
 
 pub const GitResult = struct {
     stdout: []const u8,
@@ -74,6 +75,19 @@ pub fn deleteBranch(allocator: std.mem.Allocator, io: Io, repo_path: []const u8,
     allocator.free(result.stderr);
 }
 
+/// Whether a worktree file reads as text: no NUL byte in the first 8 KiB, the
+/// same heuristic git uses to call a file binary. Unreadable files are treated
+/// as non-text, so a sweep never guesses.
+fn looksTextual(allocator: std.mem.Allocator, worktree_dir: []const u8, rel_path: []const u8) bool {
+    // A directory entry ("dir/") in porcelain output: let git expand it.
+    if (std.mem.endsWith(u8, rel_path, "/")) return true;
+    const full = std.fs.path.join(allocator, &.{ worktree_dir, rel_path }) catch return false;
+    defer allocator.free(full);
+    const data = fs.readFileAlloc(allocator, full, 8 * 1024) catch return false;
+    defer allocator.free(data);
+    return std.mem.indexOfScalar(u8, data, 0) == null;
+}
+
 /// Commit everything left in a worker's worktree, on its own branch.
 ///
 /// Workers are told to commit and often simply don't: on chatplugin 2026-08-19,
@@ -90,10 +104,36 @@ pub fn commitLeftovers(allocator: std.mem.Allocator, io: Io, worktree_dir: []con
     defer allocator.free(status.stderr);
     if (std.mem.trim(u8, status.stdout, &std.ascii.whitespace).len == 0) return false;
 
-    const add = try run(allocator, io, &.{ "git", "add", "-A" }, worktree_dir);
-    allocator.free(add.stdout);
-    allocator.free(add.stderr);
-    if (add.exit_code != 0) return false;
+    // Stage tracked edits, plus untracked TEXT files only. A worker's real work
+    // is source; the untracked binaries left in a worktree are artifacts whose
+    // .gitignore has not caught up (the first sweep on chatplugin committed
+    // nothing but SQLite WAL/SHM sidecars, which would have cost a merger
+    // review to judge as noise).
+    {
+        const add = try run(allocator, io, &.{ "git", "add", "-u" }, worktree_dir);
+        defer allocator.free(add.stdout);
+        defer allocator.free(add.stderr);
+        if (add.exit_code != 0) return false;
+    }
+    var lines = std.mem.splitScalar(u8, status.stdout, '\n');
+    while (lines.next()) |line| {
+        if (line.len < 4) continue;
+        if (!std.mem.startsWith(u8, line, "??")) continue;
+        const path = std.mem.trim(u8, line[2..], &std.ascii.whitespace);
+        if (path.len == 0) continue;
+        if (!looksTextual(allocator, worktree_dir, path)) continue;
+        const add_one = run(allocator, io, &.{ "git", "add", "--", path }, worktree_dir) catch continue;
+        allocator.free(add_one.stdout);
+        allocator.free(add_one.stderr);
+    }
+
+    // Nothing worth a commit once the artifacts are excluded.
+    {
+        const staged = try run(allocator, io, &.{ "git", "diff", "--cached", "--name-only" }, worktree_dir);
+        defer allocator.free(staged.stdout);
+        defer allocator.free(staged.stderr);
+        if (std.mem.trim(u8, staged.stdout, &std.ascii.whitespace).len == 0) return false;
+    }
 
     // The message says who made it, so a human reading `git log` can tell a
     // swept commit from one the worker chose to make.
