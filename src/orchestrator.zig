@@ -705,6 +705,7 @@ pub fn run(
     // own interval rather than on every 10s poll.
     var last_idle_refill: u64 = 0;
     var idle_reported = false;
+    var ceiling_reported = false;
     while (@atomicLoad(u32, &state.shutdown_requested, .acquire) == 0) {
         sleepInterruptible(io, &state, 10);
 
@@ -1035,7 +1036,18 @@ pub fn run(
                 tasks_mod.syncFromFile(store, paths.tasks_file, .template, allocator) catch {};
                 reloadPool(&pool, store, paths.tasks_file, allocator);
 
-                if (pool.hasActiveTasks() and !dailyCeilingReached(cfg, store, logger, &state)) {
+                const over_ceiling = ceilingExceeded(cfg, store, &state) != null;
+                if (over_ceiling and !ceiling_reported) {
+                    // Say it once per stretch, not once per check: this runs
+                    // every 60s and would otherwise bury a night's log in
+                    // hundreds of identical lines, hiding the events the log
+                    // exists to show.
+                    _ = dailyCeilingReached(cfg, store, logger, &state);
+                    ceiling_reported = true;
+                } else if (!over_ceiling) {
+                    ceiling_reported = false;
+                }
+                if (pool.hasActiveTasks() and !over_ceiling) {
                     const need_idle = @min(cfg.workers.count, MAX_WORKERS);
                     logger.info("[daemon] idle with work available — spawning {d} worker(s)", .{need_idle});
                     for (0..need_idle) |_| {
