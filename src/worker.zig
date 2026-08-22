@@ -350,6 +350,13 @@ fn runWorkerImpl(
         if (result.claude_session_id.len > 0) allocator.free(result.claude_session_id);
     }
 
+    // Sweep anything the worker edited but never committed onto its branch —
+    // otherwise the branch is empty, the merger sees nothing, and the session's
+    // whole spend is discarded. The merger still judges what lands here.
+    if (git.commitLeftovers(allocator, io, worktree_dir, task_name) catch false) {
+        logger.warn("[worker:{d}] swept uncommitted changes into a commit — the agent left them behind", .{worker_id});
+    }
+
     // Count commits
     const commits = git.getCommitsAhead(allocator, io, paths.root, branch_name, cfg.project.base_branch) catch 0;
     // A branch the merger has yet to judge keeps the task claimed.

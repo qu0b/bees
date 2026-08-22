@@ -74,6 +74,38 @@ pub fn deleteBranch(allocator: std.mem.Allocator, io: Io, repo_path: []const u8,
     allocator.free(result.stderr);
 }
 
+/// Commit everything left in a worker's worktree, on its own branch.
+///
+/// Workers are told to commit and often simply don't: on chatplugin 2026-08-19,
+/// 82 worker sessions produced 66 branches that were all 0 commits ahead, while
+/// their worktrees held real edits (one had 635 insertions across 16 files, and
+/// it compiled). The work was done, paid for, and then thrown away because the
+/// merger only ever sees commits. Sweeping the tree turns that silent loss into
+/// a candidate the merger can judge — and reject on its merits if it is bad.
+///
+/// Returns true when a commit was actually created (a clean tree makes none).
+pub fn commitLeftovers(allocator: std.mem.Allocator, io: Io, worktree_dir: []const u8, task_name: []const u8) !bool {
+    const status = try run(allocator, io, &.{ "git", "status", "--porcelain" }, worktree_dir);
+    defer allocator.free(status.stdout);
+    defer allocator.free(status.stderr);
+    if (std.mem.trim(u8, status.stdout, &std.ascii.whitespace).len == 0) return false;
+
+    const add = try run(allocator, io, &.{ "git", "add", "-A" }, worktree_dir);
+    allocator.free(add.stdout);
+    allocator.free(add.stderr);
+    if (add.exit_code != 0) return false;
+
+    // The message says who made it, so a human reading `git log` can tell a
+    // swept commit from one the worker chose to make.
+    const message = try std.fmt.allocPrint(allocator, "{s}\n\nSwept by bees: the worker left this uncommitted when its session ended.", .{task_name});
+    defer allocator.free(message);
+
+    const commit = try run(allocator, io, &.{ "git", "commit", "-m", message }, worktree_dir);
+    defer allocator.free(commit.stdout);
+    defer allocator.free(commit.stderr);
+    return commit.exit_code == 0;
+}
+
 pub fn getCommitsAhead(allocator: std.mem.Allocator, io: Io, repo_path: []const u8, branch: []const u8, base: []const u8) !u32 {
     const range = try std.fmt.allocPrint(allocator, "{s}..{s}", .{ base, branch });
     defer allocator.free(range);
