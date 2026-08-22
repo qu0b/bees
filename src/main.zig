@@ -409,6 +409,24 @@ fn getCwd(arena: std.mem.Allocator) ![]const u8 {
     return std.process.currentPathAlloc(fs.io, arena);
 }
 
+/// Load a project WITHOUT activating gateway mode — for commands that only
+/// read local state (status, sessions, tasks, logs, config).
+///
+/// `loadProject` refuses to run at all when `gateway.enabled` is set and the
+/// key is missing from the environment, which is right for anything that
+/// spawns an agent and wrong for anything that prints numbers out of LMDB. It
+/// cost real blindness: the weekend health check runs from a systemd unit,
+/// which does not carry the interactive shell's key, so every `bees status`
+/// it ran exited 1 and the watch logged "spend=unknown" for hours while the
+/// swarm was fine.
+fn loadProjectReadOnly(arena: std.mem.Allocator) !struct { config_mod.Config, config_mod.ProjectPaths } {
+    const cwd = try getCwd(arena);
+    const root = try config_mod.findProjectRoot(arena, cwd) orelse return error.NotABeesProject;
+    const paths = try config_mod.ProjectPaths.init(arena, root);
+    const cfg = try config_mod.load(arena, paths.config_file);
+    return .{ cfg, paths };
+}
+
 fn loadProject(arena: std.mem.Allocator) !struct { config_mod.Config, config_mod.ProjectPaths } {
     const cwd = try getCwd(arena);
     const root = try config_mod.findProjectRoot(arena, cwd) orelse return error.NotABeesProject;
@@ -1637,7 +1655,7 @@ fn installBinary(new_bin: []const u8, dest_path: []const u8) !void {
 }
 
 fn cmdStatus(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
-    const project = try loadProject(arena);
+    const project = try loadProjectReadOnly(arena);
     const cfg = project[0];
     const paths = project[1];
 
@@ -2105,7 +2123,7 @@ fn cmdRunUser(arena: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
 }
 
 fn cmdLog(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
-    const project = try loadProject(arena);
+    const project = try loadProjectReadOnly(arena);
     const paths = project[1];
 
     const log_path = try std.fs.path.join(arena, &.{ paths.logs_dir, "bees.log" });
@@ -2131,7 +2149,7 @@ fn cmdLog(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
 }
 
 fn cmdConfig(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
-    const project = try loadProject(arena);
+    const project = try loadProjectReadOnly(arena);
     const cfg = project[0];
     const paths = project[1];
 
@@ -2157,7 +2175,7 @@ fn cmdConfig(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
 }
 
 fn cmdTasks(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
-    const project = try loadProject(arena);
+    const project = try loadProjectReadOnly(arena);
     const paths = project[1];
 
     // Try LMDB first
@@ -2233,7 +2251,7 @@ fn cmdTasks(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
 }
 
 fn cmdTasksSync(arena: std.mem.Allocator, stdout: *Io.Writer, file: ?[]const u8) !void {
-    const project = try loadProject(arena);
+    const project = try loadProjectReadOnly(arena);
     const cfg = project[0];
     const paths = project[1];
 
@@ -2275,7 +2293,7 @@ fn cmdTasksSync(arena: std.mem.Allocator, stdout: *Io.Writer, file: ?[]const u8)
 ///
 /// It does not touch sessions or branches; it only settles the task row.
 fn cmdTasksRetire(arena: std.mem.Allocator, stdout: *Io.Writer, name: []const u8) !void {
-    const project = try loadProject(arena);
+    const project = try loadProjectReadOnly(arena);
     const paths = project[1];
 
     var store = try store_mod.Store.open(paths.db_dir);
@@ -2341,7 +2359,7 @@ fn daemonOwnsProject(arena: std.mem.Allocator, cfg: config_mod.Config) bool {
 /// cleared, and re-wording its name to force a fresh row would fork the history
 /// rather than fix it.
 fn cmdTasksReset(arena: std.mem.Allocator, stdout: *Io.Writer, name: ?[]const u8) !void {
-    const project = try loadProject(arena);
+    const project = try loadProjectReadOnly(arena);
     const paths = project[1];
 
     var store = try store_mod.Store.open(paths.db_dir);
@@ -2413,7 +2431,7 @@ fn cmdTasksReset(arena: std.mem.Allocator, stdout: *Io.Writer, name: ?[]const u8
 }
 
 fn cmdSync(arena: std.mem.Allocator, stdout: *Io.Writer) !void {
-    const project = try loadProject(arena);
+    const project = try loadProjectReadOnly(arena);
     const paths = project[1];
 
     var store = store_mod.Store.open(paths.db_dir) catch |e| {
@@ -2813,7 +2831,7 @@ fn findJsonStr(data: []const u8, key: []const u8) ?[]const u8 {
 }
 
 fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?types.SessionType, json: bool, limit: u32) !void {
-    const project = try loadProject(arena);
+    const project = try loadProjectReadOnly(arena);
     const paths = project[1];
 
     // LMDB is the authoritative live store; SQLite only catches up on syncAll,
@@ -2901,7 +2919,7 @@ fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?type
 }
 
 fn cmdSession(arena: std.mem.Allocator, stdout: *Io.Writer, id: u64, json: bool) !void {
-    const project = try loadProject(arena);
+    const project = try loadProjectReadOnly(arena);
     const paths = project[1];
 
     const db_path = paths.db_dir;
