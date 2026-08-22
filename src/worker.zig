@@ -339,6 +339,12 @@ fn runWorkerImpl(
         // Every runSession attempt failed to even start (spawn error). Don't
         // leave the session stuck as "running" until the next daemon restart —
         // mark it errored so status queries and slot accounting stay accurate.
+        //
+        // Sweep first: a session that died still leaves whatever the agent had
+        // written, and that is exactly when the work is most likely to be lost.
+        if (git.commitLeftovers(allocator, io, worktree_dir, task_name) catch false) {
+            logger.warn("[worker:{d}] session failed but left changes — swept them onto its branch", .{worker_id});
+        }
         var err_header = header;
         err_header.status = .err;
         err_header.finished_at = @truncate(fs.timestamp());

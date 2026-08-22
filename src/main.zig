@@ -2233,6 +2233,7 @@ fn cmdTasks(arena: std.mem.Allocator, stdout: *Io.Writer, json: bool) !void {
 
 fn cmdTasksSync(arena: std.mem.Allocator, stdout: *Io.Writer, file: ?[]const u8) !void {
     const project = try loadProject(arena);
+    const cfg = project[0];
     const paths = project[1];
 
     fs.makePath(paths.db_dir) catch {};
@@ -2244,13 +2245,39 @@ fn cmdTasksSync(arena: std.mem.Allocator, stdout: *Io.Writer, file: ?[]const u8)
     const tasks_path = file orelse paths.tasks_file;
     try tasks_mod.syncFromFile(&store, tasks_path, .template, arena);
 
-    // Clean up any stale running sessions
-    const cleaned = store.cleanupStaleSessions();
-    if (cleaned > 0) {
-        try stdout.print("Cleaned up {d} stale running sessions\n", .{cleaned});
+    // Clean up stale running sessions — but ONLY when no daemon owns this
+    // project. cleanupStaleSessions marks EVERY .running row as errored with
+    // no liveness check, so running this during a live cycle erases the
+    // bookkeeping of sessions still working (2026-08-22: a `tasks sync` did
+    // exactly that to a worker mid-edit, which then looked like a 0-turn
+    // error and released its task claim).
+    if (daemonOwnsProject(arena, cfg)) {
+        try stdout.print("A daemon is running — leaving in-flight sessions alone.\n", .{});
+    } else {
+        const cleaned = store.cleanupStaleSessions();
+        if (cleaned > 0) {
+            try stdout.print("Cleaned up {d} stale running sessions\n", .{cleaned});
+        }
     }
 
     try stdout.print("Tasks synced to LMDB from {s}\n", .{tasks_path});
+}
+
+/// Whether a live daemon holds this project's lock. The lock file carries the
+/// daemon's pid and `worker.acquireLock` already reclaims it when that process
+/// is gone, so "could not acquire" means a real daemon is running right now.
+fn daemonOwnsProject(arena: std.mem.Allocator, cfg: config_mod.Config) bool {
+    const lock_path = std.fmt.allocPrint(arena, "/tmp/bees-{s}-daemon.lock", .{cfg.project.name}) catch return false;
+    defer arena.free(lock_path);
+    if (!fs.access(lock_path)) return false;
+    // Acquiring would create the file and make US the owner; probe instead.
+    const file = fs.openFile(lock_path) catch return false;
+    defer fs.closeFile(file);
+    var pid_buf: [32]u8 = undefined;
+    const len = fs.readAll(file, &pid_buf) catch return false;
+    const pid_str = std.mem.trim(u8, pid_buf[0..len], &std.ascii.whitespace);
+    const pid = std.fmt.parseInt(std.c.pid_t, pid_str, 10) catch return false;
+    return std.c.kill(pid, @enumFromInt(0)) == 0;
 }
 
 /// `bees tasks reset [name]` — clear a task's run history and make it active.
