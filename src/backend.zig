@@ -312,6 +312,11 @@ pub const ResultAccumulator = struct {
     /// token figure here is a partial running sum, not the authoritative total.
     saw_result: bool = false,
     tool_errors: u16 = 0,
+    /// Tool calls refused by the permission layer. Counted apart from
+    /// tool_errors because the fix is different in kind: a denial means the
+    /// role's security profile (or the task asking for something the role may
+    /// not do), never a flaky tool.
+    permission_denials: u16 = 0,
     duration_secs: u16 = 0,
     /// Result subtype: "success", "error_max_turns", "error_max_budget_usd",
     /// "error_during_execution", etc.
@@ -724,6 +729,12 @@ pub fn probeBackend(
 
 /// Dispatch event processing to the appropriate backend normalizer.
 fn processEvent(backend: types.BackendType, line: []const u8, acc: *ResultAccumulator) types.EventMeta {
+    // Backend-agnostic: every CLI reports a refusal as tool_result prose. A
+    // worker that spends its budget being told "no" looks identical to one
+    // doing hard work unless this is counted and said out loud.
+    if (std.mem.indexOf(u8, line, "has been denied") != null) {
+        acc.permission_denials +|= 1;
+    }
     const meta = switch (backend) {
         .claude => claudeProcessEvent(line, acc),
         .codex => backend_codex.processEvent(line, acc),
@@ -1124,6 +1135,7 @@ pub fn runSession(
             .cache_creation_tokens = acc.cache_creation_tokens,
             .cache_read_tokens = acc.cache_read_tokens,
             .tool_errors = acc.tool_errors,
+            .permission_denials = acc.permission_denials,
             .result_subtype = acc.result_subtype,
             .stop_reason = acc.stop_reason,
             .duration_api_ms = acc.duration_api_ms,
@@ -1156,6 +1168,7 @@ pub fn runSession(
         .cache_creation_tokens = acc.cache_creation_tokens,
         .cache_read_tokens = acc.cache_read_tokens,
         .tool_errors = acc.tool_errors,
+        .permission_denials = acc.permission_denials,
         .result_subtype = acc.result_subtype,
         .stop_reason = acc.stop_reason,
         .duration_api_ms = acc.duration_api_ms,

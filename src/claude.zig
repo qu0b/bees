@@ -63,6 +63,9 @@ pub const SessionResult = struct {
     cache_creation_tokens: u32 = 0,
     cache_read_tokens: u32 = 0,
     tool_errors: u16 = 0,
+    /// Tool calls the permission layer refused — a security-profile or task
+    /// mismatch, not a flaky tool, and a different fix.
+    permission_denials: u16 = 0,
     /// Result subtype: "success", "error_max_turns", "error_max_budget_usd", etc.
     result_subtype: []const u8 = "",
     /// API stop reason: "end_turn", "max_tokens"

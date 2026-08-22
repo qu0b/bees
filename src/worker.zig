@@ -442,6 +442,9 @@ fn runWorkerImpl(
     {
         const subtype = if (result.result_subtype.len > 0) result.result_subtype else "unknown";
         const stop = if (result.stop_reason.len > 0) result.stop_reason else "-";
+        if (result.permission_denials > 0) {
+            logger.warn("[worker:{d}] {d} tool call(s) refused by the permission layer — the role's security profile forbids what this task asked for; check the task, not the tool", .{ worker_id, result.permission_denials });
+        }
         logger.info("[worker:{d}] done task=\"{s}\" commits={d} cost=${d:.2} turns={d} subtype={s} stop={s} tool_errors={d}", .{
             worker_id,
             task_name,
