@@ -2769,7 +2769,7 @@ fn cmdSessions(arena: std.mem.Allocator, stdout: *Io.Writer, session_type: ?type
             first_json = false;
             try stdout.print("{{\"id\":{d},\"type\":\"{s}\",\"status\":\"{s}\",\"backend\":\"{s}\",\"worker_id\":{d},\"commits\":{d},", .{
                 entry.id,                          entry.view.header.type.label(),
-                entry.view.header.status.label(),  entry.view.header.backend.label(),
+                entry.view.header.status.label(),  entry.view.header.getBackend().label(),
                 entry.view.header.worker_id,       entry.view.header.commit_count,
             });
             // null, not 0 — a killed agent's real spend was never reported, and

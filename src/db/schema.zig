@@ -253,7 +253,7 @@ pub fn bindSession(stmt: *c.sqlite3_stmt, id: u64, h: types.SessionHeader, task:
     col += 1;
     sqlite.bindInt(stmt, col, @intFromEnum(h.status));
     col += 1;
-    sqlite.bindInt(stmt, col, @intFromEnum(h.backend));
+    sqlite.bindInt(stmt, col, @intFromEnum(h.getBackend()));
     col += 1;
     sqlite.bindInt(stmt, col, @intCast(h.worker_id));
     col += 1;

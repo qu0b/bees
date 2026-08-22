@@ -968,3 +968,19 @@ test "TaskTier survives a header round-trip and keeps the record at 16 bytes" {
 }
 
 const types_size_check: usize = 16;
+
+test "getBackend reads a pre-2026-08 record's frozen slot and a new record's tail field" {
+    // New writers fill the tail field and leave the legacy slot zero.
+    var fresh = std.mem.zeroes(SessionHeader);
+    fresh.backend = .dsh;
+    try std.testing.expectEqual(BackendType.dsh, fresh.getBackend());
+
+    // A record written before the move carries its value in bit 14 only.
+    var old = std.mem.zeroes(SessionHeader);
+    old.backend_legacy = @intFromEnum(BackendType.pi);
+    try std.testing.expectEqual(BackendType.pi, old.getBackend());
+
+    // Claude is zero in both slots and must stay readable as claude.
+    const zero = std.mem.zeroes(SessionHeader);
+    try std.testing.expectEqual(BackendType.claude, zero.getBackend());
+}

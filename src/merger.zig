@@ -592,7 +592,7 @@ fn runBuildStep(
     defer allocator.free(error_context);
 
     const fix_result = backend.runSession(store, io, .{
-        .backend = header.backend,
+        .backend = header.getBackend(),
         .prompt = error_context,
         .cwd = paths.root,
         .append_prompt_file = fix_prompt_path,

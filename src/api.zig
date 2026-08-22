@@ -251,7 +251,7 @@ fn handleSession(w: *Io.Writer, store: *store_mod.Store, id: u64) !void {
         id,
         session.header.@"type".label(),
         session.header.status.label(),
-        session.header.backend.label(),
+        session.header.getBackend().label(),
         session.header.commit_count,
         @as(u64, session.header.cost_microdollars) / 10000,
         session.header.cost_microdollars,
@@ -557,7 +557,7 @@ fn writeSessionsArray(w: *Io.Writer, store: *store_mod.Store, txn: anytype, type
             entry.id,
             entry.view.header.@"type".label(),
             entry.view.header.status.label(),
-            entry.view.header.backend.label(),
+            entry.view.header.getBackend().label(),
             entry.view.header.commit_count,
             @as(u64, entry.view.header.cost_microdollars) / 10000,
         });
