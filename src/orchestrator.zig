@@ -41,6 +41,11 @@ const DaemonState = struct {
     sre_trigger_count: u32 = 0,
     /// PID of the daemon-owned headless Chrome instance (0 = not running).
     chrome_pid: std.posix.pid_t = 0,
+    /// Whether the daily-ceiling warning has been emitted since the ceiling
+    /// was last clear. Shared by every call site: the checks run on several
+    /// cadences (10s poll, 60s idle refill, per-cycle role gates) and each
+    /// logging independently buried a night's log in identical lines.
+    ceiling_reported: bool = false,
     /// Count of strategist runs, used to route a fraction of them to Codex.
     strategist_runs: u32 = 0,
 };
@@ -369,9 +374,14 @@ fn dailyCeilingReached(
     cfg: config_mod.Config,
     store: *store_mod.Store,
     logger: *log_mod.Logger,
-    state: *const DaemonState,
+    state: *DaemonState,
 ) bool {
-    const over = ceilingExceeded(cfg, store, state) orelse return false;
+    const over = ceilingExceeded(cfg, store, state) orelse {
+        state.ceiling_reported = false;
+        return false;
+    };
+    if (state.ceiling_reported) return true;
+    state.ceiling_reported = true;
     const settled = over.settled;
     const committed = over.committed;
     const in_flight = over.in_flight;
@@ -705,7 +715,6 @@ pub fn run(
     // own interval rather than on every 10s poll.
     var last_idle_refill: u64 = 0;
     var idle_reported = false;
-    var ceiling_reported = false;
     while (@atomicLoad(u32, &state.shutdown_requested, .acquire) == 0) {
         sleepInterruptible(io, &state, 10);
 
@@ -804,7 +813,11 @@ pub fn run(
             // the child registry — orphaning agents nobody can signal, still
             // spending. Let the old batch finish and spawn after the restart.
             if (!source_changed and
-                pool.hasActiveTasks() and @atomicLoad(u32, &state.shutdown_requested, .acquire) == 0)
+                pool.hasActiveTasks() and @atomicLoad(u32, &state.shutdown_requested, .acquire) == 0 and
+                // Ask before announcing: spawnWorker refuses over the ceiling,
+                // so without this the log read "spawning 2 new workers" on a
+                // cycle that spawned none.
+                !dailyCeilingReached(cfg, store, logger, &state))
             {
                 const active_now = @atomicLoad(u32, &state.active_count, .acquire);
                 const need_now = @min(cfg.workers.count, MAX_WORKERS) -| active_now;
@@ -1010,9 +1023,12 @@ pub fn run(
                         spawnWorker(cfg, paths, store, pool, logger, io, allocator, &state, context_blob);
                     }
                 }
-            } else {
+            } else if (!pool.hasActiveTasks()) {
                 logger.warn("[daemon] no active tasks, skipping worker spawn — waiting for next cycle", .{});
             }
+            // The ceiling case says so itself, in dailyCeilingReached — blaming
+            // missing tasks for a budget stop sent the next reader looking in
+            // the wrong place.
         }
 
         // ── Idle refill ────────────────────────────────────────────────────
@@ -1036,18 +1052,9 @@ pub fn run(
                 tasks_mod.syncFromFile(store, paths.tasks_file, .template, allocator) catch {};
                 reloadPool(&pool, store, paths.tasks_file, allocator);
 
-                const over_ceiling = ceilingExceeded(cfg, store, &state) != null;
-                if (over_ceiling and !ceiling_reported) {
-                    // Say it once per stretch, not once per check: this runs
-                    // every 60s and would otherwise bury a night's log in
-                    // hundreds of identical lines, hiding the events the log
-                    // exists to show.
-                    _ = dailyCeilingReached(cfg, store, logger, &state);
-                    ceiling_reported = true;
-                } else if (!over_ceiling) {
-                    ceiling_reported = false;
-                }
-                if (pool.hasActiveTasks() and !over_ceiling) {
+                // dailyCeilingReached now says it once per stretch itself, so
+                // this can call it plainly.
+                if (pool.hasActiveTasks() and !dailyCeilingReached(cfg, store, logger, &state)) {
                     const need_idle = @min(cfg.workers.count, MAX_WORKERS);
                     logger.info("[daemon] idle with work available — spawning {d} worker(s)", .{need_idle});
                     for (0..need_idle) |_| {
