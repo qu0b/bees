@@ -439,6 +439,12 @@ const roles = [_]RoleDef{
         \\  "done" looks like in observable terms, call out the edge cases you expect to bite,
         \\  give the verification commands, and end with "Commit your work."
         \\
+        \\Never write browser verification into a worker task. The worker role's security
+        \\profile denies the browser tools, so a task that says "measure it at 390px" or
+        \\"check it in a browser" spends its whole budget being refused. Driving a browser
+        \\belongs to the QA and user-advocate roles: ask the worker for the change and the
+        \\reasoning that justifies it, and let QA confirm the pixels afterwards.
+        \\
         \\Workers already inherit AGENTS.md/CLAUDE.md and their role prompt, so don't restate
         \\build commands or coding conventions in every task — spend those tokens on what is
         \\specific to the work.
