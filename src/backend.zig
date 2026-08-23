@@ -34,11 +34,12 @@ const GatewayState = struct {
     /// CLI outside the spawn() override (e.g. seed file selection). The last
     /// slot is the optional context-window override; `env_len` says how many
     /// entries are live.
-    env: [7][2][]const u8 = undefined,
+    env: [8][2][]const u8 = undefined,
     env_len: usize = 0,
 };
 var gateway: GatewayState = .{};
 var gateway_ctx_buf: [16]u8 = undefined;
+var gateway_out_buf: [16]u8 = undefined;
 
 /// Activate gateway mode from config. Reads the API key from the environment
 /// (never from config.json); fails fast when the key env var is unset so the
@@ -46,7 +47,13 @@ var gateway_ctx_buf: [16]u8 = undefined;
 /// The `gw` string slices must outlive all spawns (they do: config is arena-
 /// allocated for the process lifetime).
 pub fn configureGateway(gw: config_mod.Config.Gateway) error{GatewayKeyMissing}!void {
-    if (!gw.enabled) return;
+    if (!gw.enabled) {
+        // Reset rather than return: leaving a previously-configured gateway
+        // standing made "disabled" mean "whatever was set before", and made
+        // the test suite order-dependent.
+        gateway = .{};
+        return;
+    }
     // std.c.getenv wants a sentinel-terminated name; config strings aren't.
     // Copy into a bounded buffer (env var names are short by construction).
     var name_buf: [128:0]u8 = undefined;
@@ -73,6 +80,7 @@ pub fn configureGatewayWithKey(gw: config_mod.Config.Gateway, api_key: []const u
             .{ "ANTHROPIC_DEFAULT_OPUS_MODEL", gw.model },
             .{ "ANTHROPIC_SMALL_FAST_MODEL", gw.model },
             .{ "", "" }, // context window, filled below when configured
+            .{ "", "" }, // output ceiling, filled below when configured
         },
         .env_len = 6,
     };
@@ -83,6 +91,17 @@ pub fn configureGatewayWithKey(gw: config_mod.Config.Gateway, api_key: []const u
         if (std.fmt.bufPrint(&gateway_ctx_buf, "{d}", .{gw.context_tokens})) |s| {
             gateway.env[6] = .{ "CLAUDE_CODE_MAX_CONTEXT_TOKENS", s };
             gateway.env_len = 7;
+        } else |_| {}
+    }
+    // And the model's real output ceiling. Left unset the CLI assumes a
+    // default that may exceed what the gateway will accept, so a long answer
+    // fails at the end of an expensive turn rather than being sized correctly
+    // up front. Only meaningful once the context slot above is filled, since
+    // env_len advances in order.
+    if (gw.output_tokens > 0 and gateway.env_len == 7) {
+        if (std.fmt.bufPrint(&gateway_out_buf, "{d}", .{gw.output_tokens})) |s| {
+            gateway.env[7] = .{ "CLAUDE_CODE_MAX_OUTPUT_TOKENS", s };
+            gateway.env_len = 8;
         } else |_| {}
     }
 }
@@ -532,8 +551,13 @@ pub fn isClaudeModelName(model: []const u8) bool {
 /// reaches here implicitly.
 pub fn resolveBackend(default_backend: []const u8, role_backend: []const u8) types.BackendType {
     if (role_backend.len > 0) return types.BackendType.fromString(role_backend);
-    if (gateway.active) return .claude;
-    return types.BackendType.fromString(default_backend);
+    // A project's declared default wins even in gateway mode. This used to
+    // return .claude unconditionally, so `default_backend: "pi"` was accepted
+    // by the config and then silently ignored — a gateway is an endpoint, not
+    // a choice of CLI. The field defaults to "claude", so nothing changes for
+    // a project that never set it.
+    if (default_backend.len > 0) return types.BackendType.fromString(default_backend);
+    return .claude;
 }
 
 /// Dispatch spawn to the appropriate backend.
@@ -1607,9 +1631,15 @@ test "gateway mode forces claude backend and injects endpoint env" {
     try std.testing.expect(gatewayActive());
     try std.testing.expect(gatewayTextOnly()); // text_only defaults on
 
-    // The project DEFAULT collapses to claude, whatever it says...
-    try std.testing.expectEqual(types.BackendType.claude, resolveBackend("pi", ""));
-    try std.testing.expectEqual(types.BackendType.claude, resolveBackend("codex", ""));
+    // The project's declared default is honoured. This used to collapse to
+    // claude whatever the config said, on the reasoning that gateway mode
+    // means "point the Claude CLI at our endpoint" — the injected
+    // ANTHROPIC_BASE_URL/env only that CLI reads. But another harness can
+    // serve the same endpoint from its own config (pi reads models.json), so
+    // the endpoint is not a choice of CLI. Unset still means claude.
+    try std.testing.expectEqual(types.BackendType.claude, resolveBackend("claude", ""));
+    try std.testing.expectEqual(types.BackendType.pi, resolveBackend("pi", ""));
+    try std.testing.expectEqual(types.BackendType.codex, resolveBackend("codex", ""));
     // ...but an explicit per-role backend still wins, so a role can be moved to
     // another provider to free the gateway's concurrency for workers.
     try std.testing.expectEqual(types.BackendType.pi, resolveBackend("claude", "pi"));
@@ -1646,6 +1676,53 @@ test "gateway mode forces claude backend and injects endpoint env" {
     try std.testing.expectEqualStrings("tok", bearer_env.get("ANTHROPIC_AUTH_TOKEN").?);
     try std.testing.expect(bearer_env.get("ANTHROPIC_API_KEY") == null);
     try std.testing.expectEqualStrings("600000", bearer_env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS").?);
+}
+
+test "a project's default backend wins over gateway mode" {
+    try configureGateway(.{ .enabled = false });
+    configureGatewayWithKey(.{ .enabled = true, .base_url = "https://ai.example", .model = "m" }, "k");
+
+    // The historical behaviour: gateway + no declared default = claude.
+    try std.testing.expectEqual(types.BackendType.claude, resolveBackend("claude", ""));
+    // A role's own backend still wins over everything.
+    try std.testing.expectEqual(types.BackendType.pi, resolveBackend("claude", "pi"));
+    // And a project that declares pi gets pi, which gateway mode used to
+    // override without saying so.
+    try std.testing.expectEqual(types.BackendType.pi, resolveBackend("pi", ""));
+    try configureGateway(.{ .enabled = false });
+}
+
+test "the gateway exports the model's real context and output ceilings" {
+    // Both limits are the endpoint's, not the CLI's guesses: left unset the CLI
+    // assumes 200k of context and its own output default, so a prompt the
+    // server would accept is refused, or a long answer fails at the end of a
+    // turn already paid for.
+    configureGatewayWithKey(.{
+        .enabled = true,
+        .base_url = "https://ai.example",
+        .model = "starflinger-anthropic",
+        .context_tokens = 500_000,
+        .output_tokens = 64_000,
+    }, "sk-test");
+    var env = buildFilteredEnvMap(std.testing.allocator);
+    defer env.deinit();
+    try std.testing.expectEqualStrings("500000", env.get("CLAUDE_CODE_MAX_CONTEXT_TOKENS").?);
+    try std.testing.expectEqualStrings("64000", env.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS").?);
+
+    // Unset stays unset — the CLI keeps its own default rather than being told
+    // a number nobody verified. Asserted on the gateway's own slots, not the
+    // merged map: buildFilteredEnvMap also copies the PROCESS environment, so a
+    // developer who happens to export the variable would "pass" either way.
+    configureGatewayWithKey(.{
+        .enabled = true,
+        .base_url = "https://ai.example",
+        .model = "starflinger-anthropic",
+        .context_tokens = 500_000,
+    }, "sk-test");
+    try std.testing.expectEqual(@as(usize, 7), gateway.env_len);
+
+    // Leave the global as the next test expects to find it.
+    try configureGateway(.{ .enabled = false });
 }
 
 test "configureGateway is a no-op when disabled and fails fast on missing key" {

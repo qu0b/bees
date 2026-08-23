@@ -304,6 +304,12 @@ pub const Config = struct {
         /// sent — even when the server advertises far more (vLLM
         /// max_model_len). 0 = leave the CLI's assumption alone.
         context_tokens: u32 = 0,
+        /// The gateway model's maximum output tokens, exported as
+        /// CLAUDE_CODE_MAX_OUTPUT_TOKENS. 0 leaves the CLI's own default in
+        /// place. Set it to what the endpoint actually accepts: claiming more
+        /// than the server allows fails the request at the END of a turn you
+        /// have already paid to generate.
+        output_tokens: u32 = 0,
         /// The gateway model is text-only (no vision). Browser tooling stays
         /// available — DOM/a11y snapshots, console, network, evaluate_script
         /// are textual — but image-producing tools (chrome-devtools
