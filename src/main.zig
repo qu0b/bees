@@ -991,6 +991,14 @@ fn checkRole(
         // MISSING_CREDENTIAL without them — on stderr, which the probe
         // silences, so an unprobed role looks fine and a probed one only says
         // "call failed". Name the missing variable while we can still see it.
+        // A budget the backend cannot enforce is a number that reassures
+        // without bounding. pi and dsh take no budget flag, so max_budget_usd
+        // on those roles does nothing — say so rather than let the config imply
+        // a cap that isn't there.
+        if ((c.bt == .pi or c.bt == .dsh) and rc.max_budget_usd > 0) {
+            try stdout.print("  ⚠ max_budget_usd is not enforceable on {s} — it takes no budget flag; bound this role by time or at the endpoint\n", .{c.bt.label()});
+            warnings.* += 1;
+        }
         if (c.bt == .dsh and std.c.getenv("DEEPSEEK_API_KEY") == null) {
             try stdout.print("  ⚠ DEEPSEEK_API_KEY is not set — dsh will exit MISSING_CREDENTIAL before it calls a model\n", .{});
             warnings.* += 1;
