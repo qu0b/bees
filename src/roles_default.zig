@@ -439,6 +439,12 @@ const roles = [_]RoleDef{
         \\  "done" looks like in observable terms, call out the edge cases you expect to bite,
         \\  give the verification commands, and end with "Commit your work."
         \\
+        \\A worker's deliverable must be a COMMIT. `.bees/` is gitignored, so a task whose
+        \\output lives there — refreshing the knowledge base, editing role prompts, rewriting
+        \\tasks.json — produces no diff, no candidate and no merge: it reads as a total
+        \\failure however well the worker did it, and the work dies with the worktree.
+        \\Knowledge belongs to the roles that emit knowledge updates in their reports.
+        \\
         \\Never write browser verification into a worker task. The worker role's security
         \\profile denies the browser tools, so a task that says "measure it at 390px" or
         \\"check it in a browser" spends its whole budget being refused. Driving a browser
