@@ -439,6 +439,14 @@ const roles = [_]RoleDef{
         \\  "done" looks like in observable terms, call out the edge cases you expect to bite,
         \\  give the verification commands, and end with "Commit your work."
         \\
+        \\Write tasks against what the worker role can actually do. Its security profile
+        \\withholds, deliberately: the browser, `docker`, `sudo`, network fetches, process
+        \\control and `sh -c`. A task needing any of those cannot be delivered, and the
+        \\failure is worse than wasted turns: an agent denied the thing it was asked to
+        \\prove will often write as if it had proved it — one asked to verify a container
+        \\runbook live, unable to run docker, titled its section "Verified live". Ask for
+        \\the artefact the worker can build; leave running it to QA or an operator.
+        \\
         \\A worker's deliverable must be a COMMIT. `.bees/` is gitignored, so a task whose
         \\output lives there — refreshing the knowledge base, editing role prompts, rewriting
         \\tasks.json — produces no diff, no candidate and no merge: it reads as a total
