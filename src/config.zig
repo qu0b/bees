@@ -120,6 +120,12 @@ pub const Config = struct {
         max_turns: u32 = 10,
         tool_error_threshold: u32 = 3,
         backend: []const u8 = "",
+        /// Whether the diagnosis role runs at all. Removing `sre` from the
+        /// workflow is NOT enough on its own: the daemon also drains queued
+        /// triggers outside the workflow steps, so an operator who deleted the
+        /// step still got SRE sessions. On chatplugin those cost ~$104 across
+        /// 12 runs for one success — it exhausted its turn cap every time.
+        enabled: bool = true,
     };
 
     pub const Strategist = struct {

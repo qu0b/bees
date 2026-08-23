@@ -1238,6 +1238,12 @@ fn drainSreTriggers(
     // the in-flight ones (2026-08-13), so a stop that should take seconds sat
     // for minutes waiting on work it had just decided not to do.
     if (@atomicLoad(u32, &state.shutdown_requested, .acquire) != 0) return;
+    // One gate for every SRE path, workflow step and fallback drain alike —
+    // the same choke-point lesson the daily ceiling taught.
+    if (!cfg.sre.enabled) {
+        _ = @atomicRmw(u32, &state.sre_trigger_count, .Xchg, 0, .acquire);
+        return;
+    }
     const count = @atomicRmw(u32, &state.sre_trigger_count, .Xchg, 0, .acquire);
     if (count == 0) return;
 
