@@ -27,7 +27,15 @@ pub const Store = struct {
         errdefer c.mdb_env_close(env);
 
         try check(c.mdb_env_set_maxdbs(env, 8));
-        try check(c.mdb_env_set_mapsize(env, 1 * 1024 * 1024 * 1024));
+        // The map size is a VIRTUAL ceiling, not an allocation: the file grows
+        // sparsely toward it. 1 GiB was reached by a single project in five
+        // days of continuous running (2026-08-24, chatplugin), and a full map
+        // takes the daemon down hard — every write fails with LmdbMapFull and
+        // the daemon restart-loops because it cannot even load tasks.json.
+        // Raised to 16 GiB to put that failure far out of reach. This bounds
+        // the CEILING only; event volume still needs retention, or the same
+        // wall arrives later.
+        try check(c.mdb_env_set_mapsize(env, 16 * 1024 * 1024 * 1024));
         // With MDB_NOTLS, each concurrent read txn needs its own reader slot.
         // 3 workers + merger + strategist + QA + SRE + CLI = ~32 max concurrent.
         try check(c.mdb_env_set_maxreaders(env, 32));

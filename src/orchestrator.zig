@@ -601,6 +601,16 @@ pub fn run(
     tasks_mod.syncFromFile(store, paths.tasks_file, .template, allocator) catch |e| {
         switch (e) {
             error.FileNotFound => logger.warn("[daemon] no {s} — starting with whatever tasks LMDB already holds", .{paths.tasks_file}),
+            // A full map is a STORE failure, not a malformed file. Reported as
+            // a parse error it sends the operator to inspect a tasks.json that
+            // is perfectly valid while the daemon restart-loops (2026-08-24:
+            // the map hit its ceiling and every write failed under a message
+            // naming the wrong file). Say what is actually wrong and what to
+            // do about it.
+            error.LmdbMapFull => {
+                logger.err("[daemon] LMDB store is FULL — no write can succeed, so tasks cannot be loaded. {s} is fine; the store is not. Raise the map size (src/store.zig mdb_env_set_mapsize) and/or prune event history.", .{paths.tasks_file});
+                return e;
+            },
             else => {
                 logger.err("[daemon] {s} will not parse ({s}) — expected a JSON array of {{\"name\",\"weight\",\"prompt\",\"tier\"?}}", .{
                     paths.tasks_file, @errorName(e),
