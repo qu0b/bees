@@ -607,7 +607,40 @@ fn spawn(backend: types.BackendType, allocator: std.mem.Allocator, io: Io, optio
             options.prompt;
         opts.prompt = "Your full instructions and context are provided via stdin. Read them and proceed.";
     }
+    // Everything else carries the prompt in argv. Linux caps a single argv
+    // string at MAX_ARG_STRLEN, and exceeding it fails execve with E2BIG —
+    // which Zig surfaces as error.SystemResources with NO syscall visible in
+    // the parent. That reads like an out-of-memory condition and sends the
+    // operator hunting the wrong thing entirely. Claude is rewritten to stdin
+    // above and Codex composes its own overflow inside spawnCodex; for the
+    // rest, say what is actually wrong before spawning.
+    if (!promptFitsArgv(backend, opts.prompt.len)) return error.PromptTooLargeForBackend;
     return spawnResolved(backend, allocator, io, opts, claude_binary, pi_binary, dsh_binary);
+}
+
+/// Whether `prompt_len` can ride in argv for `backend`. Claude is rewritten to
+/// stdin before this point and Codex composes its own overflow inside
+/// spawnCodex, so both always fit; every other backend is bounded by
+/// MAX_ARG_STRLEN.
+pub fn promptFitsArgv(backend: types.BackendType, prompt_len: usize) bool {
+    return switch (backend) {
+        .claude, .codex => true,
+        else => prompt_len <= max_argv_prompt_bytes,
+    };
+}
+
+test "oversized prompts are refused only for backends that cannot take stdin" {
+    const big = max_argv_prompt_bytes + 1;
+    // Rewritten to stdin / composed from files before the spawn.
+    try std.testing.expect(promptFitsArgv(.claude, big));
+    try std.testing.expect(promptFitsArgv(.codex, big));
+    // No verified stdin path: refused up front rather than failing execve with
+    // E2BIG, which surfaces as an unattributable error.SystemResources.
+    try std.testing.expect(!promptFitsArgv(.dsh, big));
+    try std.testing.expect(!promptFitsArgv(.pi, big));
+    // Anything at or under the cap rides in argv on every backend.
+    try std.testing.expect(promptFitsArgv(.dsh, max_argv_prompt_bytes));
+    try std.testing.expect(promptFitsArgv(.pi, 1));
 }
 
 fn spawnResolved(backend: types.BackendType, allocator: std.mem.Allocator, io: Io, options: BackendOptions, claude_binary: []const u8, pi_binary: []const u8, dsh_binary: []const u8) !std.process.Child {
