@@ -68,8 +68,37 @@ pub fn writeFile(file: File, data: []const u8) !void {
     try writer.interface.flush();
 }
 
-/// Write `data` at `*pos` and advance `*pos` by the number of bytes written.
-/// Use this for append-semantics on a file opened without O_APPEND.
+/// Open `path` for APPEND-ONLY writing, creating it if absent.
+///
+/// O_APPEND makes the kernel resolve the write offset to the true end of file
+/// atomically per write, which is the only way several writers can share one
+/// log file safely. The alternative — each writer tracking its own offset and
+/// issuing positional writes — corrupts the file two ways when more than one
+/// writer is live: equal offsets OVERWRITE each other, and an offset past the
+/// real end leaves a hole that reads back as NUL bytes. chatplugin's log
+/// accumulated 7367 NULs that way, which also made it "binary" to grep, so
+/// every plain `grep` over it silently matched nothing.
+pub fn openFileAppend(path: []const u8) !File {
+    var path_buf: [4096]u8 = undefined;
+    if (path.len >= path_buf.len) return error.NameTooLong;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+
+    const fd = std.c.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return error.OpenFailed;
+    return .{ .handle = fd, .flags = .{ .nonblocking = false } };
+}
+
+/// Append `data` to a file opened with `openFileAppend`. The kernel picks the
+/// offset, so no caller-side position is tracked or needed.
+pub fn appendToFile(file: File, data: []const u8) !void {
+    try file.writeStreamingAll(io, data);
+}
+
+/// Write `data` at `*pos` and advance `*pos`. Single-writer only: two writers
+/// tracking independent offsets corrupt the file (see `openFileAppend`). For a
+/// shared log, use `openFileAppend` + `appendToFile` instead.
 pub fn writeFileAppend(file: File, data: []const u8, pos: *u64) !void {
     try file.writePositionalAll(io, data, pos.*);
     pos.* += data.len;

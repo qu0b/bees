@@ -4,14 +4,19 @@ const Io = std.Io;
 
 pub const Logger = struct {
     file: ?Io.File,
-    /// Current write position in the log file; initialized to the file's
-    /// existing length so that writes append rather than overwrite on restart.
-    pos: u64,
 
+    /// The log is opened O_APPEND so the KERNEL resolves each write to the
+    /// true end of file. Several Loggers share one path — the daemon, its
+    /// role runners, and a second daemon across a restart — and the previous
+    /// scheme gave each its own cached offset for positional writes. Two
+    /// writers then either landed on the same offset and overwrote each other,
+    /// or wrote past the real end and left a hole; holes read back as NUL.
+    /// chatplugin's log collected 7367 NULs that way, which made it "binary"
+    /// to grep, so every plain `grep` over it matched nothing silently — the
+    /// log looked empty exactly when it was most needed.
     pub fn init(log_path: ?[]const u8) Logger {
-        const file = if (log_path) |p| fs.createFile(p, .{ .truncate = false }) catch null else null;
-        const pos: u64 = if (file) |f| fs.fileLength(f) else 0;
-        return .{ .file = file, .pos = pos };
+        const file = if (log_path) |p| fs.openFileAppend(p) catch null else null;
+        return .{ .file = file };
     }
 
     pub fn deinit(self: *Logger) void {
@@ -47,7 +52,7 @@ pub const Logger = struct {
         const msg_len = std.fmt.bufPrint(buf[prefix_len.len..], fmt ++ "\n", args) catch return;
         const total = buf[0 .. prefix_len.len + msg_len.len];
 
-        if (self.file) |f| fs.writeFileAppend(f, total, &self.pos) catch {};
+        if (self.file) |f| fs.appendToFile(f, total) catch {};
         std.debug.print("{s}", .{total});
     }
 };
