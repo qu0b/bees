@@ -63,10 +63,18 @@ pub fn createWorktree(allocator: std.mem.Allocator, io: Io, repo_path: []const u
     }
 }
 
+/// Remove a worktree directory. The branch it had checked out SURVIVES — the
+/// branch is the durable artifact, the working tree is just disk.
+///
+/// Reports failure. It used to free the output and return success regardless
+/// of git's exit code, so every caller's `catch {}` was unreachable and a
+/// worktree that could not be removed leaked silently — invisible until the
+/// disk filled.
 pub fn removeWorktree(allocator: std.mem.Allocator, io: Io, repo_path: []const u8, worktree_dir: []const u8) !void {
     const result = try run(allocator, io, &.{ "git", "worktree", "remove", "--force", worktree_dir }, repo_path);
-    allocator.free(result.stdout);
-    allocator.free(result.stderr);
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+    if (result.exit_code != 0) return error.WorktreeRemoveFailed;
 }
 
 pub fn deleteBranch(allocator: std.mem.Allocator, io: Io, repo_path: []const u8, branch_name: []const u8) !void {

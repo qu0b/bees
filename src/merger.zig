@@ -753,6 +753,75 @@ fn cleanupOldWorktrees(
         }
     }
 
+    // 1b. Count cap: reclaim the oldest ABANDONED worktrees once there are more
+    // than `git.max_worktrees`.
+    //
+    // The age sweep above is not a bound. A worktree holds a whole build tree
+    // (~2 GB for this project), `stale_hours` is a day, and a fast swarm turns
+    // over far quicker than that — so worktrees that never got a terminal
+    // marker pile up under the age gate and fill the disk (2026-08-24: 37
+    // dirs, 59 GB, disk at 95%). What multiplies by the build size is the
+    // COUNT, so that is what is capped.
+    //
+    // Only worktrees with NO `.done` and older than `abandoned_grace_mins` are
+    // eligible: a marked one is already handled above, and a recent unmarked
+    // one is presumed to be a worker mid-build. Oldest go first. Branches are
+    // NOT deleted here — the branch is the durable artifact and costs nothing;
+    // only the working tree is reclaimed.
+    if (cfg.git.max_worktrees > 0) {
+        const Abandoned = struct { name: []const u8, ts: u64 };
+        var abandoned: std.ArrayList(Abandoned) = .empty;
+        defer {
+            for (abandoned.items) |a| allocator.free(a.name);
+            abandoned.deinit(allocator);
+        }
+        var total: usize = 0;
+
+        if (fs.openDir(worktree_base)) |*d| {
+            var dd = d.*;
+            defer fs.closeDir(dd);
+            const now2: u64 = fs.timestamp();
+            const grace = now2 -| (@as(u64, cfg.git.abandoned_grace_mins) * 60);
+            var it2 = dd.iterate();
+            while (it2.next(io) catch null) |entry| {
+                if (entry.kind != .directory) continue;
+                total += 1;
+
+                const wt = std.fmt.allocPrint(allocator, "{s}/{s}", .{ worktree_base, entry.name }) catch continue;
+                defer allocator.free(wt);
+                if (hasFile(allocator, wt, ".done")) continue;
+
+                const ts = parseWorktreeTimestamp(entry.name) orelse continue;
+                if (ts >= grace) continue; // presumed live
+
+                const name = allocator.dupe(u8, entry.name) catch continue;
+                abandoned.append(allocator, .{ .name = name, .ts = ts }) catch {
+                    allocator.free(name);
+                };
+            }
+        } else |_| {}
+
+        if (total > cfg.git.max_worktrees and abandoned.items.len > 0) {
+            std.mem.sort(Abandoned, abandoned.items, {}, struct {
+                fn lt(_: void, a: Abandoned, b: Abandoned) bool {
+                    return a.ts < b.ts;
+                }
+            }.lt);
+
+            const over = total - cfg.git.max_worktrees;
+            const take = @min(over, abandoned.items.len);
+            for (abandoned.items[0..take]) |a| {
+                const wt = std.fmt.allocPrint(allocator, "{s}/{s}", .{ worktree_base, a.name }) catch continue;
+                defer allocator.free(wt);
+                git.removeWorktree(allocator, io, paths.root, wt) catch |e| {
+                    logger.warn("[merger] could not reclaim abandoned worktree {s}: {s}", .{ a.name, @errorName(e) });
+                    continue;
+                };
+                logger.info("[merger] reclaimed abandoned worktree {s} (over cap: {d} > {d}; branch kept)", .{ a.name, total, cfg.git.max_worktrees });
+            }
+        }
+    }
+
     // 2. Prune stale git worktree refs (worktree dir deleted but git still tracks it)
     {
         const prune = git.run(allocator, io, &.{ "git", "worktree", "prune" }, paths.root) catch null;

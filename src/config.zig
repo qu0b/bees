@@ -213,6 +213,22 @@ pub const Config = struct {
 
     pub const Git = struct {
         shallow_worktrees: bool = true,
+        /// Upper bound on retained worktree directories before the merger
+        /// reclaims the oldest ABANDONED ones (no `.done`, past
+        /// `abandoned_grace_mins`).
+        ///
+        /// The age sweep alone is not a bound: a worktree carries a full build
+        /// tree — ~2 GB for a Rust project — and `stale_hours` defaults to a
+        /// day, so a swarm that turns over faster than that accumulates
+        /// without limit. On 2026-08-24 chatplugin held 37 worktrees using
+        /// 59 GB and filled the disk to 95%. Bound the COUNT, because that is
+        /// what multiplies by the build size. 0 disables the cap.
+        max_worktrees: u32 = 12,
+        /// How long a worktree with no `.done` marker is presumed to belong to
+        /// a live worker. Only past this is it a candidate for the count cap.
+        /// Generous next to a worker run (minutes), so a building worker is
+        /// never reclaimed out from under itself.
+        abandoned_grace_mins: u32 = 60,
     };
 
     pub const Build = struct {
