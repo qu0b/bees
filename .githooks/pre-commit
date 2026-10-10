@@ -10,18 +10,20 @@
 set -euo pipefail
 
 readonly MODEL=claude-opus-5-5 BUDGET=500000
-# count_tokens wraps the content in a user turn that costs a fixed 7 tokens per request:
-# count(a) + count(b) - count(a ++ b) == 7 for every file pair measured.
-readonly WRAPPER_TOKENS=7
+# Each request carries a fixed frame, and on Opus 5.x a trailing newline is free alone but
+# costs a token once text follows. count(a) + count(b) - count(a ++ b) == 7 for every file pair
+# measured, so per-file counts minus 7 sum exactly to one request holding the whole repo.
+readonly FRAME_TOKENS=7
 
 cd "$(git rev-parse --show-toplevel)"
 cache="$(git rev-parse --git-common-dir)/token-budget-$MODEL"
 touch "$cache"
 
 count_tokens() { # <blob> <path> -> content tokens
-  local key=${TOKEN_BUDGET_API_KEY:-${ANTHROPIC_API_KEY:-}} response
+  local key=${TOKEN_COUNT_API_KEY:-${ANT_API_KEY:-}} response
   if [[ -z $key ]]; then
-    echo "token-budget: set TOKEN_BUDGET_API_KEY to an Anthropic API key to count $2" >&2
+    echo "token-budget: set TOKEN_COUNT_API_KEY or ANT_API_KEY to an Anthropic API key" \
+      "(not a LiteLLM gateway key) to count $2" >&2
     return 1
   fi
   response=$(git cat-file blob "$1" \
@@ -32,7 +34,7 @@ count_tokens() { # <blob> <path> -> content tokens
     echo "token-budget: count_tokens failed for $2: $response" >&2
     return 1
   }
-  echo $(($(jq -e .input_tokens <<<"$response") - WRAPPER_TOKENS))
+  echo $(($(jq -e .input_tokens <<<"$response") - FRAME_TOKENS))
 }
 
 declare -A cached text
