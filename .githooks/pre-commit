@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Token budget: the repo's own text must fit in BUDGET Opus 5.5 context tokens, so an
+# agent can always hold all of it at once. vendor/ is excluded: it is pinned third-party
+# code no agent reads (sqlite3.c alone is ~9 MB).
+#
+# Anthropic's tokenizer is not public, so every count comes from the count_tokens API
+# (free, rate-limited). Each blob is counted once and cached by its hash, so a commit only
+# pays for the files it changes. Runs as pre-commit and pre-merge-commit; run it by hand
+# to see the current total.
+set -euo pipefail
+
+readonly MODEL=claude-opus-5-5 BUDGET=500000
+# count_tokens wraps the content in a user turn that costs a fixed 7 tokens per request:
+# count(a) + count(b) - count(a ++ b) == 7 for every file pair measured.
+readonly WRAPPER_TOKENS=7
+
+cd "$(git rev-parse --show-toplevel)"
+cache="$(git rev-parse --git-common-dir)/token-budget-$MODEL"
+touch "$cache"
+
+count_tokens() { # <blob> <path> -> content tokens
+  local key=${TOKEN_BUDGET_API_KEY:-${ANTHROPIC_API_KEY:-}} response
+  if [[ -z $key ]]; then
+    echo "token-budget: set TOKEN_BUDGET_API_KEY to an Anthropic API key to count $2" >&2
+    return 1
+  fi
+  response=$(git cat-file blob "$1" \
+    | jq -Rs --arg model "$MODEL" '{model: $model, messages: [{role: "user", content: .}]}' \
+    | curl -sS --fail-with-body -m 120 https://api.anthropic.com/v1/messages/count_tokens \
+      -H "x-api-key: $key" -H 'anthropic-version: 2023-06-01' \
+      -H 'content-type: application/json' -d @-) || {
+    echo "token-budget: count_tokens failed for $2: $response" >&2
+    return 1
+  }
+  echo $(($(jq -e .input_tokens <<<"$response") - WRAPPER_TOKENS))
+}
+
+declare -A cached text
+while read -r blob tokens; do cached[$blob]=$tokens; done <"$cache"
+# Text files with at least one non-whitespace character: the API rejects whitespace-only
+# content, which holds next to no tokens anyway.
+while IFS= read -r -d '' path; do text[$path]=1; done \
+  < <(git grep --cached -z -I -l -e '[^[:space:]]' -- ':!vendor/')
+
+total=0
+report=()
+while IFS= read -r -d '' entry; do # "<mode> <blob> <stage>\t<path>"
+  path=${entry#*$'\t'}
+  [[ -n ${text[$path]:-} ]] || continue
+  blob=${entry#* }
+  blob=${blob%% *}
+  if [[ -z ${cached[$blob]:-} ]]; then
+    cached[$blob]=$(count_tokens "$blob" "$path")
+    echo "$blob ${cached[$blob]}" >>"$cache"
+  fi
+  total=$((total + cached[$blob]))
+  report+=("${cached[$blob]} $path")
+done < <(git ls-files -s -z)
+
+echo "token-budget: $total / $BUDGET $MODEL tokens"
+if ((total > BUDGET)); then
+  echo "token-budget: over by $((total - BUDGET)) tokens. Largest files:" >&2
+  printf '%s\n' "${report[@]}" | sort -rn | head -n 15 >&2
+  exit 1
+fi

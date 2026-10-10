@@ -85,6 +85,7 @@ surrounding file is the spec; the rules below are the ones you cannot read off i
 - The workflow definition is the single source of truth for what runs, when, and under what conditions
 - Reports derived on demand from LMDB meta — not written to disk as files
 - Knowledge base is append-mostly — agents add and refine, never bulk-delete
+- The repo's own text (`vendor/` excluded) stays within 500k Opus 5.5 context tokens. `.githooks/pre-commit` enforces it on every commit and merge commit with exact counts from Anthropic's count_tokens API, cached per blob; it needs `git config core.hooksPath .githooks` and `TOKEN_BUDGET_API_KEY` (an Anthropic key) whenever a changed file has not been counted yet. Run the hook by hand to see the current total.
 
 ## Browser Automation
 
